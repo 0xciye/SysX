@@ -1,6 +1,6 @@
 use image::{ImageFormat, RgbImage};
 use std::io;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -72,6 +72,8 @@ pub struct UdpDecodedFrameSource {
     socket: Option<UdpSocket>,
     reassembler: UdpFrameReassembler,
     datagram: [u8; MAX_DATAGRAM_BYTES + 1],
+    crop_resolution: u32,
+    sender: Option<SocketAddr>,
 }
 
 impl UdpDecodedFrameSource {
@@ -88,7 +90,16 @@ impl UdpDecodedFrameSource {
             socket: None,
             reassembler: UdpFrameReassembler::default(),
             datagram: [0; MAX_DATAGRAM_BYTES + 1],
+            crop_resolution: 640,
+            sender: None,
         })
+    }
+
+    pub fn set_crop_resolution(&mut self, resolution: u32) {
+        if (1..=8192).contains(&resolution) {
+            self.crop_resolution = resolution;
+            self.send_crop_config();
+        }
     }
     pub fn open(&mut self) -> io::Result<()> {
         if self.socket.is_none() {
@@ -121,7 +132,11 @@ impl UdpDecodedFrameSource {
                 .expect("socket opened")
                 .recv_from(&mut self.datagram)
             {
-                Ok((length, _)) => {
+                Ok((length, sender)) => {
+                    if self.sender != Some(sender) {
+                        self.sender = Some(sender);
+                        self.send_crop_config();
+                    }
                     self.reassembler
                         .accept(&self.datagram[..length], monotonic_ns());
                 }
@@ -136,6 +151,15 @@ impl UdpDecodedFrameSource {
     }
     pub fn close(&mut self) {
         self.socket = None;
+        self.sender = None;
+    }
+
+    fn send_crop_config(&self) {
+        let (Some(socket), Some(sender)) = (&self.socket, self.sender) else {
+            return;
+        };
+        let message = format!("SYSCFG 1 CROP {}", self.crop_resolution);
+        let _ = socket.send_to(message.as_bytes(), sender);
     }
 }
 

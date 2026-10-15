@@ -1,28 +1,69 @@
 # SysX OBS canvas sender
 
-This is a UI-less OBS global module. When loaded, it captures the full main OBS canvas, encodes each frame as JPEG quality 80, and sends it over UDP to the compile-time destination in `sysx_canvas_sender.cpp`.
+A UI-less OBS global module for Windows. Once loaded it:
 
-The sender uses SysX's `RCVR` v1 packet format (30-byte big-endian header, 1,170-byte JPEG chunks, 1,200-byte datagrams). It does not crop or resize. The SysX receiver performs the configured centered crop after decoding.
+1. reads the OBS main texture in the main-rendered callback,
+2. copies the receiver-requested centered `N × N` crop on the GPU and reads it back through a three-surface staging ring (the render thread never waits on the readback it just queued),
+3. JPEG-encodes the crop on a worker thread with libjpeg-turbo (BGRA input, 4:4:4 chroma by default so small Pixel Seek colors are not smeared),
+4. sends it to SysX with the `RCVR` v1 UDP protocol (`docs/OBS_RECEIVER_PROTOCOL.md`): 30-byte big-endian header, 1,170-byte JPEG chunks, ≤1,200-byte datagrams.
 
-Edit these constants before building:
+The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <resolution>` and repeats it whenever Crop Resolution changes. The plugin accepts that message only from the configured receiver address and recreates its GPU crop resources, so the receiver's Crop Resolution stays authoritative. Only the newest frame is kept; a slow encoder or network drops obsolete frames instead of queueing them.
 
-```cpp
-constexpr char kDestinationIp[] = "192.168.1.100";
-constexpr uint16_t kDestinationPort = 4200;
-constexpr int kJpegQuality = 80;
+## Configuration
+
+On first load the plugin writes `%APPDATA%\obs-studio\plugin_config\sysx-canvas-sender\sender.ini`. Edit it and restart OBS:
+
+```ini
+host = 127.0.0.1      ; SysX receiver IPv4 address or hostname
+port = 4200           ; receiver UDP port
+jpeg_quality = 80     ; 1-100
+max_fps = 0           ; 0 = every OBS render frame
+chroma_444 = 1        ; 1 = 4:4:4 (Pixel Seek), 0 = 4:2:0 (smaller frames)
+default_crop = 640    ; used until the receiver reports its crop
 ```
 
-Build on Windows with the OBS development SDK and libjpeg-turbo:
+The plugin writes nothing to the OBS log (by request). OBS itself only logs `Loading module: …sysx-canvas-sender.dll`. HDR (non-8-bit-BGRA) canvases are silently not sent.
+
+## Install
+
+Copy `sysx-canvas-sender.dll` into `C:\Program Files\obs-studio\obs-plugins\64bit\` and restart OBS. Nothing else is required: libjpeg-turbo and the Visual C++ runtime are linked statically, so the DLL imports only `KERNEL32.dll` and `WS2_32.dll` (both part of Windows) and resolves libobs functions from the running `obs.dll`. No `jpeg62.dll`, VC++ redistributable, or `sender.ini` is needed — the defaults (127.0.0.1:4200) apply and the ini is created on first load. Remove older SysX sender DLLs (for example `sysx-canvas-sender-gpu-localhost.dll`) so two senders do not stream at once — the protocol supports one sender per receiver.
+
+## Build
+
+Requires Visual Studio 2022 Build Tools, the libobs headers from the matching OBS source release (plus a directory containing `obsconfig.h`), an `obs.lib` import library, and libjpeg-turbo. libobs graphics functions are resolved from the loaded `obs.dll` at runtime, so a minimal import library is enough.
 
 ```powershell
-cmake -S obs-plugin/sysx-canvas-sender -B build/obs-sysx `
-  -DOBS_INCLUDE_DIR="C:/Program Files/obs-studio/include" `
-  -DOBS_LIB_DIR="C:/Program Files/obs-studio/bin/64bit" `
-  -DJPEG_INCLUDE_DIR="C:/vcpkg/installed/x64-windows/include" `
-  -DJPEG_LIBRARY="C:/vcpkg/installed/x64-windows/lib/jpeg.lib"
-cmake --build build/obs-sysx --config Release
+cmake -S obs-plugin/sysx-canvas-sender -B work/obs-build-release -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release `
+  -DOBS_INCLUDE_DIR="work/obs-source/obs-studio-32.2.2/libobs;work/obs-config" `
+  -DOBS_LIB_DIR="work/obs-runtime/bin/64bit" `
+  -DJPEG_INCLUDE_DIR="C:/libjpeg-turbo64/include" `
+  -DJPEG_LIBRARY="C:/libjpeg-turbo64/lib/jpeg-static.lib"
+cmake --build work/obs-build-release
 ```
 
-Copy `sysx-canvas-sender.dll` into OBS's plugin directory under `obs-plugins/64bit`.
+Run these from a "x64 Native Tools" prompt (or after `vcvars64.bat`).
 
-The module has no settings page and intentionally emits no plugin logs. It keeps only the newest captured frame, so a slow encoder/network silently drops obsolete frames.
+## Headless self-test
+
+`sysx-sender-selftest` builds the same source without OBS and pushes a 320×320 frame, a 200×120 frame with a padded stride, and a 1×1 frame through the real encode/packetize path. It passes only if the receiver's `SYSCFG` crop reply arrives:
+
+```powershell
+cmake --build work/obs-build-release --target sysx-sender-selftest
+src-tauri/binaries/receiver-backend-x86_64-pc-windows-msvc.exe udp-listen --host 127.0.0.1 --port 4299 --count 3
+work/obs-build-release/sysx-sender-selftest.exe 4299
+```
+
+Validated on Windows 10 (2026-10-15) against the Rust `udp-listen` verifier: 3/3 frames decoded at their declared sizes, 0 invalid packets, 0 dropped/expired frames, crop reply 640.
+
+## Headless libobs check
+
+`sysx-obs-host-check` loads the real `obs.dll` (OBS 32.2.2 runtime in `work/obs-runtime`), starts D3D11 video at 1920×1080/60 with no window, loads the plugin via `obs_open_module` + `obs_init_module` exactly as OBS does, runs, then calls `obs_shutdown` (which unloads the plugin). Point `APPDATA` at a scratch folder so the real OBS profile is untouched:
+
+```powershell
+cmake --build work/obs-build-release --target sysx-obs-host-check
+cd work/obs-runtime/bin/64bit
+$env:APPDATA = "<scratch>"   # with obs-studio\plugin_config\sysx-canvas-sender\sender.ini
+..\..\..\obs-build-release\sysx-obs-host-check.exe <path>\sysx-canvas-sender.dll 10
+```
+
+Result on Windows 10 + RTX 4060 (2026-10-15, static-CRT build): plugin loaded and `udp-listen` received 300/300 frames (640×640, frame IDs 1–300) at OBS's 60 FPS render rate; shutdown/unload was clean. HDR check (Rec.2100 PQ canvas, RGBA16F main texture): the plugin loaded, sent nothing, and unloaded cleanly. After logging was removed the silent build was rechecked: no plugin lines in the libobs log, 239 frames in 4 s at 60 FPS, HDR still skipped. Throughput (640×640, 4:4:4, quality 80, loopback, 5 s including startup): 1,171 frames at a 240 FPS render rate (234.2 FPS) and 1,784 frames at 360 FPS (356.8 FPS). The harness takes optional `<fps>` and `hdr` arguments after the seconds. Not yet validated: the OBS Studio app UI itself, real game/scene content at high FPS, and LAN/firewall delivery between two computers.

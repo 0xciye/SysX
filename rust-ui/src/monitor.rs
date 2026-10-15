@@ -1,23 +1,18 @@
-use crate::client::{command_channel, device_status, start_backend_client};
+use crate::client::{command_channel, start_backend_client};
 use crate::layout::preview_detections;
 use crate::preview::{PreviewCanvas, PreviewFrame};
 use crate::protocol::{BackendEvent, BackendState, DeviceStatus};
-use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
-use wasm_bindgen_futures::spawn_local;
 
+/// Receiver window: one square live feed with an in-feed HUD, connection and
+/// device status in a thin bar, and the five mouse-button states below the feed.
 #[component]
 pub fn MonitorApp() -> impl IntoView {
     let backend_state = RwSignal::new(None::<BackendState>);
     let backend_connected = RwSignal::new(false);
     let backend_error = RwSignal::new(String::new());
-    let device = RwSignal::new(DeviceStatus {
-        state: "missing".into(),
-        name: None,
-        buttons: vec![None; 5],
-    });
     let frame = RwSignal::new(None::<PreviewFrame>);
     let detections = RwSignal::new(Vec::new());
     let target = RwSignal::new(None::<[f32; 2]>);
@@ -31,13 +26,17 @@ pub fn MonitorApp() -> impl IntoView {
     Effect::new({
         let command_receiver = Rc::clone(&command_receiver);
         move || {
+            let _keep_sender = command_sender.clone();
             if let Some(command_receiver) = command_receiver.borrow_mut().take() {
-                start_backend_client(false, command_receiver, move |event| match event {
+                start_backend_client("monitor", command_receiver, move |event| match event {
                     BackendEvent::Ready => {
                         backend_connected.set(true);
                         backend_error.set(String::new());
                     }
-                    BackendEvent::Disconnected => backend_connected.set(false),
+                    BackendEvent::Disconnected => {
+                        backend_connected.set(false);
+                        frame.set(None);
+                    }
                     BackendEvent::State(state) => {
                         backend_connected.set(true);
                         backend_error.set(state.last_error.clone().unwrap_or_default());
@@ -48,6 +47,8 @@ pub fn MonitorApp() -> impl IntoView {
                             "Smooth".into()
                         });
                         detection_color.set(pixel_color_hex(&state.pixel_color).into());
+                        // "waiting" = no frame for a second: show the empty
+                        // state instead of a frozen image.
                         if state.status == "waiting" {
                             frame.set(None);
                             detections.set(Vec::new());
@@ -68,10 +69,9 @@ pub fn MonitorApp() -> impl IntoView {
                         }
                     }
                     BackendEvent::Frame(next, image_url, preview_fps) => {
-                        let strategy = next.mode.as_str();
                         let visible = preview_detections(
                             &next.detection.objects,
-                            strategy,
+                            &next.mode,
                             model_confidence.get_untracked(),
                             |object| object.confidence,
                         );
@@ -91,112 +91,170 @@ pub fn MonitorApp() -> impl IntoView {
                     BackendEvent::Error(message) => backend_error.set(message),
                 });
             }
-            let command_sender = command_sender.clone();
-            spawn_local(async move {
-                let _command_sender = command_sender;
-                loop {
-                    match device_status().await {
-                        Ok(value) => device.set(value),
-                        Err(_) => {
-                            device.set(DeviceStatus {
-                                state: "error".into(),
-                                name: None,
-                                buttons: vec![None; 5],
-                            });
-                        }
-                    }
-                    TimeoutFuture::new(100).await;
-                }
-            });
         }
     });
 
-    let receiving = move || {
-        frame.get().is_some()
-            && backend_state
-                .get()
-                .is_some_and(|state| state.status == "streaming")
+    let status = Memo::new(move |_| {
+        monitor_status(
+            !backend_error.get().is_empty(),
+            backend_connected.get(),
+            frame.with(Option::is_some),
+        )
+    });
+    let port = move || {
+        backend_state
+            .get()
+            .and_then(|state| state.port)
+            .filter(|_| backend_connected.get())
     };
-    let status_label = move || {
-        let error = !backend_error.get().is_empty();
-        if error {
-            if backend_connected.get() {
-                "Runtime error"
-            } else {
-                "Connection error"
-            }
-        } else if receiving()
-            || backend_state
-                .get()
-                .is_some_and(|state| state.status == "streaming")
-        {
-            "Receiving frames"
-        } else if backend_connected.get() {
-            "Waiting for sender"
-        } else {
-            "Starting receiver"
+    let device = Memo::new(move |_| {
+        backend_state
+            .get()
+            .and_then(|state| state.device)
+            .filter(|_| backend_connected.get())
+            .unwrap_or_else(|| DeviceStatus {
+                state: "missing".into(),
+                name: None,
+                buttons: vec![None; 5],
+            })
+    });
+    let device_label = move || {
+        let device = device.get();
+        match device.state.as_str() {
+            "connected" => device.name.unwrap_or_else(|| "Device connected".into()),
+            "error" => "Device error".into(),
+            _ => "No device".into(),
         }
     };
+    let device_tone = move || match device.get().state.as_str() {
+        "connected" => "live",
+        "error" => "error",
+        _ => "idle",
+    };
+    let hud = move || {
+        frame.with(|frame| match frame {
+            Some(value) => (
+                format!(
+                    "{} × {}",
+                    value.frame.detection.processed_width, value.frame.detection.processed_height
+                ),
+                value
+                    .frame
+                    .processing_fps
+                    .map(|fps| format!("{fps:.0}"))
+                    .unwrap_or_else(|| "—".into()),
+                format!("{:.2}", value.frame.detection.total_processing_ms),
+            ),
+            None => ("—".into(), "—".into(), "—".into()),
+        })
+    };
+    let empty_detail = move || match status.get() {
+        MonitorStatus::RuntimeError | MonitorStatus::ConnectionError => backend_error.get(),
+        MonitorStatus::Starting => "Launching the local receiver.".into(),
+        _ => match port() {
+            Some(port) => {
+                format!("Listening on UDP {port}. Preview starts with the first valid frame.")
+            }
+            None => "Preview starts with the first valid frame.".into(),
+        },
+    };
+
     view! {
-        <main class="app-window monitor-window">
-            <header class="app-header">
-                <div class="nav-brand"><img class="brand-mark" src="/receiver-mark.svg" alt="" aria-hidden="true"/><span>"SysX"</span></div>
-                <div class="header-status-group monitor-status-group">
-                    <span class=move || format!("device-chip {}", if device.get().state == "connected" { "connected" } else { "error" }) aria-live="polite">
-                        <i/>
-                        {move || match device.get().state.as_str() {
-                            "connected" => device.get().name.unwrap_or_else(|| "Connected".into()),
-                            "error" => "Device error".into(),
-                            _ => "No device".into(),
-                        }}
+        <main class="monitor">
+            <header class="monitor-bar">
+                <div class="monitor-brand">
+                    <img src="receiver-mark.svg" alt="" aria-hidden="true"/>
+                    <span>"SysX"</span>
+                </div>
+                <div class="monitor-status">
+                    <span class="status" data-tone=move || status.get().tone() role="status" aria-live="polite">
+                        <i aria-hidden="true"/>{move || status.get().label()}
                     </span>
-                    <div class="mouse-state" role="group" aria-label="Physical mouse button state">
-                        <span class="mouse-state-title">"Mouse"</span>
-                        {[
-                            ("Left", "Left"),
-                            ("Right", "Right"),
-                            ("Middle", "Middle"),
-                            ("Mouse4", "M4"),
-                            ("Mouse5", "M5"),
-                        ].into_iter().enumerate().map(|(index, (label, display))| {
-                            let button_state = move || match device.get().buttons.get(index).copied().flatten() {
-                                Some(true) if device.get().state == "connected" => "pressed",
-                                Some(false) if device.get().state == "connected" => "released",
-                                _ => "unknown",
+                    <Show when=move || port().is_some()>
+                        <span class="status-port">{move || port().map(|port| format!("UDP {port}"))}</span>
+                    </Show>
+                    <span class="status-divider" aria-hidden="true"/>
+                    <span class="status" data-tone=device_tone aria-live="polite">
+                        <i aria-hidden="true"/>{device_label}
+                    </span>
+                </div>
+            </header>
+            <section class="monitor-stage" aria-label="Live preview">
+                <div class="monitor-column">
+                    <div class="feed">
+                        <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov/>
+                        <div class="feed-hud" aria-label="Processing resolution, FPS and latency">
+                            <span><b>{move || hud().0}</b></span>
+                            <span><b>{move || hud().1}</b><i>"FPS"</i></span>
+                            <span><b>{move || hud().2}</b><i>"ms"</i></span>
+                        </div>
+                        <Show when=move || frame.with(Option::is_none)>
+                            <div class="feed-empty" role="status" aria-live="polite">
+                                <span class="feed-empty-tag">"NO FRAME"</span>
+                                <strong data-tone=move || status.get().tone()><i aria-hidden="true"/>{move || status.get().label()}</strong>
+                                <p>{empty_detail}</p>
+                            </div>
+                        </Show>
+                    </div>
+                    <div class="mouse" role="group" aria-label="Physical mouse buttons">
+                        {["Left", "Right", "Middle", "M4", "M5"].into_iter().enumerate().map(|(index, label)| {
+                            let state = move || {
+                                let device = device.get();
+                                match device.buttons.get(index).copied().flatten() {
+                                    Some(true) if device.state == "connected" => "down",
+                                    Some(false) if device.state == "connected" => "up",
+                                    _ => "unknown",
+                                }
                             };
                             view! {
-                                <span class=move || format!("mouse-state-key {}", button_state()) aria-label=move || format!("{label}: {}", button_state()) title=move || format!("{label}: {}", button_state())>
-                                    <i aria-hidden="true"/>{display}
+                                <span class="mouse-key" data-state=state aria-label=move || format!("{label}: {}", state())>
+                                    <i aria-hidden="true"/>{label}
                                 </span>
                             }
                         }).collect_view()}
                     </div>
-                    <span class=move || format!("status-chip {}", if !backend_error.get().is_empty() { "error" } else if receiving() { "ready" } else { "waiting" }) aria-live="polite"><i/>{status_label}</span>
                 </div>
-            </header>
-            <section class="monitor-content" aria-label="Live preview">
-                <section class="preview-panel monitor-preview" aria-label="Preview">
-                    <div class="preview-canvas">
-                        <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov/>
-                        <Show when=move || frame.get().is_none()>
-                            <div class="waiting-message" role="status" aria-live="polite">
-                                <span class="waiting-indicator" aria-hidden="true"/>
-                                <span class="frame-empty-label">"NO FRAME"</span>
-                                <strong>{move || if !backend_error.get().is_empty() { if backend_connected.get() { "Receiver error" } else { "Receiver unavailable" } } else if backend_connected.get() { "Waiting for sender" } else { "Starting receiver" }}</strong>
-                                <Show when=move || !backend_error.get().is_empty()>
-                                    <span>{backend_error}</span>
-                                </Show>
-                            </div>
-                        </Show>
-                    </div>
-                    <footer class="monitor-hud" aria-label="Performance">
-                        <span><i>"Processing resolution"</i><b>{move || if receiving() { frame.get().map(|value| format!("{} × {}", value.frame.detection.processed_width, value.frame.detection.processed_height)).unwrap_or_else(|| "—".into()) } else { "—".into() }}</b></span>
-                        <span><i>"FPS"</i><b>{move || if receiving() { frame.get().and_then(|value| value.frame.processing_fps).map(|fps| format!("{fps:.1}")).unwrap_or_else(|| "—".into()) } else { "—".into() }}</b></span>
-                        <span><i>"Latency"</i><b>{move || if receiving() { frame.get().map(|value| format!("{:.2} ms", value.frame.detection.total_processing_ms)).unwrap_or_else(|| "—".into()) } else { "—".into() }}</b></span>
-                    </footer>
-                </section>
             </section>
         </main>
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorStatus {
+    Starting,
+    Waiting,
+    Receiving,
+    RuntimeError,
+    ConnectionError,
+}
+
+impl MonitorStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting receiver",
+            Self::Waiting => "Waiting for sender",
+            Self::Receiving => "Receiving frames",
+            Self::RuntimeError => "Runtime error",
+            Self::ConnectionError => "Connection error",
+        }
+    }
+
+    fn tone(self) -> &'static str {
+        match self {
+            Self::Starting | Self::Waiting => "wait",
+            Self::Receiving => "live",
+            Self::RuntimeError | Self::ConnectionError => "error",
+        }
+    }
+}
+
+fn monitor_status(has_error: bool, connected: bool, has_frame: bool) -> MonitorStatus {
+    match (has_error, connected, has_frame) {
+        (true, true, _) => MonitorStatus::RuntimeError,
+        (true, false, _) => MonitorStatus::ConnectionError,
+        (false, _, true) => MonitorStatus::Receiving,
+        (false, true, false) => MonitorStatus::Waiting,
+        (false, false, false) => MonitorStatus::Starting,
     }
 }
 

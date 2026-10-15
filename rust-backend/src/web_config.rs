@@ -55,6 +55,7 @@ pub async fn start(
     };
     let app = Router::new()
         .route("/config.html", get(config_page))
+        .route("/monitor.html", get(config_page))
         .route("/api/session", get(session))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/upload-model", post(upload_model))

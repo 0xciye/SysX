@@ -120,7 +120,7 @@ fn draw_empty(canvas: &HtmlCanvasElement) {
     let Some((context, width, height, _)) = context(canvas) else {
         return;
     };
-    context.set_fill_style_str("#080a0b");
+    context.set_fill_style_str("#05080b");
     context.fill_rect(0.0, 0.0, width, height);
 }
 
@@ -137,7 +137,7 @@ fn draw_image(
     let Some((context, width, height, _)) = context(canvas) else {
         return;
     };
-    context.set_fill_style_str("#080a0b");
+    context.set_fill_style_str("#05080b");
     context.fill_rect(0.0, 0.0, width, height);
     context.set_image_smoothing_enabled(!pixel_perfect);
     let Some(rect) = fit_preview_image(
@@ -192,7 +192,7 @@ fn draw_image(
                 0.0,
                 std::f64::consts::TAU,
             );
-            context.set_stroke_style_str("rgba(67,207,190,.78)");
+            context.set_stroke_style_str("rgba(67,207,160,.8)");
             context.set_line_width(1.0);
             context.stroke();
         }
@@ -285,20 +285,23 @@ fn draw_summary(context: &CanvasRenderingContext2d, summary: &str, rect: Rect, c
         return;
     }
     let font_size = 15.0_f64.min(10.0_f64.max(max_width / (summary.len() as f64 * 0.58).max(12.0)));
-    context.set_font(&format!("600 {font_size}px Segoe UI, Arial, sans-serif"));
+    context.set_font(&format!(
+        "500 {font_size}px Cascadia Mono, Consolas, ui-monospace, monospace"
+    ));
     let text_width = context
         .measure_text(summary)
         .map(|metric| metric.width())
         .unwrap_or(0.0);
     let badge_width = max_width.min(text_width + 22.0);
     let x = rect.x + (rect.width - badge_width) / 2.0;
-    let y = rect.y + 10.0;
-    context.set_fill_style_str("rgba(10, 13, 15, .94)");
+    // Bottom-center keeps the top-left corner free for the HTML HUD plate.
+    let y = rect.y + rect.height - 29.0 - 10.0;
+    context.set_fill_style_str("rgba(6, 9, 12, .86)");
     context.fill_rect(x, y, badge_width, 29.0);
     context.set_stroke_style_str(color);
-    context.set_line_width(1.5);
+    context.set_line_width(1.0);
     context.stroke_rect(x, y, badge_width, 29.0);
-    context.set_fill_style_str("#E6EBEC");
+    context.set_fill_style_str("#EBF1F5");
     context.set_text_baseline("middle");
     context.set_text_align("center");
     let _ = context.fill_text_with_max_width(

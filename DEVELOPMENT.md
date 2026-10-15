@@ -2,20 +2,18 @@
 
 ## Current milestone status (2026-10-15)
 
-The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The release macOS bundle was rebuilt from the current source and visually checked with the native Rust UI mounted through embedded WASM; its square preview startup state and FPS/latency/resolution HUD are visible. Chrome configuration mounts the same Rust WASM UI and uses the persisted app-data settings file. Windows and physical-device validation remain outstanding.
+The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The receiver window is the Rust WASM monitor page (`/monitor.html`) served by the backend and opened by the native host as a chromeless Edge app window; the separate config page is the same bundle at `/config.html` in the default browser. The `eframe/egui` window was removed. Windows visual review and physical-device validation remain outstanding.
 
 ## Architecture
 
-The application source is Rust: **Tauri 2 + a Leptos/WebAssembly UI + a Rust sidecar**. Trunk builds the UI bundle consumed by the native monitor and by the sidecar's loopback-only `/config.html` route. Windows release builds embed both the sidecar and config assets into one portable `SysX.exe`; the app extracts them under app data while it runs. The legacy React/TypeScript frontend, Python backend, Python benchmark scripts, and PyInstaller spec have been removed. Rust Object Detection has ONNX Runtime, OpenVINO, and optional TensorRT adapters; no real model or target hardware has validated inference.
+The application source is Rust: **a native host (no UI toolkit) + a Leptos/WebAssembly monitor/config UI + a Rust sidecar**. Trunk builds one bundle served by the sidecar's loopback-only `/monitor.html` and `/config.html` routes. Windows release builds embed both the sidecar and UI assets into one portable `SysX.exe`; the app extracts them under app data while it runs. The legacy React/TypeScript frontend, Python backend, Python benchmark scripts, and PyInstaller spec have been removed. Rust Object Detection has ONNX Runtime, OpenVINO, and optional TensorRT adapters; no real model or target hardware has validated inference.
 
-The monitor is a native desktop window rendered through the operating system's WebView (WebView2 on Windows and WKWebView on macOS). Configuration runs in a separate browser window against a loopback-only page served by the Rust sidecar; it is not public or cloud hosted. Windows builds emit a single executable without an installer. The Windows host must provide WebView2 Runtime, and accelerator backends may require their vendor runtime. Neither framework by itself guarantees a 180–360 FPS processing rate; that depends on frame size, model, device, and bounded pipeline behavior and must be benchmarked.
+The monitor is the web page `/monitor.html`, opened by the host with `msedge --app=<url> --user-data-dir=%LOCALAPPDATA%\SysX\monitor-window` (default browser as fallback). It connects to the backend WebSocket with `role=monitor`; the backend counts those clients in `state.monitor_clients`, and the host exits 3 s after the count drops to zero (60 s if no monitor ever connects). The host connects with `role=host` (state only, no preview frames) and pushes Medius/Ferrum status with the `device_status` command; the backend validates it and republishes it as `state.device`, which drives the monitor's device label and Mouse State. Configuration runs in a separate browser window against the same loopback server; nothing is public or cloud hosted. Windows builds emit a single executable without an installer. Accelerator backends may require their vendor runtime. Neither framework by itself guarantees a 180–360 FPS processing rate; that depends on frame size, model, device, and bounded pipeline behavior and must be benchmarked.
 
 Build the Windows executable and its embedded sidecar on Windows; do not claim Windows validation from a macOS build.
 
 References:
 
-- [Tauri process model](https://v2.tauri.app/concept/process-model/)
-- [Tauri sidecar binaries](https://v2.tauri.app/develop/sidecar/)
 - [Electron process model](https://www.electronjs.org/docs/latest/tutorial/process-model)
 - [Electron IPC](https://www.electronjs.org/docs/latest/tutorial/ipc)
 
@@ -23,14 +21,14 @@ References:
 
 ### Brand assets
 
-- `public/receiver-mark.svg` is the canonical SysX mark. Keep the title-bar mark and the Tauri PNG/ICO exports visually aligned with it.
-- `src-tauri/tauri.conf.json` lists the PNG and ICO used by desktop bundles.
+- `public/receiver-mark.svg` is the canonical SysX mark. Keep browser config branding and desktop assets visually aligned with it.
+- `src-tauri/build.rs` embeds the backend sidecar and web-config assets into the native executable.
 
 ### Rust UI
 
 - UI components live in `rust-ui/src`; `layout.rs` contains pure preview geometry helpers.
-- `scripts/build-rust-ui.mjs` runs Trunk for both development and release builds. The same output directory feeds Tauri's monitor and the Rust sidecar's local configuration server.
-- Tauri enables `withGlobalTauri` so the Rust UI can select the monitor view and call native commands. The browser-served configuration view uses the local backend HTTP/WebSocket APIs.
+- `scripts/build-rust-ui.mjs` runs Trunk for both development and release builds. The output directory is embedded and served by the Rust sidecar's local configuration server.
+- `app.rs` mounts `MonitorApp` on `/monitor.html` and `ConfigApp` everywhere else; both get their WebSocket token from `/api/session`. Monitor styles are the `.monitor` block at the end of `style.css`, using the tokens in `design-system/sysx-native-receiver/MASTER.md`.
 
 ### Desktop frontend
 
@@ -63,7 +61,7 @@ References:
 - Import one bundle with ONNX `.onnx`, TensorRT `.engine`/`.plan`, and OpenVINO IR `.xml`/`.bin`. ONNX Runtime is CPU-only; OpenVINO requests CPU/GPU/NPU from the installed runtime; TensorRT is compiled only when TensorRT headers and `CUDA_PATH` are set during backend build and needs GPU hardware. Inference rejects crop dimensions that differ from the configured model input; it does not resize.
 - The supported decoder expects raw YOLOv8 output shaped `[1, 4+classes, anchors]` or `[1, anchors, 4+classes]`. Confidence and IoU come from the model registry; class-aware NMS precedes the common FOV/prior-box/anchor selector. The Precision selector is saved UI preference only.
 - Runtime adapters compile, the pure output decoder and crop mismatch path have unit coverage, but no user model is present. Actual model inference and accelerator/runtime availability remain unverified.
-- `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the Tauri executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
+- `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the native executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
 
 The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pixel Seek or a selected Object Detection runtime, persists detections, and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
 
@@ -84,16 +82,16 @@ The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pi
 
 The CapkfaPlus mapping in [`docs/CAPKFA_RECONSTRUCTION_MAPPING.md`](docs/CAPKFA_RECONSTRUCTION_MAPPING.md) is reference material only. SysX does not expose or run the reconstructed active-state, mode-predicate, direct-offset, or timed-click branches because their live state producers are unavailable. The supported output path uses fresh summed deltas, the configured physical trigger, sampled recoil on Y, and the documented Medius/Ferrum relative-move APIs.
 
-The development and release launchers build the Rust UI before the Rust backend. Tauri embeds the sidecar and static config bundle; Windows emits the `SysX.exe` portable executable with `--no-bundle`. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
+The development and release launchers build the Rust UI before the Rust backend. The native host embeds the sidecar and static config bundle; Windows emits the `receiver.exe` portable executable. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
 
-The Tauri host runs the vision sidecar and a background device monitor as separate Rust processes/threads. Pending movement-delta merging, freshness checks, trigger mapping, and the ±32 per-axis command clamp live in `src-tauri/src/movement.rs`; device monitors retain the Medius and Ferrum API calls. The host checks Medius devices using the official `medius` Rust client and watches five physical button states. Ferrum currently uses a Silicon Labs CP210x Legacy API connection at 115,200 baud, verified by `km.version()`. While the configured trigger is held, the host sends the merged movement through that same verified connection. The X/Y exponential filters are applied before movement. The Ferrum App Software API endpoint and movement behavior on either vendor's hardware remain unverified on Windows.
+The native host runs the vision sidecar and a background device monitor as separate Rust processes/threads. Pending movement-delta merging, freshness checks, trigger mapping, and the ±32 per-axis command clamp live in `src-tauri/src/movement.rs`; device monitors retain the Medius and Ferrum API calls. The host checks Medius devices using the official `medius` Rust client and watches five physical button states. Ferrum currently uses a Silicon Labs CP210x Legacy API connection at 115,200 baud, verified by `km.version()`. While the configured trigger is held, the host sends the merged movement through that same verified connection. The X/Y exponential filters are applied before movement. The Ferrum App Software API endpoint and movement behavior on either vendor's hardware remain unverified on Windows.
 
-No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` builds the Rust sidecar and UI, emits one `SysX.exe` without an installer, verifies UDP `4200` and 192×192 frame receipt, then checks executable startup, embedded backend bind, and normal shutdown. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
+No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` (no Node required) builds the Trunk UI, the Rust sidecar, runs all three test suites, emits one `SysX.exe` without an installer, and verifies UDP `4200` and 192×192 frame receipt. `-AppSmoke` additionally launches `SysX.exe`, waits for its backend to bind UDP `4200` and for the monitor Edge window, closes that window, and checks that SysX and its backend exit — it opens windows, so run it only when the machine is free. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
 
 ## Build prerequisites
 
-- Node.js 20+, pnpm, Rust stable, Trunk, and the Tauri platform prerequisites.
-- For Windows release builds: Windows x64 runner and an available WebView2 Runtime on the validation machine.
+- Node.js 20+, pnpm, Rust stable, and Trunk.
+- For Windows release builds: Windows x64 runner and the selected inference runtimes.
 
 ## Commands
 
@@ -101,9 +99,9 @@ Build and launch commands from the project root:
 
 ```sh
 pnpm install
-pnpm tauri dev
+pnpm native:dev
 pnpm build
-pnpm tauri build
+pnpm build:desktop
 ```
 
 Rust backend checks from the repository root:
@@ -129,7 +127,7 @@ The verifier reports frames it actually receives; it does not measure inference 
 
 Use `0.0.0.0` as the listener host only when intentionally accepting frames from other computers on the network. The verifier reports frames it actually receives; it does not measure inference throughput.
 
-The OBS sender is out of scope for the current application. Its interoperable SysX contract and implementation limits are documented in [`docs/OBS_RECEIVER_PROTOCOL.md`](docs/OBS_RECEIVER_PROTOCOL.md). Keep that document synchronized with `rust-backend/src/udp.rs` if the wire protocol changes.
+The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, runtime `sender.ini`, headless `sysx-sender-selftest`); see its README for build/install. The wire contract is documented in [`docs/OBS_RECEIVER_PROTOCOL.md`](docs/OBS_RECEIVER_PROTOCOL.md). Keep that document synchronized with `rust-backend/src/udp.rs` if the wire protocol changes.
 
 ## Milestones
 
@@ -229,6 +227,13 @@ The OBS sender is out of scope for the current application. Its interoperable Sy
 94. [x] Removed Native Motion State and Timed Action from the active UI/runtime. Restored the Tauri movement module with fresh pending-delta summing, selected-trigger gating, recoil sampling into Y, and ±32 command clamps. The backend now creates `app-settings.json` on first launch; the web config reads and writes that file through its local settings API. Added persistence and movement regression tests; Windows and hardware movement remain unverified.
 95. [x] Fixed packaged WebView startup: production CSP now permits the Trunk WASM bootstrap, and the embedded page includes a visible `NO FRAME` startup fallback if a platform WebView cannot initialize WASM. Rebuilt and opened the release macOS bundle successfully; it shows the SysX startup state instead of a black window. The fallback does not replace the Rust UI when WASM initializes normally.
 96. [x] Made the native Preview viewport square at up to 640 × 640 CSS pixels and kept its HUD to the three requested measured fields: resolution, FPS, and latency. The startup fallback follows the same square preview and HUD shape.
+97. [x] Replaced the Tauri/WebView desktop shell with a native `eframe/egui` receiver window. The Rust host connects directly to the authenticated preview WebSocket, embeds the backend/config assets, opens only the loopback config page in the browser, and restores native Medius/Ferrum monitoring with five-button telemetry and movement output. `cargo fmt --check`, native tests (5), backend tests (35), `git diff --check`, and the Windows release build pass; no runtime window was opened during this validation because the user was actively gaming.
+98. [x] Redesigned the native receiver UI using the Impeccable and UI/UX Pro Max direction: a simple single-page dark Preview surface, large feed, compact in-feed `RES / FPS / LATENCY` HUD, bottom Mouse State strip, high-contrast semantic status colors, and restrained spacing. The generated design system is persisted in `design-system/sysx-native-receiver/`; native compile and detector checks pass.
+99. [x] Corrected the single-page layout after visual review: the footer is now reserved outside the preview content, the square preview is centered within the remaining viewport, the HUD renders above the image layer, and Mouse State stays in a dedicated footer strip. Release build and native tests pass.
+100. [x] Added live configuration synchronization while the receiver is running: each authenticated preview WebSocket now emits a changed state snapshot every 250 ms, including while binary preview frames are flowing. Web Config Apply Changes therefore updates the native Receiver's display and runtime telemetry without requiring a restart. Backend formatting, check, and all 35 backend tests pass.
+
+101. [x] Completed the OBS sender plugin: runtime `sender.ini` (host, port, JPEG quality, FPS cap, 4:4:4/4:2:0 chroma, startup crop), 8 MiB UDP send buffer, libjpeg-turbo BGRA input linked statically (no `jpeg62.dll`), `SYSCFG` crop accepted only from the configured receiver, HDR/non-BGRA canvases skipped, and no OBS log output (by request). A headless `sysx-sender-selftest` sent 320×320, padded-stride 200×120, and 1×1 frames to the Rust `udp-listen` verifier on Windows 10: 3/3 decoded, 0 invalid/dropped/expired, crop reply 640. The DLL links libjpeg-turbo and the VC++ runtime statically (imports only KERNEL32/WS2_32). The headless `sysx-obs-host-check` loaded it inside the real OBS 32.2.2 `obs.dll` with D3D11 video and no window: 300/300 640×640 frames reached `udp-listen` at 60 FPS and unload was clean; an HDR canvas is skipped silently; at 240/360 FPS render rates it delivered 234.2/356.8 FPS over loopback. The OBS Studio UI and LAN delivery between two computers are not yet validated.
+102. [x] Replaced the `eframe/egui` receiver window with the web monitor: Edge app window on `/monitor.html`, device/button state via `device_status` → `state.device`, host lifetime tied to `state.monitor_clients`. Redesigned the monitor with the Impeccable / UI UX Pro Max / no-AI-slop guidance (one focal feed, in-feed HUD plate, status as dot + text, shape-coded Mouse State, mono only for measurements). Backend (37), UI (5) and host (8) tests pass; the new window has not been visually captured because the user was using the machine.
 
 ## Limitations to preserve
 
@@ -236,7 +241,7 @@ The OBS sender is out of scope for the current application. Its interoperable Sy
 - No user model is present. Object Detection supports raw YOLOv8 output only; ONNX Runtime uses CPU, OpenVINO requires the matching installed runtime/device plugin, and TensorRT requires a build with TensorRT headers plus `CUDA_PATH` and a compatible GPU. Precision remains a saved preference. No real-model, Windows, accelerator, or hardware inference has been validated.
 - Do not report the sample values in the prototype as live measurements.
 - The app can only be called Windows-tested after a Windows CI or device build and runtime check.
-- `scripts/smoke-windows-app.ps1` has not been executed locally because this workspace is macOS and has no PowerShell runtime; run it on a Windows machine for authoritative validation.
-- Previous macOS app bundles and benchmark results include the retired Python path. The 350.74 sender FPS / 355.0 source-processing FPS run is historical and is not Rust or current Tauri measurement. It does not verify OBS interoperability, Windows behavior, sustained 360-FPS sender throughput, or target hardware.
+- `scripts/smoke-windows-app.ps1` has not been executed locally; run it on a Windows machine for authoritative end-to-end validation.
+- Previous macOS app bundles and benchmark results include the retired Python path. The 350.74 sender FPS / 355.0 source-processing FPS run is historical and is not current native measurement. It does not verify OBS interoperability, Windows sustained 360-FPS sender throughput, or target hardware.
 - Except for `design-review/receiver-visual-qa-980x680.png`, the PNGs in `design-review/` are historical captures of earlier layouts. The current screenshot verifies layout only and shows a UDP bind error; Preview fit, overlay mapping, and HiDPI geometry have automated unit coverage, while Windows visual behavior remains unverified.
 

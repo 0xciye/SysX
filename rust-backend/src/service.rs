@@ -21,7 +21,7 @@ use image::codecs::jpeg::JpegEncoder;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +55,12 @@ pub struct ReceiverService {
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<JoinHandle<()>>>,
     session_id: String,
+    /// Latest Medius/Ferrum status reported by the native host
+    /// (`device_status` command); forwarded to the monitor page in `state`.
+    device: Mutex<Value>,
+    /// Open `role=monitor` WebSocket clients. The native host exits when the
+    /// monitor window has been closed.
+    monitor_clients: AtomicUsize,
 }
 
 impl ReceiverService {
@@ -175,6 +181,7 @@ impl ReceiverService {
             app.port.parse::<u16>().unwrap_or(requested_udp_port),
         )
         .map_err(|error| error.to_string())?;
+        initial_source.set_crop_resolution(app.crop_resolution);
         let mut source_state = SourceState {
             active: None,
             active_port: app.port.parse().unwrap_or(requested_udp_port),
@@ -203,6 +210,8 @@ impl ReceiverService {
             stop: Arc::new(AtomicBool::new(false)),
             reader: Mutex::new(None),
             session_id,
+            device: Mutex::new(missing_device()),
+            monitor_clients: AtomicUsize::new(0),
         });
         Self::start_reader(&service);
         Ok(service)
@@ -227,12 +236,6 @@ impl ReceiverService {
             .map(|value| value.clone())
             .unwrap_or_default();
         let models = self.registry.lock().ok();
-        let active_model = models.as_ref().and_then(|registry| {
-            registry
-                .active_model_id
-                .as_ref()
-                .and_then(|id| registry.models.get(id))
-        });
         let latest = self.pipeline.latest();
         let stats = self.pipeline.stats();
         let source_name;
@@ -256,13 +259,15 @@ impl ReceiverService {
         }
         let is_live = latest
             .as_ref()
-            .is_some_and(|frame| monotonic_ns().saturating_sub(frame.published_ns) < 1_000_000_000);
+            .is_some_and(|frame| preview_is_fresh(frame.published_ns, monotonic_ns()));
         let source_fps = self.source_fps();
         let active_model_id = models
             .as_ref()
             .and_then(|registry| registry.active_model_id.clone());
+        // The OBS plugin crops before transmission.  This is the resolution
+        // the receiver advertises to the sender and expects in each packet.
         let expected_source_resolution =
-            active_model.map(|model| vec![model.input_width, model.input_height]);
+            Some(vec![settings.crop_resolution, settings.crop_resolution]);
         let last_error = stats
             .last_error
             .clone()
@@ -280,7 +285,9 @@ impl ReceiverService {
             "session_id":self.session_id, "processed_frames":stats.processed_frames, "dropped_input_frames":stats.dropped_input_frames,
             "rejected_frames":stats.rejected_frames, "resolution_mismatches":stats.resolution_mismatches,
             "transport_dropped_frames":transport.dropped_frames + transport.expired_frames, "invalid_packets":transport.invalid_packets,
-            "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error
+            "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
+            "device":self.device.lock().map(|device| device.clone()).unwrap_or_else(|_| missing_device()),
+            "monitor_clients":self.monitor_clients.load(Ordering::Relaxed)
         })
     }
 
@@ -329,6 +336,12 @@ impl ReceiverService {
         }
         let mut candidate =
             UdpDecodedFrameSource::new("0.0.0.0", port).map_err(|error| error.to_string())?;
+        let crop_resolution = self
+            .settings
+            .lock()
+            .map_err(|_| "settings lock poisoned")?
+            .crop_resolution;
+        candidate.set_crop_resolution(crop_resolution);
         if let Err(error) = candidate.open() {
             let message = error.to_string();
             if let Ok(mut source) = self.source.lock() {
@@ -402,6 +415,11 @@ impl ReceiverService {
             .ok_or("command type is required")?;
         match kind {
             "state" => Ok(self.state()),
+            "device_status" => {
+                let device = parse_device_status(&command)?;
+                *self.device.lock().map_err(|_| "device lock poisoned")? = device;
+                Ok(json!({"event":"ack","type":kind}))
+            }
             "apply_settings" => {
                 let commands = command
                     .get("commands")
@@ -537,6 +555,11 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
                     .crop_resolution = resolution;
+                if let Ok(mut source) = self.source.lock() {
+                    if let Some(active) = source.active.as_mut() {
+                        active.set_crop_resolution(resolution);
+                    }
+                }
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
@@ -744,7 +767,14 @@ fn receiver_loop(service: Weak<ReceiverService>) {
                 .filter(|_| Instant::now() >= state.retry_at)
         });
         if let Some(port) = retry {
+            let crop_resolution = service
+                .settings
+                .lock()
+                .ok()
+                .map(|settings| settings.crop_resolution)
+                .unwrap_or(640);
             let candidate = UdpDecodedFrameSource::new("0.0.0.0", port).and_then(|mut source| {
+                source.set_crop_resolution(crop_resolution);
                 source.open()?;
                 Ok(source)
             });
@@ -814,6 +844,36 @@ struct WebSocketState {
 #[derive(serde::Deserialize)]
 struct WsQuery {
     token: String,
+    /// `monitor` (counted, receives preview frames), `host` (native host: state
+    /// only, no preview frames), or absent (config page: frames + state).
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientRole {
+    Monitor,
+    Host,
+    Config,
+}
+
+impl ClientRole {
+    fn parse(role: Option<&str>) -> Self {
+        match role {
+            Some("monitor") => Self::Monitor,
+            Some("host") => Self::Host,
+            _ => Self::Config,
+        }
+    }
+}
+
+/// Decrements the monitor count however the socket loop ends.
+struct MonitorGuard(Arc<ReceiverService>);
+
+impl Drop for MonitorGuard {
+    fn drop(&mut self) {
+        self.0.monitor_clients.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn websocket_route(
@@ -828,9 +888,10 @@ async fn websocket_route(
     if !token_ok || !allowed_origin {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
+    let role = ClientRole::parse(query.role.as_deref());
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| socket_loop(socket, state.service))
+        .on_upgrade(move |socket| socket_loop(socket, state.service, role))
 }
 
 fn token_matches(expected: &str, supplied: &str) -> bool {
@@ -852,13 +913,20 @@ fn origin_allowed(origin: Option<&str>, config_port: Option<u16>) -> bool {
     })
 }
 
-async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>) {
-    if send_text(&mut socket, service.state()).await.is_err() {
+async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role: ClientRole) {
+    let _monitor = (role == ClientRole::Monitor).then(|| {
+        service.monitor_clients.fetch_add(1, Ordering::Relaxed);
+        MonitorGuard(Arc::clone(&service))
+    });
+    let initial_state = service.state();
+    if send_text(&mut socket, initial_state.clone()).await.is_err() {
         return;
     }
     let mut ticker = tokio::time::interval(Duration::from_millis(1000 / DISPLAY_FPS));
+    // 100 ms keeps the monitor's Mouse State responsive; unchanged states are not resent.
+    let mut state_ticker = tokio::time::interval(Duration::from_millis(100));
     let mut last_frame = None;
-    let mut last_status = Instant::now();
+    let mut last_state = initial_state;
     loop {
         tokio::select! {
             message = socket.recv() => {
@@ -893,21 +961,61 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>) {
                 attach_request_id(&mut event, request_id);
                 if send_text(&mut socket, event).await.is_err() { break; }
             }
-            _ = ticker.tick() => {
+            _ = ticker.tick(), if role != ClientRole::Host => {
                 if let Some(processed) = service.pipeline.latest() {
-                    if last_frame != Some(processed.published_ns) {
+                    // A client that connects after the sender stopped must not
+                    // receive the stale last frame (it would read as "Receiving").
+                    if last_frame != Some(processed.published_ns) && preview_is_fresh(processed.published_ns, monotonic_ns()) {
                         match encode_frame(&service, &processed) {
                             Ok(bytes) => { if socket.send(Message::Binary(bytes.into())).await.is_err() { break; } last_frame = Some(processed.published_ns); }
                             Err(error) => service.record_error(error),
                         }
                     }
-                } else if last_status.elapsed() >= Duration::from_secs(1) {
-                    if send_text(&mut socket, service.state()).await.is_err() { break; }
-                    last_status = Instant::now();
+                }
+            }
+            // Settings are applied by another authenticated WebSocket client (the
+            // browser config page). Keep every connected receiver client in sync
+            // even while the frame stream is busy sending binary preview data.
+            _ = state_ticker.tick() => {
+                let state = service.state();
+                if state != last_state {
+                    if send_text(&mut socket, state.clone()).await.is_err() { break; }
+                    last_state = state;
                 }
             }
         }
     }
+}
+
+/// Same one-second window that `state()` uses for `streaming` vs `waiting`.
+fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
+    now_ns.saturating_sub(published_ns) < 1_000_000_000
+}
+
+fn missing_device() -> Value {
+    json!({"state":"missing","name":null,"buttons":[null,null,null,null,null]})
+}
+
+/// Validates the native host's device report before it is broadcast.
+fn parse_device_status(command: &Value) -> Result<Value, String> {
+    let state = command
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|state| ["connected", "missing", "error"].contains(state))
+        .ok_or("device state must be connected, missing, or error")?;
+    let name = match command.get("name") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(name)) if name.chars().count() <= 64 => json!(name),
+        _ => return Err("device name must be a string of at most 64 characters".into()),
+    };
+    let buttons = command
+        .get("buttons")
+        .and_then(Value::as_array)
+        .filter(|buttons| {
+            buttons.len() == 5 && buttons.iter().all(|b| b.is_boolean() || b.is_null())
+        })
+        .ok_or("device buttons must be five booleans or nulls")?;
+    Ok(json!({"state":state,"name":name,"buttons":buttons}))
 }
 
 fn attach_request_id(event: &mut Value, request_id: Option<Value>) {
@@ -1090,6 +1198,49 @@ mod tests {
         );
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn device_status_is_validated_before_broadcast() {
+        let valid =
+            json!({"state":"connected","name":"Medius","buttons":[true,false,null,false,false]});
+        assert_eq!(super::parse_device_status(&valid).unwrap(), valid);
+        let unnamed = super::parse_device_status(
+            &json!({"state":"missing","buttons":[null,null,null,null,null]}),
+        )
+        .unwrap();
+        assert_eq!(unnamed["name"], Value::Null);
+        for invalid in [
+            json!({"state":"hacked","buttons":[null,null,null,null,null]}),
+            json!({"state":"connected","buttons":[true,false]}),
+            json!({"state":"connected","buttons":[1,0,0,0,0]}),
+            json!({"state":"connected","name":"x".repeat(65),"buttons":[null,null,null,null,null]}),
+        ] {
+            assert!(super::parse_device_status(&invalid).is_err());
+        }
+        assert!(matches!(
+            super::ClientRole::parse(Some("monitor")),
+            super::ClientRole::Monitor
+        ));
+        assert!(matches!(
+            super::ClientRole::parse(Some("host")),
+            super::ClientRole::Host
+        ));
+        assert!(matches!(
+            super::ClientRole::parse(None),
+            super::ClientRole::Config
+        ));
+    }
+
+    #[test]
+    fn stale_preview_frames_are_not_sent_to_new_clients() {
+        let published = 5_000_000_000;
+        assert!(super::preview_is_fresh(published, published + 999_999_999));
+        assert!(!super::preview_is_fresh(
+            published,
+            published + 1_000_000_000
+        ));
+        assert!(super::preview_is_fresh(published, published - 1));
     }
 
     #[test]

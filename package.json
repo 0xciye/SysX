@@ -6,12 +6,9 @@
   "scripts": {
     "dev": "node scripts/build-rust-backend.mjs --debug && node scripts/build-rust-ui.mjs serve",
     "build": "node scripts/build-rust-ui.mjs build",
-    "build:desktop": "pnpm build && node scripts/build-rust-backend.mjs --release",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "build:desktop": "pnpm build && node scripts/build-rust-backend.mjs --release && cargo build --manifest-path src-tauri/Cargo.toml --release",
+    "native:dev": "node scripts/build-rust-backend.mjs --debug && cargo run --manifest-path src-tauri/Cargo.toml",
+    "native:build": "pnpm build:desktop"
   },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
-  }
+  "devDependencies": {}
 }

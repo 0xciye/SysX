@@ -1,5 +1,5 @@
 use crate::config::ModelDefinition;
-use crate::crop::{centered_crop, CropError};
+use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
 use crate::pixel_seek::{process_pixel_seek, PixelTargetColor};
 use crate::receiver::SourceFrame;
@@ -299,10 +299,7 @@ fn processing_loop(
             }
             Err(error) => {
                 state.stats.rejected_frames += 1;
-                if matches!(
-                    error,
-                    ProcessError::Crop(_) | ProcessError::ModelResolutionMismatch { .. }
-                ) {
+                if matches!(error, ProcessError::ModelResolutionMismatch { .. }) {
                     state.stats.resolution_mismatches += 1;
                 }
                 state.stats.last_error = Some(error.to_string());
@@ -322,20 +319,29 @@ fn process_frame(
     previous_is_fresh: bool,
 ) -> Result<ProcessedFrame, ProcessError> {
     let frame_started = Instant::now();
+    // The OBS plugin is the sole owner of capture cropping.  The receiver
+    // must process the JPEG exactly as received; applying another centered
+    // crop here would double-crop the image and waste a full-frame copy.
     let source_width = frame.image.width();
     let source_height = frame.image.height();
-    let (cropped, rect) = centered_crop(&frame.image, config.crop_resolution)?;
-    let crop_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+    let rect = CropRect {
+        x: 0,
+        y: 0,
+        width: source_width,
+        height: source_height,
+    };
+    let processed = &frame.image;
+    let crop_ms = 0.0;
     if config.strategy == DetectionMode::ObjectDetection {
         let model = config.model.as_ref().ok_or_else(|| {
             ProcessError::ObjectDetectionUnavailable("select a model bundle".into())
         })?;
-        if cropped.width() != model.input_width || cropped.height() != model.input_height {
+        if processed.width() != model.input_width || processed.height() != model.input_height {
             return Err(ProcessError::ModelResolutionMismatch {
                 expected_width: model.input_width,
                 expected_height: model.input_height,
-                actual_width: cropped.width(),
-                actual_height: cropped.height(),
+                actual_width: processed.width(),
+                actual_height: processed.height(),
             });
         }
         let runtime = cached_runtime(
@@ -346,7 +352,7 @@ fn process_frame(
         )
         .map_err(ProcessError::ObjectDetectionUnavailable)?;
         let inference = runtime
-            .infer(&cropped)
+            .infer(processed)
             .map_err(|error| ProcessError::ObjectDetectionUnavailable(error.to_string()))?;
         let postprocess_started = Instant::now();
         let boxes = decode_yolo_output(
@@ -364,8 +370,8 @@ fn process_frame(
             model_id: Some(model.id.clone()),
             source_width,
             source_height,
-            processed_width: cropped.width(),
-            processed_height: cropped.height(),
+            processed_width: processed.width(),
+            processed_height: processed.height(),
             objects,
             preprocess_ms: crop_ms + inference.preprocess_ms,
             detection_ms: inference.inference_ms,
@@ -378,8 +384,8 @@ fn process_frame(
         let candidates = object_detection_candidates(&result, model.confidence);
         let selected_target = object_detection_target(
             &candidates,
-            cropped.width(),
-            cropped.height(),
+            processed.width(),
+            processed.height(),
             rect.x,
             rect.y,
             config.fov_degrees,
@@ -397,10 +403,7 @@ fn process_frame(
         result.postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
         result.total_processing_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         return Ok(ProcessedFrame {
-            frame: SourceFrame {
-                image: cropped,
-                ..frame
-            },
+            frame: SourceFrame { ..frame },
             result,
             published_ns: monotonic_ns(),
             crop_x: rect.x,
@@ -409,7 +412,7 @@ fn process_frame(
         });
     }
     let started = Instant::now();
-    let output = process_pixel_seek(&cropped, rect, config.pixel_color, config.fov_degrees);
+    let output = process_pixel_seek(processed, rect, config.pixel_color, config.fov_degrees);
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
@@ -424,8 +427,8 @@ fn process_frame(
         model_id: None,
         source_width,
         source_height,
-        processed_width: cropped.width(),
-        processed_height: cropped.height(),
+        processed_width: processed.width(),
+        processed_height: processed.height(),
         objects: output.objects,
         preprocess_ms: crop_ms,
         detection_ms,
@@ -436,10 +439,7 @@ fn process_frame(
         smoothed_target_xy: filtered.map(|point| [point.x, point.y]),
     };
     Ok(ProcessedFrame {
-        frame: SourceFrame {
-            image: cropped,
-            ..frame
-        },
+        frame: SourceFrame { ..frame },
         result,
         published_ns: monotonic_ns(),
         crop_x: rect.x,
@@ -525,9 +525,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), &'static str> {
 
 #[derive(Debug, thiserror::Error)]
 enum ProcessError {
-    #[error(transparent)]
-    Crop(#[from] CropError),
-    #[error("model resolution {expected_width}x{expected_height} does not match cropped frame {actual_width}x{actual_height}")]
+    #[error("model resolution {expected_width}x{expected_height} does not match received cropped frame {actual_width}x{actual_height}")]
     ModelResolutionMismatch {
         expected_width: u32,
         expected_height: u32,
@@ -551,6 +549,51 @@ fn monotonic_ns() -> u64 {
 mod tests {
     use super::*;
     use crate::config::ModelArtifacts;
+
+    #[test]
+    fn processing_keeps_the_plugin_cropped_frame_without_recropping() {
+        let frame = SourceFrame {
+            frame_id: 7,
+            timestamp_ns: 11,
+            image: image::RgbImage::new(320, 320),
+            source: "udp".into(),
+        };
+        let config = PipelineConfig::default();
+        let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
+        let mut runtime_cache = None;
+        let processed = process_frame(
+            frame,
+            &config,
+            &mut smoother,
+            &mut runtime_cache,
+            None,
+            false,
+        )
+        .expect("the already-cropped frame should be processed as-is");
+
+        assert_eq!(
+            (
+                processed.frame.image.width(),
+                processed.frame.image.height()
+            ),
+            (320, 320)
+        );
+        assert_eq!((processed.crop_x, processed.crop_y), (0, 0));
+        assert_eq!(
+            (
+                processed.result.source_width,
+                processed.result.source_height
+            ),
+            (320, 320)
+        );
+        assert_eq!(
+            (
+                processed.result.processed_width,
+                processed.result.processed_height
+            ),
+            (320, 320)
+        );
+    }
 
     #[test]
     fn object_detection_rejects_crop_size_that_does_not_match_model_input() {

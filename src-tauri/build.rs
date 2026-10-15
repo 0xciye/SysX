@@ -30,7 +30,7 @@ fn main() {
     let embedded_backend = if sidecar.is_file() {
         format!("include_bytes!({sidecar:?})")
     } else {
-        println!("cargo:warning=Rust backend was not built; use the Tauri build hook for a runnable release");
+        println!("cargo:warning=Rust backend was not built; run pnpm build:desktop before a runnable release build");
         "&[]".into()
     };
 
@@ -42,8 +42,10 @@ fn main() {
     }
     files.sort();
 
-    let mut generated = format!("pub const EMBEDDED_BACKEND: &[u8] = {embedded_backend};\n");
-    generated.push_str("pub const EMBEDDED_CONFIG_ASSETS: &[(&str, &[u8])] = &[\n");
+    let mut generated =
+        format!("#[allow(dead_code)]\npub const EMBEDDED_BACKEND: &[u8] = {embedded_backend};\n");
+    generated
+        .push_str("#[allow(dead_code)]\npub const EMBEDDED_CONFIG_ASSETS: &[(&str, &[u8])] = &[\n");
     for relative in &files {
         let source = dist.join(relative);
         let name = relative.to_string_lossy().replace('\\', "/");
@@ -53,5 +55,4 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("embedded_runtime.rs");
     fs::write(output, generated).expect("write embedded runtime index");
-    tauri_build::build();
 }

@@ -65,6 +65,8 @@ pub struct BackendState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default)]
+    pub device: Option<DeviceStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

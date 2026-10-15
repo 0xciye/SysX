@@ -21,6 +21,8 @@ $testBackendIds = @()
 
 try {
     $app = Start-Process -FilePath $appExe -WorkingDirectory $appDir -PassThru
+    # Windows PowerShell 5.1 only reports ExitCode if the process handle was opened.
+    $null = $app.Handle
     $startupDeadline = (Get-Date).AddSeconds(120)
     $backend = $null
     $udpListener = $null
@@ -52,24 +54,32 @@ try {
     $testBackendIds = @($backend.Id)
     Write-Host "SysX launched its bundled backend (PID $($backend.Id)), which bound UDP port 4200."
 
-    $closeDeadline = (Get-Date).AddSeconds(10)
-    $closeRequested = $false
-    while ((Get-Date) -lt $closeDeadline) {
+    # The receiver window is an Edge app window using SysX's own profile
+    # (`--user-data-dir=...\SysX\monitor-window`). Closing it must stop SysX.
+    $monitorDeadline = (Get-Date).AddSeconds(30)
+    $monitor = @()
+    while ((Get-Date) -lt $monitorDeadline) {
         $app.Refresh()
         if ($app.HasExited) {
-            throw "SysX exited before the smoke test could request a normal window close."
+            throw "SysX exited before its monitor window opened."
         }
-        if ($app.MainWindowHandle -ne [IntPtr]::Zero -and $app.CloseMainWindow()) {
-            $closeRequested = $true
-            break
-        }
-        Start-Sleep -Milliseconds 200
+        $monitor = @(
+            Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like "*SysX\monitor-window*" -and $_.CommandLine -like "*--app=*monitor.html*" }
+        )
+        if ($monitor.Count -gt 0) { break }
+        Start-Sleep -Milliseconds 250
     }
-    if (-not $closeRequested) {
-        throw "Could not request a normal close of the SysX window."
+    if ($monitor.Count -eq 0) {
+        throw "SysX did not open its monitor app window within 30 seconds."
     }
-    if (-not $app.WaitForExit(15000)) {
-        throw "SysX did not exit after its main window was closed."
+    # Let the page connect before closing it.
+    Start-Sleep -Seconds 5
+    foreach ($process in $monitor) {
+        & taskkill.exe /PID $process.ProcessId /T | Out-Null
+    }
+    if (-not $app.WaitForExit(20000)) {
+        throw "SysX did not exit after its monitor window was closed."
     }
 
     $shutdownDeadline = (Get-Date).AddSeconds(10)
@@ -86,7 +96,7 @@ try {
         throw "SysX exited but left its bundled backend running."
     }
 
-    Write-Host "Windows desktop smoke test passed: app launch, backend startup, and shutdown."
+    Write-Host "Windows desktop smoke test passed: app launch, backend startup, monitor window, and shutdown on close."
 }
 finally {
     if ($app) {

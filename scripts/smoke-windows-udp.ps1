@@ -15,6 +15,8 @@ try {
     $listener = Start-Process -FilePath $sidecar `
         -ArgumentList @("udp-listen", "--host", "127.0.0.1", "--count", "1") `
         -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    # Windows PowerShell 5.1 only reports ExitCode if the process handle was opened.
+    $null = $listener.Handle
 
     $readyDeadline = (Get-Date).AddSeconds(120)
     $ready = $false

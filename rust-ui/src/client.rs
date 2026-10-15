@@ -4,10 +4,9 @@ use futures_util::{select, FutureExt, SinkExt, StreamExt};
 use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Uint8Array};
 use std::collections::VecDeque;
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{Blob, Url, UrlSearchParams};
 
 pub fn command_channel() -> (UnboundedSender<String>, UnboundedReceiver<String>) {
@@ -27,20 +26,18 @@ pub fn send_command(
         .is_ok()
 }
 
+/// `role` is sent to the backend: `"monitor"` for the receiver window (counted
+/// so the native host can exit when it closes), `"config"` for the settings page.
 pub fn start_backend_client(
-    config_page: bool,
+    role: &'static str,
     commands: UnboundedReceiver<String>,
     on_event: impl Fn(BackendEvent) + 'static,
 ) {
-    spawn_local(run_backend_client(
-        config_page,
-        commands,
-        Box::new(on_event),
-    ));
+    spawn_local(run_backend_client(role, commands, Box::new(on_event)));
 }
 
 async fn run_backend_client(
-    config_page: bool,
+    role: &'static str,
     mut commands: UnboundedReceiver<String>,
     on_event: Box<dyn Fn(BackendEvent)>,
 ) {
@@ -48,7 +45,7 @@ async fn run_backend_client(
     let mut object_urls = VecDeque::with_capacity(4);
     let mut pending_commands = VecDeque::new();
     loop {
-        let connection = match connection_info(config_page).await {
+        let connection = match connection_info().await {
             Ok(value) => value,
             Err(error) => {
                 on_event(BackendEvent::Error(error));
@@ -62,7 +59,7 @@ async fn run_backend_client(
             .as_string()
             .unwrap_or_default();
         let address = format!(
-            "ws://{}:{}/receiver?token={token}",
+            "ws://{}:{}/receiver?token={token}&role={role}",
             connection.host, connection.port
         );
         let socket = match WebSocket::open(&address) {
@@ -152,10 +149,7 @@ async fn wait_before_reconnect(
     }
 }
 
-async fn connection_info(config_page: bool) -> Result<ConnectionInfo, String> {
-    if !config_page {
-        return invoke_tauri("backend_connection_info").await;
-    }
+async fn connection_info() -> Result<ConnectionInfo, String> {
     let search = web_sys::window()
         .and_then(|window| window.location().search().ok())
         .unwrap_or_default();
@@ -213,36 +207,12 @@ pub async fn save_local_settings<T: serde::Serialize>(settings: &T) -> Result<()
     }
 }
 
-async fn invoke_tauri<T: serde::de::DeserializeOwned>(command: &str) -> Result<T, String> {
-    let window = web_sys::window().ok_or("Tauri window is unavailable")?;
-    let api = Reflect::get(window.as_ref(), &JsValue::from_str("__TAURI__")).map_err(js_error)?;
-    let core = Reflect::get(&api, &JsValue::from_str("core")).map_err(js_error)?;
-    let invoke = Reflect::get(&core, &JsValue::from_str("invoke"))
-        .map_err(js_error)?
-        .dyn_into::<Function>()
-        .map_err(js_error)?;
-    let promise = invoke
-        .call1(&core, &JsValue::from_str(command))
-        .map_err(js_error)?
-        .dyn_into::<Promise>()
-        .map_err(js_error)?;
-    let value = JsFuture::from(promise).await.map_err(js_error)?;
-    let json = js_sys::JSON::stringify(&value)
-        .map_err(js_error)?
-        .as_string()
-        .ok_or("Tauri returned an invalid value")?;
-    serde_json::from_str(&json).map_err(|error| error.to_string())
-}
-
-pub async fn device_status() -> Result<crate::protocol::DeviceStatus, String> {
-    invoke_tauri("device_status").await
-}
-
-pub fn is_tauri_window() -> bool {
-    let Some(window) = web_sys::window() else {
-        return false;
-    };
-    Reflect::has(window.as_ref(), &JsValue::from_str("__TAURI__")).unwrap_or(false)
+/// The native host opens the receiver window at `/monitor.html`; every other
+/// path is the configuration page.
+pub fn is_monitor_page() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().pathname().ok())
+        .is_some_and(|path| path.ends_with("/monitor.html"))
 }
 
 fn parse_text_event(text: &str, on_event: &dyn Fn(BackendEvent)) {
@@ -343,10 +313,4 @@ fn decode_frame(
         .filter(|(first, last)| times.len() > 1 && **last > **first)
         .map(|(first, last)| (times.len() - 1) as f64 * 1000.0 / (*last - *first));
     Some((frame, url, preview_fps))
-}
-
-fn js_error(value: JsValue) -> String {
-    value
-        .as_string()
-        .unwrap_or_else(|| format!("JavaScript bridge error: {value:?}"))
 }

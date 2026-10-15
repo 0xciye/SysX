@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::Manager;
 
 const MAX_DEVICE_DELTA: i64 = 32;
 const TARGET_FRESHNESS_MS: u64 = 100;
@@ -31,19 +30,16 @@ pub struct MovementTarget {
 #[derive(Default)]
 pub struct MovementState(Mutex<Option<MovementTarget>>);
 
-pub fn set_target(app: &tauri::AppHandle, value: &serde_json::Value) {
+pub fn set_target(state: &MovementState, value: &serde_json::Value) {
     let Ok(target) = serde_json::from_value::<MovementTarget>(value.clone()) else {
         return;
     };
-    if let Some(state) = app.try_state::<MovementState>() {
-        if let Ok(mut pending) = state.0.lock() {
-            *pending = Some(MovementTarget::merge_pending(pending.take(), target));
-        }
+    if let Ok(mut pending) = state.0.lock() {
+        *pending = Some(MovementTarget::merge_pending(pending.take(), target));
     }
 }
 
-pub fn take_target(app: &tauri::AppHandle) -> Option<MovementTarget> {
-    let state = app.try_state::<MovementState>()?;
+pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
     let target = state.0.lock().ok()?.take()?;
     target.is_fresh().then_some(target)
 }

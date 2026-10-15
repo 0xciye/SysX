@@ -42,7 +42,7 @@ pub fn ConfigApp() -> impl IntoView {
         command_sender.set(Some(command_tx_for_mount.clone()));
         if let Some(command_rx) = command_receiver.borrow_mut().take() {
             let loaded_state_for_events = Rc::clone(&loaded_settings);
-            start_backend_client(true, command_rx, move |event| match event {
+            start_backend_client("config", command_rx, move |event| match event {
                 BackendEvent::Ready => {
                     backend_connected.set(true);
                     backend_error.set(String::new());
@@ -293,7 +293,7 @@ pub fn ConfigApp() -> impl IntoView {
         move || (parse_float(&offset_y_draft.get()).unwrap_or(0.0) * 2.25).clamp(-32.0, 32.0);
 
     view! {
-        <main class="app-window">
+        <main class="app-window config-window">
             <header class="app-header">
                 <div class="nav-brand"><img class="brand-mark" src="/receiver-mark.svg" alt="" aria-hidden="true"/><span>"SysX Configuration"</span></div>
                 <span class=move || format!("status-chip {}", if !backend_error.get().is_empty() { "error" } else if backend_connected.get() { "ready" } else { "waiting" })><i/>{status_label}</span>
@@ -301,7 +301,10 @@ pub fn ConfigApp() -> impl IntoView {
             <div class="settings-workspace">
                 <section class="settings-view" aria-label="Settings">
                     <div class="page-heading">
-                        <h1>"Settings"</h1>
+                        <div class="page-title">
+                            <h1>"Settings"</h1>
+                            <p class="page-subtitle">"Tune capture, detection, targeting, and movement for this receiver."</p>
+                        </div>
                         <div class="apply-controls">
                             <button type="button" class="apply-button" on:click=apply_changes disabled=move || !apply_pending_id.get().is_empty() || (!settings_changed() && apply_message.get().is_empty())>"Apply Changes"</button>
                             <Show when=move || !apply_message.get().is_empty()>
