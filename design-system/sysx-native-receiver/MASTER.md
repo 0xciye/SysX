@@ -181,13 +181,13 @@
 
 - **Primary task:** See the current receiver crop immediately and trust the three live measurements.
 - **Surface order:** compact title/status bar > large square Preview > in-feed HUD > bottom Mouse State strip.
-- **Header (48 px):** SysX mark + name left; right side reads `● <receiver status>  UDP <port> | ● <device>`. Status is dot + text, never color alone.
+- **Header (48 px):** SysX mark + name left; right side shows only `● <device>` (receiver status and UDP port were removed by request; the receiver state lives in the Preview empty state). Status is dot + text, never color alone.
 - **Preview:** centered column, square ≤640 px, 8 px radius, 1 px border. HUD is one dark plate top-left: `<w × h>  <fps> FPS  <latency> ms` (mono values, sans units). Object Detection summary sits in a plate bottom-center. Overlays: boxes (class hue / Pixel Seek color), FOV circle, solid center-to-target line and ring, all mapped after removing the crop origin.
-- **Empty state:** `NO FRAME` (mono, muted) above a status headline with dot, plus one detail line (UDP port while waiting, error text on failure).
+- **Empty state:** `NO FRAME` (mono, muted) above a status headline with dot; a detail line appears only for errors (no "Listening on UDP" line, by request).
 - **Mouse State:** five equal-width cells matching the Preview width. Held = green tint + filled dot, released = ring, unknown = dash.
 - **Surface:** web page `/monitor.html` (Leptos/WASM, `.monitor` block in `rust-ui/style.css`) shown in a chromeless Edge app window; there is no egui window anymore. CSS tokens: `--m-bg #090C10`, `--m-bar #0F151C`, `--m-feed #05080B`, `--m-cell #121A23`, `--m-border #2D3946`, `--m-text #EBF1F5`, `--m-muted #9AA9B4`, `--m-live #43CFA0`, `--m-wait #E8B858`, `--m-error #EF6C6C`.
-- **Sizing:** `--m-side = max(240px, min(640px, 100vw − 40px, 100vh − bar − gap − mouse row − 40px))`; feed and Mouse State share that width. Below 520 px the port label and divider hide.
-- **Fonts:** Segoe UI Variable / Segoe UI for text; Cascadia Mono / Consolas only for measurements (HUD values, port, `NO FRAME`), with tabular numerals.
+- **Sizing:** `--m-side = max(240px, min(640px, 100vw − 40px, 100vh − bar − gap − mouse row − 40px))`; feed and Mouse State share that width.
+- **Fonts:** Segoe UI Variable / Segoe UI for text; Cascadia Mono / Consolas only for measurements (HUD values, `NO FRAME`), with tabular numerals.
 - **Motion:** only 120–200 ms color transitions on status dots and Mouse State; no pulsing or entrance animation; `prefers-reduced-motion` disables transitions.
 - **Captures:** `design-review/receiver-monitor-web-{live,waiting,narrow}.png` (headless Edge, isolated backend, synthetic plugin frames).
 - **Removed as decoration/duplication:** corner brackets, "RECEIVER MONITOR" eyebrow, pipeline chip, "LOOPBACK · AUTHENTICATED" caption, and the footer metric strip that repeated the HUD.

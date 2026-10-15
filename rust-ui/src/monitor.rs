@@ -101,12 +101,6 @@ pub fn MonitorApp() -> impl IntoView {
             frame.with(Option::is_some),
         )
     });
-    let port = move || {
-        backend_state
-            .get()
-            .and_then(|state| state.port)
-            .filter(|_| backend_connected.get())
-    };
     let device = Memo::new(move |_| {
         backend_state
             .get()
@@ -148,15 +142,10 @@ pub fn MonitorApp() -> impl IntoView {
             None => ("—".into(), "—".into(), "—".into()),
         })
     };
+    // Only errors get a detail line under the empty-state headline.
     let empty_detail = move || match status.get() {
         MonitorStatus::RuntimeError | MonitorStatus::ConnectionError => backend_error.get(),
-        MonitorStatus::Starting => "Launching the local receiver.".into(),
-        _ => match port() {
-            Some(port) => {
-                format!("Listening on UDP {port}. Preview starts with the first valid frame.")
-            }
-            None => "Preview starts with the first valid frame.".into(),
-        },
+        _ => String::new(),
     };
 
     view! {
@@ -167,13 +156,6 @@ pub fn MonitorApp() -> impl IntoView {
                     <span>"SysX"</span>
                 </div>
                 <div class="monitor-status">
-                    <span class="status" data-tone=move || status.get().tone() role="status" aria-live="polite">
-                        <i aria-hidden="true"/>{move || status.get().label()}
-                    </span>
-                    <Show when=move || port().is_some()>
-                        <span class="status-port">{move || port().map(|port| format!("UDP {port}"))}</span>
-                    </Show>
-                    <span class="status-divider" aria-hidden="true"/>
                     <span class="status" data-tone=device_tone aria-live="polite">
                         <i aria-hidden="true"/>{device_label}
                     </span>
@@ -192,7 +174,9 @@ pub fn MonitorApp() -> impl IntoView {
                             <div class="feed-empty" role="status" aria-live="polite">
                                 <span class="feed-empty-tag">"NO FRAME"</span>
                                 <strong data-tone=move || status.get().tone()><i aria-hidden="true"/>{move || status.get().label()}</strong>
-                                <p>{empty_detail}</p>
+                                <Show when=move || !empty_detail().is_empty()>
+                                    <p>{empty_detail}</p>
+                                </Show>
                             </div>
                         </Show>
                     </div>

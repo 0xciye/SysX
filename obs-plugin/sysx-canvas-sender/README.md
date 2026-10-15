@@ -11,22 +11,22 @@ The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <r
 
 ## Configuration
 
-On first load the plugin writes `%APPDATA%\obs-studio\plugin_config\sysx-canvas-sender\sender.ini`. Edit it and restart OBS:
+Configuration is compile-time (no ini file). Edit the constants at the top of `sysx_canvas_sender.cpp` and rebuild:
 
-```ini
-host = 127.0.0.1      ; SysX receiver IPv4 address or hostname
-port = 4200           ; receiver UDP port
-jpeg_quality = 80     ; 1-100
-max_fps = 0           ; 0 = every OBS render frame
-chroma_444 = 1        ; 1 = 4:4:4 (Pixel Seek), 0 = 4:2:0 (smaller frames)
-default_crop = 640    ; used until the receiver reports its crop
+```cpp
+constexpr char kReceiverHost[] = "127.0.0.1";  // SysX receiver IPv4 address or hostname
+constexpr uint16_t kReceiverPort = 4200;        // receiver UDP port
+constexpr int kJpegQuality = 80;                // 1-100
+constexpr uint32_t kMaxFps = 0;                 // 0 = every OBS render frame
+constexpr bool kChroma444 = true;               // false = 4:2:0 (smaller frames)
+constexpr uint32_t kDefaultCrop = 640;          // until the receiver reports its crop
 ```
 
 The plugin writes nothing to the OBS log (by request). OBS itself only logs `Loading module: …sysx-canvas-sender.dll`. HDR (non-8-bit-BGRA) canvases are silently not sent.
 
 ## Install
 
-Copy `sysx-canvas-sender.dll` into `C:\Program Files\obs-studio\obs-plugins\64bit\` and restart OBS. Nothing else is required: libjpeg-turbo and the Visual C++ runtime are linked statically, so the DLL imports only `KERNEL32.dll` and `WS2_32.dll` (both part of Windows) and resolves libobs functions from the running `obs.dll`. No `jpeg62.dll`, VC++ redistributable, or `sender.ini` is needed — the defaults (127.0.0.1:4200) apply and the ini is created on first load. Remove older SysX sender DLLs (for example `sysx-canvas-sender-gpu-localhost.dll`) so two senders do not stream at once — the protocol supports one sender per receiver.
+Copy `sysx-canvas-sender.dll` into `C:\Program Files\obs-studio\obs-plugins\64bit\` and restart OBS. Nothing else is required: libjpeg-turbo and the Visual C++ runtime are linked statically, so the DLL imports only `KERNEL32.dll` and `WS2_32.dll` (both part of Windows) and resolves libobs functions from the running `obs.dll`. No `jpeg62.dll`, VC++ redistributable, or config file is needed; the destination is compiled in (default 127.0.0.1:4200). Remove older SysX sender DLLs (for example `sysx-canvas-sender-gpu-localhost.dll`) so two senders do not stream at once — the protocol supports one sender per receiver.
 
 ## Build
 
@@ -57,12 +57,12 @@ Validated on Windows 10 (2026-10-15) against the Rust `udp-listen` verifier: 3/3
 
 ## Headless libobs check
 
-`sysx-obs-host-check` loads the real `obs.dll` (OBS 32.2.2 runtime in `work/obs-runtime`), starts D3D11 video at 1920×1080/60 with no window, loads the plugin via `obs_open_module` + `obs_init_module` exactly as OBS does, runs, then calls `obs_shutdown` (which unloads the plugin). Point `APPDATA` at a scratch folder so the real OBS profile is untouched:
+`sysx-obs-host-check` loads the real `obs.dll` (OBS 32.2.2 runtime in `work/obs-runtime`), starts D3D11 video at 1920×1080/60 with no window, loads the plugin via `obs_open_module` + `obs_init_module` exactly as OBS does, runs, then calls `obs_shutdown` (which unloads the plugin). Run `receiver-backend udp-listen` on the compiled-in port first:
 
 ```powershell
 cmake --build work/obs-build-release --target sysx-obs-host-check
 cd work/obs-runtime/bin/64bit
-$env:APPDATA = "<scratch>"   # with obs-studio\plugin_config\sysx-canvas-sender\sender.ini
+# the DLL sends to its compiled-in kReceiverHost:kReceiverPort; run udp-listen there
 ..\..\..\obs-build-release\sysx-obs-host-check.exe <path>\sysx-canvas-sender.dll 10
 ```
 

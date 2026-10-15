@@ -75,7 +75,14 @@ impl Drop for BackendRuntime {
         }
         let _ = self.child.wait();
         if let Some(path) = self.runtime_dir.take() {
-            let _ = fs::remove_dir_all(path);
+            // Windows can hold the just-exited backend image for a moment,
+            // leaving an empty directory behind; retry briefly.
+            for _ in 0..20 {
+                if fs::remove_dir_all(&path).is_ok() || !path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
@@ -670,7 +677,8 @@ fn open_monitor_window(port: u16, data_dir: &Path) {
                 .arg(format!("--app={url}"))
                 .arg(format!("--user-data-dir={}", profile.display()))
                 .args([
-                    "--window-size=720,820",
+                    // Compact default; Edge remembers later resizes in this profile.
+                    "--window-size=550,620",
                     "--no-first-run",
                     "--no-default-browser-check",
                 ])

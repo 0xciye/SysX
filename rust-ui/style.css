@@ -210,8 +210,6 @@ body:has(.config-window) { overflow: auto; }
 .monitor [data-tone="live"] > i { background: var(--m-live); }
 .monitor [data-tone="wait"] > i { background: var(--m-wait); }
 .monitor [data-tone="error"] > i { background: var(--m-error); }
-.status-port { color: var(--m-muted); font: 11px "Cascadia Mono", Consolas, ui-monospace, monospace; font-variant-numeric: tabular-nums; }
-.status-divider { width: 1px; height: 16px; background: var(--m-border); }
 
 .monitor-stage { flex: 1; min-height: 0; display: grid; place-items: center; padding: var(--m-pad); overflow: auto; }
 .monitor-column { width: var(--m-side); display: grid; gap: var(--m-gap); }
@@ -239,5 +237,4 @@ body:has(.config-window) { overflow: auto; }
 
 @media (max-width: 520px) {
   .monitor { --m-pad: 12px; }
-  .status-port, .status-divider { display: none; }
 }

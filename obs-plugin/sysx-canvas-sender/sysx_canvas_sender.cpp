@@ -24,8 +24,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -48,19 +46,27 @@ constexpr size_t kHeaderBytes = 30;
 constexpr char kControlPrefix[] = "SYSCFG 1 CROP ";
 constexpr int kSendBufferBytes = 8 * 1024 * 1024;
 
-// Runtime configuration, read from
-// %APPDATA%\obs-studio\plugin_config\sysx-canvas-sender\sender.ini.
-// The file is created with these defaults on first load.
+// ---- Sender configuration: edit these and rebuild the DLL. ----
+// SysX receiver IPv4 address (or hostname) and UDP port.
+constexpr char kReceiverHost[] = "127.0.0.1";
+constexpr uint16_t kReceiverPort = 4200;
+// JPEG quality 1-100.
+constexpr int kJpegQuality = 80;
+// Frames per second cap; 0 sends every OBS render frame.
+constexpr uint32_t kMaxFps = 0;
+// true = 4:4:4 chroma (keeps small Pixel Seek colors intact), false = 4:2:0.
+constexpr bool kChroma444 = true;
+// Crop used until the receiver's first SYSCFG control packet arrives.
+constexpr uint32_t kDefaultCrop = 640;
+// ----------------------------------------------------------------
+
 struct Config {
-  std::string host = "127.0.0.1";
-  uint16_t port = 4200;
-  int jpeg_quality = 80;
-  // 0 = every OBS render frame.
-  uint32_t max_fps = 0;
-  // 4:4:4 keeps small colored targets intact for Pixel Seek; 0 uses 4:2:0.
-  bool chroma_444 = true;
-  // Startup crop until the receiver's first SYSCFG control packet arrives.
-  uint32_t default_crop = 640;
+  std::string host = kReceiverHost;
+  uint16_t port = kReceiverPort;
+  int jpeg_quality = kJpegQuality;
+  uint32_t max_fps = kMaxFps;
+  bool chroma_444 = kChroma444;
+  uint32_t default_crop = kDefaultCrop;
 };
 
 // libobs functions are resolved from the already-loaded obs.dll so the module
@@ -138,65 +144,6 @@ ObsApi obs_api;
 uint64_t monotonic_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
-std::string trim(const std::string &value) {
-  const auto first = value.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return {};
-  const auto last = value.find_last_not_of(" \t\r\n");
-  return value.substr(first, last - first + 1);
-}
-
-std::filesystem::path config_path() {
-  const char *appdata = std::getenv("APPDATA");
-  std::filesystem::path root = appdata ? appdata : ".";
-  return root / "obs-studio" / "plugin_config" / "sysx-canvas-sender" / "sender.ini";
-}
-
-void write_default_config(const std::filesystem::path &path, const Config &config) {
-  std::error_code error;
-  std::filesystem::create_directories(path.parent_path(), error);
-  std::ofstream file(path);
-  if (!file) return;
-  file << "; SysX OBS canvas sender. Restart OBS after editing.\n"
-       << "; host: SysX receiver IPv4 address or hostname. port: receiver UDP port.\n"
-       << "host = " << config.host << "\n"
-       << "port = " << config.port << "\n"
-       << "; JPEG quality 1-100.\n"
-       << "jpeg_quality = " << config.jpeg_quality << "\n"
-       << "; Frames per second cap; 0 sends every OBS render frame.\n"
-       << "max_fps = " << config.max_fps << "\n"
-       << "; 1 = 4:4:4 chroma (best for Pixel Seek colors), 0 = 4:2:0 (smaller).\n"
-       << "chroma_444 = " << (config.chroma_444 ? 1 : 0) << "\n"
-       << "; Crop used until the receiver reports its Crop Resolution.\n"
-       << "default_crop = " << config.default_crop << "\n";
-}
-
-Config load_config() {
-  Config config;
-  const auto path = config_path();
-  std::ifstream file(path);
-  if (!file) {
-    write_default_config(path, config);
-    return config;
-  }
-  std::string line;
-  while (std::getline(file, line)) {
-    line = trim(line);
-    if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
-    const auto equals = line.find('=');
-    if (equals == std::string::npos) continue;
-    const std::string key = trim(line.substr(0, equals));
-    const std::string value = trim(line.substr(equals + 1));
-    const long number = std::strtol(value.c_str(), nullptr, 10);
-    if (key == "host" && !value.empty()) config.host = value;
-    else if (key == "port" && number >= 1 && number <= 65535) config.port = static_cast<uint16_t>(number);
-    else if (key == "jpeg_quality" && number >= 1 && number <= 100) config.jpeg_quality = static_cast<int>(number);
-    else if (key == "max_fps" && number >= 0 && number <= 1000) config.max_fps = static_cast<uint32_t>(number);
-    else if (key == "chroma_444") config.chroma_444 = number != 0;
-    else if (key == "default_crop" && number >= 1 && number <= 8192) config.default_crop = static_cast<uint32_t>(number);
-  }
-  return config;
 }
 
 struct Frame {
@@ -575,8 +522,7 @@ bool loaded = false;
 
 bool obs_module_load(void) {
   if (!obs_api.load()) return false;
-  const Config config = load_config();
-  if (!sender.start(config)) return false;
+  if (!sender.start(Config{})) return false;
   obs_api.add_rendered(main_rendered_callback, nullptr);
   loaded = true;
   return true;
