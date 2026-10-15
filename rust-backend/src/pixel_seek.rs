@@ -1,6 +1,6 @@
 use crate::crop::CropRect;
 use crate::results::DetectionObject;
-use crate::targeting::{highest_pixel_in_fov, FrameCoordinate};
+use crate::targeting::{highest_pixel_in_fov, highest_pixel_in_fov_within, FrameCoordinate};
 use image::RgbImage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,11 +42,42 @@ pub struct PixelSeekOutput {
     pub mask: Vec<u8>,
 }
 
+/// Minimum lock margin around the previous target box, in crop pixels.
+const LOCK_MARGIN_PX: f32 = 12.0;
+/// Lock margin as a fraction of the previous box's larger side.
+const LOCK_MARGIN_RATIO: f32 = 0.5;
+
+/// Search window for a locked target: the previous blob's box (original-frame
+/// coordinates) grown by a margin, in crop pixels `[left, top, right, bottom)`.
+/// Higher pixels that appear next to the target fall inside it, so the target
+/// keeps climbing; a separate blob elsewhere in the FOV does not.
+fn lock_region(previous: [f32; 4], crop: CropRect, width: u32, height: u32) -> Option<[u32; 4]> {
+    if !previous.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let [left, top, right, bottom] = [
+        previous[0] - crop.x as f32,
+        previous[1] - crop.y as f32,
+        previous[2] - crop.x as f32,
+        previous[3] - crop.y as f32,
+    ];
+    let margin = LOCK_MARGIN_PX.max((right - left).max(bottom - top) * LOCK_MARGIN_RATIO);
+    let clamp = |value: f32, max: u32| value.clamp(0.0, max as f32) as u32;
+    let region = [
+        clamp((left - margin).floor(), width),
+        clamp((top - margin).floor(), height),
+        clamp((right + margin).ceil(), width),
+        clamp((bottom + margin).ceil(), height),
+    ];
+    (region[0] < region[2] && region[1] < region[3]).then_some(region)
+}
+
 pub fn process_pixel_seek(
     image: &RgbImage,
     source_crop: CropRect,
     color: PixelTargetColor,
     fov_degrees: u16,
+    locked: Option<[f32; 4]>,
 ) -> PixelSeekOutput {
     let width = image.width();
     let height = image.height();
@@ -55,10 +86,15 @@ pub fn process_pixel_seek(
         let (h, s, v) = rgb_to_hsv(pixel.0[0], pixel.0[1], pixel.0[2]);
         mask[(y * width + x) as usize] = u8::from(in_profile(color, h, s, v));
     }
-    // Exactly one target: the topmost mask pixel inside the FOV. Only the blob
-    // containing it becomes the (single) detection; other colored regions are
-    // masked but ignored.
-    let Some(top) = highest_pixel_in_fov(&mask, width, height, fov_degrees) else {
+    // Exactly one target per frame. While a fresh lock exists, take the
+    // topmost FOV pixel near the locked target so two targets in the FOV do
+    // not alternate; when the locked target is gone, take the topmost mask
+    // pixel in the whole FOV. Only the blob containing it is reported.
+    let found = locked
+        .and_then(|previous| lock_region(previous, source_crop, width, height))
+        .and_then(|region| highest_pixel_in_fov_within(&mask, width, height, fov_degrees, region))
+        .or_else(|| highest_pixel_in_fov(&mask, width, height, fov_degrees));
+    let Some(top) = found else {
         return PixelSeekOutput {
             objects: Vec::new(),
             target: None,
@@ -182,6 +218,7 @@ mod tests {
             },
             PixelTargetColor::Yellow,
             360,
+            None,
         );
         assert_eq!(output.objects.len(), 1);
         assert_eq!(output.objects[0].bbox_xyxy, [13.0, 22.0, 16.0, 25.0]);
@@ -211,7 +248,7 @@ mod tests {
         let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
         paint(&mut image, 45, 60, 6); // lower blob
         paint(&mut image, 52, 30, 4); // higher blob, still inside a 360° FOV
-        let output = process_pixel_seek(&image, crop(100), PixelTargetColor::Red, 360);
+        let output = process_pixel_seek(&image, crop(100), PixelTargetColor::Red, 360, None);
         assert_eq!(output.objects.len(), 1);
         assert_eq!(output.objects[0].bbox_xyxy, [52.0, 30.0, 56.0, 34.0]);
         let target = output.target.expect("target");
@@ -224,11 +261,61 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_target_is_kept_when_another_higher_target_is_in_the_fov() {
+        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
+        paint(&mut image, 60, 50, 4); // locked target
+        paint(&mut image, 30, 20, 4); // separate, higher target elsewhere
+        let unlocked = process_pixel_seek(&image, crop(100), PixelTargetColor::Red, 360, None);
+        assert_eq!(unlocked.objects[0].bbox_xyxy, [30.0, 20.0, 34.0, 24.0]);
+        let locked = process_pixel_seek(
+            &image,
+            crop(100),
+            PixelTargetColor::Red,
+            360,
+            Some([60.0, 50.0, 64.0, 54.0]),
+        );
+        assert_eq!(locked.objects.len(), 1);
+        assert_eq!(locked.objects[0].bbox_xyxy, [60.0, 50.0, 64.0, 54.0]);
+        assert_eq!(locked.target.unwrap().y, 50.5);
+    }
+
+    #[test]
+    fn a_locked_target_still_climbs_to_higher_pixels_next_to_it() {
+        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
+        paint(&mut image, 60, 50, 4); // previous target box
+        paint(&mut image, 61, 42, 2); // higher pixels appearing just above it
+        paint(&mut image, 30, 10, 4); // unrelated higher target
+        let output = process_pixel_seek(
+            &image,
+            crop(100),
+            PixelTargetColor::Red,
+            360,
+            Some([60.0, 50.0, 64.0, 54.0]),
+        );
+        assert_eq!(output.target.unwrap().y, 42.5);
+        assert_eq!(output.objects[0].bbox_xyxy, [61.0, 42.0, 63.0, 44.0]);
+    }
+
+    #[test]
+    fn a_lost_lock_falls_back_to_the_topmost_target_in_the_fov() {
+        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
+        paint(&mut image, 30, 20, 4);
+        let output = process_pixel_seek(
+            &image,
+            crop(100),
+            PixelTargetColor::Red,
+            360,
+            Some([60.0, 50.0, 64.0, 54.0]),
+        );
+        assert_eq!(output.objects[0].bbox_xyxy, [30.0, 20.0, 34.0, 24.0]);
+    }
+
+    #[test]
     fn blobs_outside_the_fov_are_masked_but_never_targeted() {
         let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
         paint(&mut image, 2, 2, 5); // top-left corner, outside a small FOV
         paint(&mut image, 48, 55, 4); // near the center
-        let small = process_pixel_seek(&image, crop(100), PixelTargetColor::Red, 60);
+        let small = process_pixel_seek(&image, crop(100), PixelTargetColor::Red, 60, None);
         assert_eq!(small.objects.len(), 1);
         assert_eq!(small.objects[0].bbox_xyxy, [48.0, 55.0, 52.0, 59.0]);
         let none = process_pixel_seek(
@@ -242,6 +329,7 @@ mod tests {
             crop(100),
             PixelTargetColor::Red,
             60,
+            None,
         );
         assert!(none.objects.is_empty() && none.target.is_none());
     }

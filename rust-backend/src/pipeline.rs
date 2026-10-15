@@ -285,8 +285,12 @@ fn processing_loop(
                         prior_target_at = None;
                     }
                 } else {
-                    prior_target = None;
-                    prior_target_at = None;
+                    // Pixel Seek reports only its locked target's blob.
+                    prior_target = processed.result.objects.first().map(|object| PriorTarget {
+                        bbox_xyxy: Some(object.bbox_xyxy),
+                        class_id: None,
+                    });
+                    prior_target_at = prior_target.as_ref().map(|_| Instant::now());
                 }
                 drop(state);
                 if let Some(callback) = &on_processed {
@@ -415,7 +419,16 @@ fn process_frame(
         });
     }
     let started = Instant::now();
-    let output = process_pixel_seek(processed, rect, config.pixel_color, config.fov_degrees);
+    let locked = previous_target
+        .filter(|_| previous_is_fresh)
+        .and_then(|previous| previous.bbox_xyxy);
+    let output = process_pixel_seek(
+        processed,
+        rect,
+        config.pixel_color,
+        config.fov_degrees,
+        locked,
+    );
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
@@ -597,6 +610,41 @@ mod tests {
             ),
             (320, 320)
         );
+    }
+
+    #[test]
+    fn pixel_seek_keeps_climbing_to_each_newly_visible_higher_pixel() {
+        // A target is first seen at row 4; as rows 3, 2, 1 and 0 appear, every
+        // frame must retarget to the new topmost pixel (no stickiness).
+        let config = PipelineConfig {
+            pixel_color: PixelTargetColor::Red,
+            fov_degrees: 360,
+            ..PipelineConfig::default()
+        };
+        let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
+        let mut runtime_cache = None;
+        let mut image = image::RgbImage::new(64, 64);
+        for row in (0..=4u32).rev() {
+            image.put_pixel(32, row + 20, image::Rgb([255, 0, 0]));
+            let processed = process_frame(
+                SourceFrame {
+                    frame_id: u64::from(row),
+                    timestamp_ns: 0,
+                    image: image.clone(),
+                    source: "test".into(),
+                    jpeg: Default::default(),
+                },
+                &config,
+                &mut smoother,
+                &mut runtime_cache,
+                None,
+                false,
+            )
+            .unwrap();
+            let target = processed.result.smoothed_target_xy.expect("target");
+            assert_eq!(target[1], (row + 20) as f32 + 0.5, "frame for row {row}");
+            assert_eq!(processed.result.objects.len(), 1);
+        }
     }
 
     #[test]

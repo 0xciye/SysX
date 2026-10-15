@@ -36,6 +36,19 @@ pub fn highest_pixel_in_fov(
     height: u32,
     degrees: u16,
 ) -> Option<FrameCoordinate> {
+    highest_pixel_in_fov_within(mask, width, height, degrees, [0, 0, width, height])
+}
+
+/// Topmost mask pixel inside both the FOV circle and `region`
+/// (`[left, top, right, bottom)` in mask pixels, right/bottom exclusive).
+/// Ties on a row go to the pixel closest to the horizontal center.
+pub fn highest_pixel_in_fov_within(
+    mask: &[u8],
+    width: u32,
+    height: u32,
+    degrees: u16,
+    region: [u32; 4],
+) -> Option<FrameCoordinate> {
     if width == 0
         || height == 0
         || !(1..=360).contains(&degrees)
@@ -43,13 +56,19 @@ pub fn highest_pixel_in_fov(
     {
         return None;
     }
+    let [left, top, right, bottom] = [
+        region[0].min(width),
+        region[1].min(height),
+        region[2].min(width),
+        region[3].min(height),
+    ];
     let cx = width as f32 / 2.0;
     let cy = height as f32 / 2.0;
     let radius = (width.min(height) as f32 - 1.0) * degrees as f32 / 720.0;
-    for y in 0..height {
+    for y in top..bottom {
         let py = y as f32 + 0.5;
         let mut best_x: Option<u32> = None;
-        for x in 0..width {
+        for x in left..right {
             if mask[(y * width + x) as usize] == 0 {
                 continue;
             }
