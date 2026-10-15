@@ -125,3 +125,15 @@ Before calling the plugin compatible with the current Receiver, verify it with:
 - Sustained rate tests that record actual sender encode/network rates, Receiver processing/drop rates, and UI preview rate. Do not infer performance from the protocol verifier alone.
 
 Verified so far (Windows 10, loopback): the plugin's headless `sysx-sender-selftest` delivered a 320×320 multi-chunk frame, a 200×120 frame with a padded source stride, and a 1×1 frame to `receiver-backend udp-listen` (3/3 decoded at the declared sizes, 0 invalid packets, 0 dropped/expired) and received the receiver's `SYSCFG 1 CROP 640`; its streaming mode also drove the live monitor at ~32 processed FPS. The headless `sysx-obs-host-check` loaded the static-CRT DLL inside the real OBS 32.2.2 `obs.dll` (D3D11, 1920×1080/60, no window); the plugin captured the 640×640 centered crop on the GPU and `udp-listen` received 300/300 frames with a clean unload. HDR check (Rec.2100 PQ canvas, RGBA16F main texture): the plugin loaded, sent nothing, and unloaded cleanly. Throughput (640×640, 4:4:4, quality 80, loopback, 5 s including startup): 1,171 frames at a 240 FPS render rate (234.2 FPS) and 1,784 frames at 360 FPS (356.8 FPS). The harness takes optional `<fps>` and `hdr` arguments after the seconds. The OBS Studio app UI itself, Windows network/firewall behavior between separate computers, and 180–360 FPS hardware measurements remain deployment work.
+
+## 7. Running across a LAN (router)
+
+1. On the OBS computer set `kReceiverHost` to the SysX computer's LAN IPv4 address (keep `kReceiverPort = 4200`), rebuild the DLL, and install it. The plugin accepts `SYSCFG` only from that exact `host:port`; the receiver answers from its UDP 4200 socket, so the reply matches as long as the SysX computer uses that address on the LAN.
+2. On the SysX computer allow inbound UDP 4200 on the Private network profile once (elevated prompt):
+   `netsh advfirewall firewall add rule name="SysX UDP 4200" dir=in action=allow protocol=UDP localport=4200 profile=private`
+   SysX now extracts its backend to the fixed `%LOCALAPPDATA%\SysX\runtime\receiver-backend.exe`, so an app-based allow rule granted at the Windows prompt also persists across launches. The OBS side needs no rule: the `SYSCFG` reply comes back on the flow OBS opened.
+3. The receiver repeats `SYSCFG` every second while a sender streams, so a crop message dropped by the router is corrected within ~1 s. Only senders whose datagrams start with `RCVR` can become the `SYSCFG` recipient.
+4. The receiver socket uses an 8 MiB receive buffer (the sender uses an 8 MiB send buffer) so a frame's burst of ~100 datagrams is not dropped while the previous JPEG decodes.
+5. Bandwidth: a 640 × 640 crop at quality 80 with 4:4:4 chroma measured 75–97 KiB per frame here, about 150–190 Mbit/s at 240 FPS. Use wired gigabit Ethernet. On Wi-Fi or 100 Mbit links lower `kMaxFps`, set `kChroma444 = false`, or reduce `kJpegQuality`; otherwise incomplete frames are dropped (watch the transport-drop counter).
+
+Not yet validated on two physical computers.

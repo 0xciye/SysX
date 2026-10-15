@@ -628,8 +628,20 @@ fn prepare_runtime(
         if EMBEDDED_BACKEND.is_empty() {
             return Err("Rust backend was not embedded in SysX.exe".into());
         }
-        let runtime_dir =
-            _data_dir.join(format!("runtime-{}-{}", std::process::id(), &_token[..8]));
+        // A fixed path (safe: only one SysX runs) keeps the backend exe at the
+        // same location every launch, so a Windows Firewall allow rule for LAN
+        // UDP is granted once instead of re-prompting per run. Leftovers from
+        // crashed runs and older per-process `runtime-*` folders are removed.
+        if let Ok(entries) = fs::read_dir(_data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == "runtime" || name.starts_with("runtime-") {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        let runtime_dir = _data_dir.join("runtime");
         fs::create_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
         let executable = runtime_dir.join(if cfg!(target_os = "windows") {
             "receiver-backend.exe"

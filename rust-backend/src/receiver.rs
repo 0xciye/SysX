@@ -1,6 +1,6 @@
 use image::{ImageFormat, RgbImage};
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -79,7 +79,13 @@ pub struct UdpDecodedFrameSource {
     datagram: [u8; MAX_DATAGRAM_BYTES + 1],
     crop_resolution: u32,
     sender: Option<SocketAddr>,
+    config_sent_at: Option<Instant>,
 }
+
+/// SYSCFG is unacknowledged UDP; over a LAN/router a lost reply would leave the
+/// sender on a stale crop, so it is repeated while the sender keeps streaming.
+const CROP_CONFIG_RESEND: Duration = Duration::from_secs(1);
+const RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 impl UdpDecodedFrameSource {
     pub fn new(host: impl Into<String>, port: u16) -> io::Result<Self> {
@@ -97,6 +103,7 @@ impl UdpDecodedFrameSource {
             datagram: [0; MAX_DATAGRAM_BYTES + 1],
             crop_resolution: 640,
             sender: None,
+            config_sent_at: None,
         })
     }
 
@@ -108,7 +115,23 @@ impl UdpDecodedFrameSource {
     }
     pub fn open(&mut self) -> io::Result<()> {
         if self.socket.is_none() {
-            let socket = UdpSocket::bind((self.host.as_str(), self.port))?;
+            let address = (self.host.as_str(), self.port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "no UDP bind address")
+                })?;
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            // Over a LAN a whole frame (~100 datagrams) arrives in a burst
+            // while this thread may still be decoding the previous JPEG; the
+            // small default Windows buffer would drop chunks and whole frames.
+            let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES);
+            socket.bind(&address.into())?;
+            let socket: UdpSocket = socket.into();
             socket.set_read_timeout(Some(Duration::from_millis(50)))?;
             self.socket = Some(socket);
         }
@@ -138,9 +161,16 @@ impl UdpDecodedFrameSource {
                 .recv_from(&mut self.datagram)
             {
                 Ok((length, sender)) => {
-                    if self.sender != Some(sender) {
-                        self.sender = Some(sender);
-                        self.send_crop_config();
+                    // Only a real RCVR sender may become the crop recipient;
+                    // stray LAN datagrams must not redirect SYSCFG.
+                    if self.datagram[..length].starts_with(b"RCVR") {
+                        let resend_due = self
+                            .config_sent_at
+                            .is_none_or(|sent| sent.elapsed() >= CROP_CONFIG_RESEND);
+                        if self.sender != Some(sender) || resend_due {
+                            self.sender = Some(sender);
+                            self.send_crop_config();
+                        }
                     }
                     self.reassembler
                         .accept(&self.datagram[..length], monotonic_ns());
@@ -157,14 +187,16 @@ impl UdpDecodedFrameSource {
     pub fn close(&mut self) {
         self.socket = None;
         self.sender = None;
+        self.config_sent_at = None;
     }
 
-    fn send_crop_config(&self) {
+    fn send_crop_config(&mut self) {
         let (Some(socket), Some(sender)) = (&self.socket, self.sender) else {
             return;
         };
         let message = format!("SYSCFG 1 CROP {}", self.crop_resolution);
         let _ = socket.send_to(message.as_bytes(), sender);
+        self.config_sent_at = Some(Instant::now());
     }
 }
 
@@ -194,5 +226,48 @@ mod tests {
         .expect("fixture decodes");
         assert_eq!((frame.image.width(), frame.image.height()), (192, 192));
         assert_eq!(frame.jpeg.as_slice(), jpeg.as_slice());
+    }
+
+    #[test]
+    fn crop_config_is_repeated_to_the_rcvr_sender_and_never_to_stray_hosts() {
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg").to_vec();
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.port = 0; // ephemeral for the test
+        source.open().unwrap();
+        source.set_crop_resolution(256);
+        let target = source.local_addr().unwrap().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let stray = UdpSocket::bind("127.0.0.1:0").unwrap();
+        stray
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut reply = [0u8; 64];
+        let send_frame = |frame_id: u64| {
+            for packet in crate::udp::encode_jpeg_frame(frame_id, 192, 192, 0, &jpeg).unwrap() {
+                sender.send_to(&packet, target).unwrap();
+            }
+        };
+
+        stray.send_to(b"hello", target).unwrap();
+        send_frame(1);
+        let _ = source.read(Duration::from_millis(300)).unwrap();
+        let length = sender.recv(&mut reply).expect("first SYSCFG");
+        assert_eq!(&reply[..length], b"SYSCFG 1 CROP 256");
+        assert!(stray.recv(&mut reply).is_err(), "stray host got SYSCFG");
+
+        // Within the resend interval: no repeat.
+        send_frame(2);
+        let _ = source.read(Duration::from_millis(300)).unwrap();
+        assert!(sender.recv(&mut reply).is_err());
+
+        // After the interval the still-streaming sender gets it again.
+        std::thread::sleep(CROP_CONFIG_RESEND);
+        send_frame(3);
+        let _ = source.read(Duration::from_millis(300)).unwrap();
+        let length = sender.recv(&mut reply).expect("repeated SYSCFG");
+        assert_eq!(&reply[..length], b"SYSCFG 1 CROP 256");
     }
 }

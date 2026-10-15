@@ -1422,6 +1422,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "socket2",
  "subtle",
  "thiserror",
  "tokio",
