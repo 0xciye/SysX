@@ -73,7 +73,7 @@
 - Do not say a Windows build or hardware throughput target passed unless it was actually run on Windows or the target hardware.
 - The local macOS app bundles its Python sidecar and has been smoke-tested with 192×192 UDP frames; do not treat this as Windows, OBS, or 180–360 FPS validation. App shutdown must stop the full PyInstaller process group.
 - A current native 980 × 680 review confirmed stacked Detection Engine choices and a scrollable Settings panel; the `design-review/` screenshots remain historical and must not be presented as that review.
-- The Windows workflow runs on pushes, pull requests, and manual dispatch. It must run `scripts/smoke-windows-udp.ps1` against the built sidecar and `scripts/smoke-windows-installer.ps1` against the NSIS artifact. These verify the default UDP port and 192×192 frame reassembly, then silent install, installed app/backend startup with UDP `4200` bound by that backend process, shutdown, and uninstall; they do not verify visual rendering.
+- No GitHub Actions build workflow is configured. Windows validation scripts remain available for manual execution; they verify UDP `4200` and 192×192 frame reassembly, then silent install, installed app/backend startup, shutdown, and uninstall. They do not verify visual rendering.
 - In Windows PowerShell build scripts, check `$LASTEXITCODE` after every native command. `$ErrorActionPreference = "Stop"` alone does not reliably turn native nonzero exit codes into terminating errors.
 - Pass Tauri CLI options directly through the pnpm script (for example `pnpm tauri:build --config ...`); do not insert a standalone `--` before them.
 - Validate explicit CUDA/MPS availability before model inference and surface recovery guidance; never offer Apple MPS as a usable Windows device.
