@@ -7,7 +7,7 @@ use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Uint8Array};
 use std::collections::VecDeque;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Blob, Url, UrlSearchParams};
+use web_sys::{Blob, UrlSearchParams};
 
 pub fn command_channel() -> (UnboundedSender<String>, UnboundedReceiver<String>) {
     unbounded()
@@ -42,7 +42,6 @@ async fn run_backend_client(
     on_event: Box<dyn Fn(BackendEvent)>,
 ) {
     let mut recent_preview_times = VecDeque::with_capacity(128);
-    let mut object_urls = VecDeque::with_capacity(4);
     let mut pending_commands = VecDeque::new();
     loop {
         let connection = match connection_info().await {
@@ -98,8 +97,8 @@ async fn run_backend_client(
                 message = incoming => match message {
                     Some(Ok(Message::Text(text))) => parse_text_event(&text, &*on_event),
                     Some(Ok(Message::Bytes(bytes))) => {
-                        if let Some((frame, url, fps)) = decode_frame(&bytes, &mut recent_preview_times, &mut object_urls) {
-                            on_event(BackendEvent::Frame(frame, url, fps));
+                        if let Some((frame, image, fps)) = decode_frame(&bytes, &mut recent_preview_times) {
+                            on_event(BackendEvent::Frame(frame, image, fps));
                         }
                     }
                     Some(Err(error)) => {
@@ -123,9 +122,6 @@ async fn run_backend_client(
         if wait_before_reconnect(&mut commands, &mut pending_commands).await {
             break;
         }
-    }
-    for url in object_urls {
-        let _ = Url::revoke_object_url(&url);
     }
 }
 
@@ -270,11 +266,7 @@ fn parse_text_event(text: &str, on_event: &dyn Fn(BackendEvent)) {
     }
 }
 
-fn decode_frame(
-    bytes: &[u8],
-    times: &mut VecDeque<f64>,
-    urls: &mut VecDeque<String>,
-) -> Option<(LiveFrame, String, Option<f64>)> {
+fn decode_frame(bytes: &[u8], times: &mut VecDeque<f64>) -> Option<(LiveFrame, Blob, Option<f64>)> {
     if bytes.len() < 5 {
         return None;
     }
@@ -283,22 +275,12 @@ fn decode_frame(
     if metadata_end >= bytes.len() {
         return None;
     }
-    let metadata: serde_json::Value = serde_json::from_slice(bytes.get(4..metadata_end)?).ok()?;
-    if metadata.get("event")?.as_str()? != "frame" {
-        return None;
-    }
-    let frame: LiveFrame = serde_json::from_value(metadata).ok()?;
+    // Binary messages only carry frames; parse the metadata once, directly.
+    let frame: LiveFrame = serde_json::from_slice(bytes.get(4..metadata_end)?).ok()?;
     let image = Uint8Array::from(bytes.get(metadata_end..)?);
     let parts = Array::new();
     parts.push(image.as_ref());
     let blob = Blob::new_with_u8_array_sequence(&parts).ok()?;
-    let url = Url::create_object_url_with_blob(&blob).ok()?;
-    urls.push_back(url.clone());
-    while urls.len() > 4 {
-        if let Some(old) = urls.pop_front() {
-            let _ = Url::revoke_object_url(&old);
-        }
-    }
     let now = web_sys::window()
         .and_then(|window| window.performance())
         .map(|performance| performance.now())
@@ -312,5 +294,5 @@ fn decode_frame(
         .zip(times.back())
         .filter(|(first, last)| times.len() > 1 && **last > **first)
         .map(|(first, last)| (times.len() - 1) as f64 * 1000.0 / (*last - *first));
-    Some((frame, url, preview_fps))
+    Some((frame, blob, preview_fps))
 }

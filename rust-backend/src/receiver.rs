@@ -1,6 +1,7 @@
 use image::{ImageFormat, RgbImage};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -12,6 +13,9 @@ pub struct SourceFrame {
     pub timestamp_ns: u64,
     pub image: RgbImage,
     pub source: String,
+    /// The sender's original JPEG, forwarded to Preview as-is so the monitor
+    /// can show every input frame without re-encoding. Empty when unknown.
+    pub jpeg: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +67,7 @@ pub fn decode_udp_frame(frame: EncodedFrame) -> Result<SourceFrame, ReceiverErro
         timestamp_ns: frame.timestamp_ns,
         image,
         source: "udp".into(),
+        jpeg: Arc::new(frame.jpeg),
     })
 }
 
@@ -170,4 +175,24 @@ fn monotonic_ns() -> u64 {
         .elapsed()
         .as_nanos()
         .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_frame_keeps_the_sender_jpeg_for_preview() {
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg").to_vec();
+        let frame = decode_udp_frame(EncodedFrame {
+            frame_id: 3,
+            width: 192,
+            height: 192,
+            timestamp_ns: 9,
+            jpeg: jpeg.clone(),
+        })
+        .expect("fixture decodes");
+        assert_eq!((frame.image.width(), frame.image.height()), (192, 192));
+        assert_eq!(frame.jpeg.as_slice(), jpeg.as_slice());
+    }
 }

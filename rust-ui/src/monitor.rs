@@ -68,7 +68,7 @@ pub fn MonitorApp() -> impl IntoView {
                             model_confidence.set(model.confidence);
                         }
                     }
-                    BackendEvent::Frame(next, image_url, preview_fps) => {
+                    BackendEvent::Frame(next, image, preview_fps) => {
                         let visible = preview_detections(
                             &next.detection.objects,
                             &next.mode,
@@ -83,7 +83,7 @@ pub fn MonitorApp() -> impl IntoView {
                         detections.set(visible);
                         frame.set(Some(PreviewFrame {
                             frame: next,
-                            image_url,
+                            image,
                             preview_fps,
                         }));
                         backend_error.set(String::new());
@@ -128,10 +128,8 @@ pub fn MonitorApp() -> impl IntoView {
     let hud = move || {
         frame.with(|frame| match frame {
             Some(value) => (
-                format!(
-                    "{} × {}",
-                    value.frame.detection.processed_width, value.frame.detection.processed_height
-                ),
+                // The processed crop is always square, so one side is enough.
+                value.frame.detection.processed_width.to_string(),
                 value
                     .frame
                     .processing_fps
@@ -166,7 +164,7 @@ pub fn MonitorApp() -> impl IntoView {
                     <div class="feed">
                         <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov/>
                         <div class="feed-hud" aria-label="Processing resolution, FPS and latency">
-                            <span><b>{move || hud().0}</b></span>
+                            <span><i>"Res:"</i><b>{move || hud().0}</b></span>
                             <span><b>{move || hud().1}</b><i>"FPS"</i></span>
                             <span><b>{move || hud().2}</b><i>"ms"</i></span>
                         </div>

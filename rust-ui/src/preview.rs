@@ -1,18 +1,18 @@
 use crate::layout::{
-    canvas_backing_size, detection_summary, fit_preview_image, fov_diameter, map_detection_box,
-    map_detection_point, Rect,
+    canvas_backing_size, color_with_alpha, detection_summary, fit_preview_image, fov_diameter,
+    map_detection_box, map_detection_point, Rect,
 };
 use crate::protocol::{DetectionObject, LiveFrame};
 use leptos::prelude::*;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
+use web_sys::{Blob, CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap};
 
 #[derive(Clone, Debug)]
 pub struct PreviewFrame {
     pub frame: LiveFrame,
-    pub image_url: String,
+    pub image: Blob,
     pub preview_fps: Option<f64>,
 }
 
@@ -43,20 +43,25 @@ pub fn PreviewCanvas(
         };
         let frame_id = current.frame.frame_id;
         let latest = frame_signal;
-        let image_url = current.image_url.clone();
+        let blob = current.image.clone();
         spawn_local(async move {
-            let Ok(image) = HtmlImageElement::new() else {
+            // createImageBitmap decodes the JPEG off the main thread, so the
+            // page keeps up with the input frame rate.
+            let Some(promise) = web_sys::window()
+                .and_then(|window| window.create_image_bitmap_with_blob(&blob).ok())
+            else {
                 return;
             };
-            image.set_src(&image_url);
-            if JsFuture::from(image.decode()).await.is_err() {
+            let Ok(value) = JsFuture::from(promise).await else {
                 return;
-            }
+            };
+            let image: ImageBitmap = value.unchecked_into();
             if latest
                 .get_untracked()
                 .as_ref()
                 .is_none_or(|value| value.frame.frame_id != frame_id)
             {
+                image.close();
                 return;
             }
             draw_image(
@@ -69,6 +74,7 @@ pub fn PreviewCanvas(
                 &color,
                 fov,
             );
+            image.close();
         });
     });
 
@@ -126,7 +132,7 @@ fn draw_empty(canvas: &HtmlCanvasElement) {
 
 fn draw_image(
     canvas: &HtmlCanvasElement,
-    image: &HtmlImageElement,
+    image: &ImageBitmap,
     frame: &LiveFrame,
     pixel_perfect: bool,
     detections: &[DetectionObject],
@@ -141,15 +147,15 @@ fn draw_image(
     context.fill_rect(0.0, 0.0, width, height);
     context.set_image_smoothing_enabled(!pixel_perfect);
     let Some(rect) = fit_preview_image(
-        image.natural_width() as f64,
-        image.natural_height() as f64,
+        image.width() as f64,
+        image.height() as f64,
         width,
         height,
         pixel_perfect,
     ) else {
         return;
     };
-    let _ = context.draw_image_with_html_image_element_and_dw_and_dh(
+    let _ = context.draw_image_with_image_bitmap_and_dw_and_dh(
         image,
         rect.x,
         rect.y,
@@ -320,49 +326,75 @@ fn draw_target(
     target_y: f64,
     color: &str,
 ) {
+    // "Hairline reticle": a 1.25 px lead that fades in from the crop center,
+    // stopping short of an 8 px ring with four tick marks. Every colored
+    // stroke sits on a dark underlay so it stays readable on bright frames.
+    const SHADOW: &str = "rgba(4, 7, 8, .85)";
+    const RING: f64 = 8.0;
+    const TICK_INNER: f64 = 11.0;
+    const TICK_OUTER: f64 = 16.0;
+    const LINE_GAP: f64 = 12.0;
     let center_x = rect.x + rect.width / 2.0;
     let center_y = rect.y + rect.height / 2.0;
     let dx = target_x - center_x;
     let dy = target_y - center_y;
     let distance = dx.hypot(dy);
-    let ring = 9.0;
-    let end_x = if distance > ring {
-        target_x - dx / distance * ring
-    } else {
-        target_x
-    };
-    let end_y = if distance > ring {
-        target_y - dy / distance * ring
-    } else {
-        target_y
-    };
-    context.begin_path();
-    context.move_to(center_x, center_y);
-    context.line_to(end_x, end_y);
-    context.set_stroke_style_str("rgba(5, 9, 10, .82)");
-    context.set_line_width(4.0);
     context.set_line_cap("round");
-    context.stroke();
-    context.begin_path();
-    context.move_to(center_x, center_y);
-    context.line_to(end_x, end_y);
-    context.set_stroke_style_str(color);
-    context.set_line_width(2.0);
-    context.stroke();
-    for (x, y, radius, stroke, line_width) in [
-        (center_x, center_y, 3.5, "rgba(5, 9, 10, .9)", 3.0),
-        (center_x, center_y, 2.5, color, 1.0),
-        (target_x, target_y, ring + 1.5, "rgba(5, 9, 10, .9)", 4.0),
-        (target_x, target_y, ring, color, 2.0),
-    ] {
+    if distance > LINE_GAP {
+        let end_x = target_x - dx / distance * LINE_GAP;
+        let end_y = target_y - dy / distance * LINE_GAP;
+        stroke_segment(context, (center_x, center_y), (end_x, end_y), 3.0, SHADOW);
+        let gradient = context.create_linear_gradient(center_x, center_y, end_x, end_y);
+        let faint = color_with_alpha(color, 0.1).unwrap_or_else(|| color.to_owned());
+        let strong = color_with_alpha(color, 0.95).unwrap_or_else(|| color.to_owned());
+        let _ = gradient.add_color_stop(0.0, &faint);
+        let _ = gradient.add_color_stop(1.0, &strong);
         context.begin_path();
-        let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+        context.move_to(center_x, center_y);
+        context.line_to(end_x, end_y);
+        context.set_stroke_style_canvas_gradient(&gradient);
+        context.set_line_width(1.25);
+        context.stroke();
+    }
+    for (line_width, stroke) in [(3.5, SHADOW), (1.5, color)] {
+        context.begin_path();
+        let _ = context.arc(target_x, target_y, RING, 0.0, std::f64::consts::TAU);
         context.set_stroke_style_str(stroke);
         context.set_line_width(line_width);
         context.stroke();
+        for (ux, uy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+            stroke_segment(
+                context,
+                (target_x + ux * TICK_INNER, target_y + uy * TICK_INNER),
+                (target_x + ux * TICK_OUTER, target_y + uy * TICK_OUTER),
+                line_width,
+                stroke,
+            );
+        }
     }
+    let center_dot = color_with_alpha(color, 0.7).unwrap_or_else(|| color.to_owned());
+    for (x, y, radius, fill) in [
+        (target_x, target_y, 1.6, color),
+        (center_x, center_y, 2.0, center_dot.as_str()),
+    ] {
+        context.begin_path();
+        let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+        context.set_fill_style_str(fill);
+        context.fill();
+    }
+}
+
+fn stroke_segment(
+    context: &CanvasRenderingContext2d,
+    from: (f64, f64),
+    to: (f64, f64),
+    line_width: f64,
+    stroke: &str,
+) {
     context.begin_path();
-    let _ = context.arc(target_x, target_y, 4.2, 0.0, std::f64::consts::TAU);
-    context.set_fill_style_str(color);
-    context.fill();
+    context.move_to(from.0, from.1);
+    context.line_to(to.0, to.1);
+    context.set_stroke_style_str(stroke);
+    context.set_line_width(line_width);
+    context.stroke();
 }

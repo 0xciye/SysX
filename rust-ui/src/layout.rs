@@ -132,6 +132,20 @@ where
         .collect()
 }
 
+/// `#rrggbb` → `rgba(r, g, b, alpha)` for canvas strokes; `None` for any
+/// other color syntax so callers can fall back to the original string.
+pub fn color_with_alpha(hex: &str, alpha: f64) -> Option<String> {
+    let digits = hex.strip_prefix('#').filter(|digits| digits.len() == 6)?;
+    let value = u32::from_str_radix(digits, 16).ok()?;
+    Some(format!(
+        "rgba({}, {}, {}, {})",
+        value >> 16,
+        (value >> 8) & 0xff,
+        value & 0xff,
+        alpha.clamp(0.0, 1.0)
+    ))
+}
+
 pub fn detection_summary(detections: &[crate::protocol::DetectionObject]) -> String {
     detections
         .iter()
@@ -203,6 +217,21 @@ mod tests {
         };
         assert_eq!(fov_diameter(rect, 360), Some(319.0));
         assert_eq!(canvas_backing_size(480.0, 320.0, 2.0), Some((960, 640)));
+    }
+
+    #[test]
+    fn hex_colors_gain_alpha_and_other_syntax_is_rejected() {
+        assert_eq!(
+            color_with_alpha("#e26868", 0.1).as_deref(),
+            Some("rgba(226, 104, 104, 0.1)")
+        );
+        assert_eq!(
+            color_with_alpha("#E3BF4D", 2.0).as_deref(),
+            Some("rgba(227, 191, 77, 1)")
+        );
+        assert_eq!(color_with_alpha("hsl(10 82% 62%)", 0.5), None);
+        assert_eq!(color_with_alpha("#fff", 0.5), None);
+        assert_eq!(color_with_alpha("#zzzzzz", 0.5), None);
     }
 
     #[test]

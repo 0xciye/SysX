@@ -32,7 +32,6 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 const UDP_RETRY: Duration = Duration::from_secs(3);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const DISPLAY_FPS: u64 = 60;
 
 struct SourceState {
     active: Option<UdpDecodedFrameSource>,
@@ -40,6 +39,28 @@ struct SourceState {
     pending_port: Option<u16>,
     retry_at: Instant,
     last_error: Option<String>,
+}
+
+/// What `state()` reports about the UDP source, readable without the source lock.
+#[derive(Clone, Default)]
+struct SourceView {
+    port: u16,
+    transport: ReassemblyStats,
+    error: Option<String>,
+}
+
+impl SourceView {
+    fn of(state: &SourceState) -> Self {
+        Self {
+            port: state.active_port,
+            transport: state
+                .active
+                .as_ref()
+                .map(UdpDecodedFrameSource::stats)
+                .unwrap_or_default(),
+            error: state.last_error.clone(),
+        }
+    }
 }
 
 pub struct ReceiverService {
@@ -61,6 +82,10 @@ pub struct ReceiverService {
     /// Open `role=monitor` WebSocket clients. The native host exits when the
     /// monitor window has been closed.
     monitor_clients: AtomicUsize,
+    /// Published-at timestamp of the newest processed frame; changes once per
+    /// frame so each preview socket forwards every input frame.
+    preview_rx: tokio::sync::watch::Receiver<u64>,
+    source_view: Mutex<SourceView>,
 }
 
 impl ReceiverService {
@@ -156,7 +181,11 @@ impl ReceiverService {
             Arc::new(move |event| ticker_batcher.submit(event)),
         ));
         let callback_ticker = Arc::clone(&movement_ticker);
-        let callback: Arc<dyn Fn(ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
+        let (preview_tx, preview_rx) = tokio::sync::watch::channel(0_u64);
+        let callback: Arc<dyn Fn(&ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
+            // Wake every preview socket for this frame (no timer polling:
+            // Windows timers tick at ~15.6 ms, which capped Preview near 60 FPS).
+            preview_tx.send_replace(processed.published_ns);
             let target = processed
                 .result
                 .smoothed_target_xy
@@ -204,6 +233,7 @@ impl ReceiverService {
             store,
             movement_batcher,
             movement_ticker,
+            source_view: Mutex::new(SourceView::of(&source_state)),
             source: Arc::new(Mutex::new(source_state)),
             source_times: Arc::new(Mutex::new(VecDeque::with_capacity(720))),
             errors: Arc::new(Mutex::new(Vec::new())),
@@ -212,6 +242,7 @@ impl ReceiverService {
             session_id,
             device: Mutex::new(missing_device()),
             monitor_clients: AtomicUsize::new(0),
+            preview_rx,
         });
         Self::start_reader(&service);
         Ok(service)
@@ -242,21 +273,21 @@ impl ReceiverService {
         let source_port;
         let transport;
         let source_error;
-        if let Ok(source) = self.source.lock() {
-            source_port = source.active_port;
-            source_name = format!("UDP · 0.0.0.0:{}", source.active_port);
-            transport = source
-                .active
-                .as_ref()
-                .map(UdpDecodedFrameSource::stats)
-                .unwrap_or_default();
-            source_error = source.last_error.clone();
-        } else {
-            source_port = 4200;
-            source_name = "UDP".into();
-            transport = ReassemblyStats::default();
-            source_error = None;
-        }
+        // Never wait on the source lock: the UDP thread holds it while blocked
+        // in a read, which used to stall every state()/preview send by up to a
+        // frame interval. Fall back to the snapshot that thread keeps current.
+        let view = match self.source.try_lock() {
+            Ok(source) => SourceView::of(&source),
+            Err(_) => self
+                .source_view
+                .lock()
+                .map(|view| view.clone())
+                .unwrap_or_default(),
+        };
+        source_port = view.port;
+        source_name = format!("UDP · 0.0.0.0:{}", view.port);
+        transport = view.transport;
+        source_error = view.error;
         let is_live = latest
             .as_ref()
             .is_some_and(|frame| preview_is_fresh(frame.published_ns, monotonic_ns()));
@@ -802,11 +833,17 @@ fn receiver_loop(service: Weak<ReceiverService>) {
             }
         }
         let read = service.source.lock().ok().map(|mut state| {
-            if let Some(source) = state.active.as_mut() {
+            let result = if let Some(source) = state.active.as_mut() {
                 source.read(Duration::from_millis(100))
             } else {
                 Ok(None)
+            };
+            // Readers of state() use this snapshot instead of waiting on the
+            // source lock, which is held for the whole blocking read above.
+            if let Ok(mut view) = service.source_view.lock() {
+                *view = SourceView::of(&state);
             }
+            result
         });
         match read {
             Some(Ok(Some(frame))) => {
@@ -826,6 +863,9 @@ fn receiver_loop(service: Weak<ReceiverService>) {
                     source.pending_port = Some(source.active_port);
                     source.retry_at = Instant::now() + UDP_RETRY;
                     source.last_error = Some(message.clone());
+                    if let Ok(mut view) = service.source_view.lock() {
+                        *view = SourceView::of(&source);
+                    }
                 }
                 service.record_error(message);
             }
@@ -922,7 +962,8 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
     if send_text(&mut socket, initial_state.clone()).await.is_err() {
         return;
     }
-    let mut ticker = tokio::time::interval(Duration::from_millis(1000 / DISPLAY_FPS));
+    // Preview forwards every processed frame (no display-rate cap).
+    let mut preview_rx = service.preview_rx.clone();
     // 100 ms keeps the monitor's Mouse State responsive; unchanged states are not resent.
     let mut state_ticker = tokio::time::interval(Duration::from_millis(100));
     let mut last_frame = None;
@@ -961,7 +1002,8 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
                 attach_request_id(&mut event, request_id);
                 if send_text(&mut socket, event).await.is_err() { break; }
             }
-            _ = ticker.tick(), if role != ClientRole::Host => {
+            changed = preview_rx.changed(), if role != ClientRole::Host => {
+                if changed.is_err() { break; }
                 if let Some(processed) = service.pipeline.latest() {
                     // A client that connects after the sender stopped must not
                     // receive the stale last frame (it would read as "Receiving").
@@ -1025,12 +1067,21 @@ fn attach_request_id(event: &mut Value, request_id: Option<Value>) {
 }
 
 fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result<Vec<u8>, String> {
-    let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, 88)
-        .encode_image(&image::DynamicImage::ImageRgb8(
-            processed.frame.image.clone(),
-        ))
-        .map_err(|error| error.to_string())?;
+    // The receiver processes the sender's frame as-is, so the original JPEG is
+    // exactly what Preview shows; re-encode only when it is unavailable.
+    let encoded;
+    let jpeg: &[u8] = if processed.frame.jpeg.is_empty() {
+        let mut buffer = Vec::new();
+        JpegEncoder::new_with_quality(&mut buffer, 88)
+            .encode_image(&image::DynamicImage::ImageRgb8(
+                processed.frame.image.clone(),
+            ))
+            .map_err(|error| error.to_string())?;
+        encoded = buffer;
+        &encoded
+    } else {
+        &processed.frame.jpeg
+    };
     let stats = service.pipeline.stats();
     let state = service.state();
     let metadata = json!({
@@ -1047,7 +1098,7 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
     let mut output = Vec::with_capacity(4 + bytes.len() + jpeg.len());
     output.extend_from_slice(&size.to_be_bytes());
     output.extend_from_slice(&bytes);
-    output.extend_from_slice(&jpeg);
+    output.extend_from_slice(jpeg);
     Ok(output)
 }
 

@@ -147,6 +147,7 @@ pub struct DeviceStatus {
     pub buttons: Vec<Option<bool>>,
 }
 
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
     Ready,
@@ -158,6 +159,8 @@ pub enum BackendEvent {
         error: Option<String>,
     },
     Models(Vec<BackendModel>, Option<String>),
-    Frame(LiveFrame, String, Option<f64>),
+    /// Frame metadata, the sender's JPEG as a Blob (decoded off the main
+    /// thread with createImageBitmap), and the measured preview FPS.
+    Frame(LiveFrame, web_sys::Blob, Option<f64>),
     Error(String),
 }

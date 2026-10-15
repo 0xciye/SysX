@@ -72,7 +72,7 @@ struct State {
     config: PipelineConfig,
     generation: u64,
     pending: Option<Pending>,
-    latest: Option<ProcessedFrame>,
+    latest: Option<Arc<ProcessedFrame>>,
     stats: PipelineStats,
     completed_ns: VecDeque<u64>,
     stopping: bool,
@@ -91,7 +91,7 @@ impl LatestFramePipeline {
     pub fn new(
         config: PipelineConfig,
         store: Option<Arc<DetectionDataStore>>,
-        on_processed: Option<Arc<dyn Fn(ProcessedFrame) + Send + Sync>>,
+        on_processed: Option<Arc<dyn Fn(&ProcessedFrame) + Send + Sync>>,
     ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -151,7 +151,7 @@ impl LatestFramePipeline {
         self.shared.wake.notify_all();
         Ok(())
     }
-    pub fn latest(&self) -> Option<ProcessedFrame> {
+    pub fn latest(&self) -> Option<Arc<ProcessedFrame>> {
         self.shared.state.lock().ok()?.latest.clone()
     }
     pub fn stats(&self) -> PipelineStats {
@@ -208,7 +208,7 @@ impl LatestFramePipeline {
 fn processing_loop(
     shared: Arc<Shared>,
     store: Option<Arc<DetectionDataStore>>,
-    on_processed: Option<Arc<dyn Fn(ProcessedFrame) + Send + Sync>>,
+    on_processed: Option<Arc<dyn Fn(&ProcessedFrame) + Send + Sync>>,
 ) {
     let mut smoother = None;
     let mut smoother_generation = None;
@@ -269,7 +269,10 @@ fn processing_loop(
                     state.completed_ns.pop_front();
                 }
                 state.completed_ns.push_back(finished_ns);
-                state.latest = Some(processed.clone());
+                // Shared, not copied: the frame image is ~1.2 MB at 640x640 and
+                // preview senders read `latest` at the input frame rate.
+                let processed = Arc::new(processed);
+                state.latest = Some(Arc::clone(&processed));
                 if processed.result.mode == DetectionMode::ObjectDetection {
                     if let Some(target) = &processed.selected_target {
                         prior_target = Some(PriorTarget {
@@ -287,10 +290,10 @@ fn processing_loop(
                 }
                 drop(state);
                 if let Some(callback) = &on_processed {
-                    callback(processed.clone());
+                    callback(&processed);
                 }
                 if let Some(store) = &store {
-                    if !store.submit(processed.result) {
+                    if !store.submit(processed.result.clone()) {
                         eprintln!(
                             "Detection result was not persisted (store queue full or closed)"
                         );
@@ -557,6 +560,7 @@ mod tests {
             timestamp_ns: 11,
             image: image::RgbImage::new(320, 320),
             source: "udp".into(),
+            jpeg: Default::default(),
         };
         let config = PipelineConfig::default();
         let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
@@ -602,6 +606,7 @@ mod tests {
             timestamp_ns: 10,
             image: image::RgbImage::new(640, 640),
             source: "test".into(),
+            jpeg: Default::default(),
         };
         let model = ModelDefinition {
             id: "test-model".into(),

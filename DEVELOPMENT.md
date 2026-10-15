@@ -72,7 +72,7 @@ The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pi
 3. Keep queues bounded and discard stale frames under load.
 4. Process every frame still admitted to the processing queue.
 5. Persist detection output asynchronously.
-6. Publish only the latest preview frame at a display-friendly cadence; report processing FPS and preview FPS separately.
+6. Forward every processed frame to Preview (event-driven, original sender JPEG, no re-encode) so preview FPS matches input FPS; report processing FPS and preview FPS separately. With a 240 FPS libobs source (headless, 2026-10-15) the monitor page received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
 
 ### Target selection and mouse output
 
