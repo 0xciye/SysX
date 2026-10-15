@@ -7,6 +7,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{Manager, State};
 
+include!(concat!(env!("OUT_DIR"), "/embedded_runtime.rs"));
+
+mod movement;
+#[allow(dead_code)]
+mod serial_queue;
+
 const FERRUM_LEGACY_BAUD_RATE: u32 = 115_200;
 
 struct BackendState {
@@ -14,6 +20,7 @@ struct BackendState {
     port: Mutex<Option<u16>>,
     startup_error: Mutex<Option<String>>,
     child: Mutex<Option<Child>>,
+    runtime_dir: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -33,6 +40,13 @@ fn device_status(state: State<'_, DeviceStatusState>) -> Result<DeviceStatus, St
         .lock()
         .map(|status| status.clone())
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ui_wasm_asset() -> Result<String, String> {
+    use base64::Engine;
+    let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../dist/sysx-ui_bg.wasm"));
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 fn empty_device_status(state: &'static str) -> DeviceStatus {
@@ -86,13 +100,18 @@ fn monitor_medius(app: &tauri::AppHandle, path: &str) -> bool {
         },
     );
 
+    let mut movement_error = false;
+    let mut vertical_adjustment = movement::VerticalAdjustmentClock::default();
     loop {
-        if let Some(event) = events.recv_timeout(Duration::from_millis(250)) {
+        if let Some(event) = events.recv_timeout(Duration::from_millis(4)) {
             let usage = match event.input {
-                Input::Press(usage) | Input::Release(usage) => usage,
-                Input::Motion { .. } => continue,
+                Input::Press(usage) | Input::Release(usage) => Some(usage),
+                Input::Motion { .. } => None,
             };
-            if usage.class == Class::Button && usage.id < 5 {
+            if usage
+                .as_ref()
+                .is_some_and(|usage| usage.class == Class::Button && usage.id < 5)
+            {
                 let mut buttons = [Some(false); 5];
                 for held in events.held(Class::Button) {
                     if held.id < 5 {
@@ -106,11 +125,33 @@ fn monitor_medius(app: &tauri::AppHandle, path: &str) -> bool {
                 }
             }
         }
+        if let Some(target) = movement::take_target(app) {
+            let held =
+                movement::trigger_button_index(&target.trigger_button).is_some_and(|button| {
+                    events
+                        .held(Class::Button)
+                        .iter()
+                        .any(|usage| usage.id == button)
+                });
+            let now = std::time::Instant::now();
+            let recoil =
+                vertical_adjustment.sample(held && target.target_valid, &target.recoil, now);
+            if held && target.target_valid && events.is_connected() {
+                let (dx, dy) = target.device_delta(recoil);
+                if (dx != 0 || dy != 0) && device.move_rel(dx, dy).is_err() {
+                    movement_error = true;
+                    break;
+                }
+            }
+        }
         if !events.is_connected() {
             break;
         }
     }
-    set_device_status(app, empty_device_status("missing"));
+    set_device_status(
+        app,
+        empty_device_status(if movement_error { "error" } else { "missing" }),
+    );
     true
 }
 
@@ -136,7 +177,7 @@ fn monitor_ferrum(app: &tauri::AppHandle, port_name: &str) -> bool {
     use std::io::{Read, Write};
 
     let Ok(mut connection) = serialport::new(port_name, FERRUM_LEGACY_BAUD_RATE)
-        .timeout(Duration::from_millis(150))
+        .timeout(Duration::from_millis(2))
         .open()
     else {
         return false;
@@ -174,11 +215,15 @@ fn monitor_ferrum(app: &tauri::AppHandle, port_name: &str) -> bool {
         },
     );
     let mut buffered = Vec::with_capacity(128);
+    let mut last_mask = 0_u8;
+    let mut movement_error = false;
+    let mut vertical_adjustment = movement::VerticalAdjustmentClock::default();
     loop {
         match connection.read(&mut chunk) {
             Ok(count) => {
                 buffered.extend_from_slice(&chunk[..count]);
                 if let Some(mask) = parse_ferrum_button_mask(&buffered) {
+                    last_mask = mask;
                     let buttons = std::array::from_fn(|index| Some(mask & (1 << index) != 0));
                     if let Some(state) = app.try_state::<DeviceStatusState>() {
                         if let Ok(mut current) = state.0.lock() {
@@ -191,11 +236,32 @@ fn monitor_ferrum(app: &tauri::AppHandle, port_name: &str) -> bool {
                     buffered = keep;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => break,
         }
+        if let Some(target) = movement::take_target(app) {
+            let held = movement::trigger_button_index(&target.trigger_button)
+                .is_some_and(|button| last_mask & (1 << button) != 0);
+            let now = std::time::Instant::now();
+            let recoil =
+                vertical_adjustment.sample(held && target.target_valid, &target.recoil, now);
+            if held && target.target_valid {
+                let (dx, dy) = target.device_delta(recoil);
+                if (dx != 0 || dy != 0)
+                    && connection
+                        .write_all(format!("km.move({dx},{dy})\n").as_bytes())
+                        .is_err()
+                {
+                    movement_error = true;
+                    break;
+                }
+            }
+        }
     }
-    set_device_status(app, empty_device_status("missing"));
+    set_device_status(
+        app,
+        empty_device_status(if movement_error { "error" } else { "missing" }),
+    );
     true
 }
 
@@ -331,29 +397,51 @@ fn make_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+#[cfg(debug_assertions)]
 fn backend_executable() -> Result<PathBuf, String> {
-    if cfg!(debug_assertions) {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        #[cfg(target_os = "windows")]
-        let candidate = root.join(".venv/Scripts/receiver-backend.exe");
-        #[cfg(not(target_os = "windows"))]
-        let candidate = root.join(".venv/bin/receiver-backend");
-        return if candidate.is_file() {
-            Ok(candidate)
-        } else {
-            Err(format!(
-                "Backend is not installed at {}",
-                candidate.display()
-            ))
-        };
+    find_sidecar(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries"))
+}
+
+#[cfg(not(debug_assertions))]
+fn extract_runtime(data_dir: &Path, token: &str) -> Result<(PathBuf, PathBuf), String> {
+    if EMBEDDED_BACKEND.is_empty() {
+        return Err("The Rust backend was not embedded in this executable".into());
+    }
+    if !EMBEDDED_CONFIG_ASSETS
+        .iter()
+        .any(|(name, _)| *name == "index.html")
+    {
+        return Err("The local configuration UI was not embedded in this executable".into());
     }
 
-    let executable_dir = std::env::current_exe()
-        .map_err(|error| error.to_string())?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "Cannot locate application executable directory".to_string())?;
-    find_sidecar(&executable_dir)
+    let runtime_dir = data_dir.join(format!("runtime-{}-{}", std::process::id(), &token[..8]));
+    fs::create_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
+    let extraction = (|| {
+        #[cfg(target_os = "windows")]
+        let executable = runtime_dir.join("receiver-backend.exe");
+        #[cfg(not(target_os = "windows"))]
+        let executable = runtime_dir.join("receiver-backend");
+        fs::write(&executable, EMBEDDED_BACKEND).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                .map_err(|error| error.to_string())?;
+        }
+        let config_root = runtime_dir.join("web-config");
+        for (relative, bytes) in EMBEDDED_CONFIG_ASSETS {
+            let destination = config_root.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(destination, bytes).map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>((executable, runtime_dir.clone()))
+    })();
+    if extraction.is_err() {
+        let _ = fs::remove_dir_all(&runtime_dir);
+    }
+    extraction
 }
 
 fn open_config_browser(port: u16) -> Result<(), String> {
@@ -366,9 +454,12 @@ fn open_config_browser(port: u16) -> Result<(), String> {
     let result = Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "linux")]
     let result = Command::new("xdg-open").arg(&url).spawn();
-    result.map(|_| ()).map_err(|error| format!("Could not open SysX local configuration in the browser: {error}"))
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Could not open SysX local configuration in the browser: {error}"))
 }
 
+#[cfg(any(debug_assertions, test))]
 fn find_sidecar(directory: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let candidate = directory.join("receiver-backend-x86_64-pc-windows-msvc.exe");
@@ -428,6 +519,7 @@ fn launch_backend(app: &tauri::AppHandle) {
         port: Mutex::new(None),
         startup_error: Mutex::new(None),
         child: Mutex::new(None),
+        runtime_dir: Mutex::new(None),
     };
     app.manage(state);
 
@@ -445,6 +537,7 @@ fn launch_backend(app: &tauri::AppHandle) {
         );
         return;
     }
+    #[cfg(debug_assertions)]
     let executable = match backend_executable() {
         Ok(path) => path,
         Err(error) => {
@@ -455,10 +548,15 @@ fn launch_backend(app: &tauri::AppHandle) {
     #[cfg(debug_assertions)]
     let config_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
     #[cfg(not(debug_assertions))]
-    let config_root = match app.path().resource_dir() {
-        Ok(path) => path.join("web-config"),
+    let (executable, config_root) = match extract_runtime(&data_dir, &token) {
+        Ok((executable, runtime_dir)) => {
+            if let Ok(mut current) = app.state::<BackendState>().runtime_dir.lock() {
+                *current = Some(runtime_dir.clone());
+            }
+            (executable, runtime_dir.join("web-config"))
+        }
         Err(error) => {
-            set_startup_error(app, format!("Cannot find local config resources: {error}"));
+            set_startup_error(app, format!("Cannot prepare embedded runtime: {error}"));
             return;
         }
     };
@@ -485,7 +583,7 @@ fn launch_backend(app: &tauri::AppHandle) {
     let mut child = match backend_command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            set_startup_error(app, format!("Could not start the vision backend: {error}"));
+            set_startup_error(app, format!("Could not start the Rust backend: {error}"));
             return;
         }
     };
@@ -501,49 +599,60 @@ fn launch_backend(app: &tauri::AppHandle) {
                 for line in BufReader::new(stdout).lines() {
                     match line {
                         Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
-                            Ok(value)
-                                if value.get("event").and_then(|event| event.as_str())
-                                    == Some("ready") =>
-                            {
-                                if let Some(port) = value
-                                    .get("port")
-                                    .and_then(|value| value.as_u64())
-                                    .and_then(|value| u16::try_from(value).ok())
+                                Ok(value)
+                                    if value.get("event").and_then(|event| event.as_str())
+                                        == Some("movement_target") =>
                                 {
-                                    if let Some(state) = app_handle.try_state::<BackendState>() {
-                                        if let Ok(mut current) = state.port.lock() {
-                                            *current = Some(port);
-                                        }
-                                        if let Some(config_port) = value
-                                            .get("config_port")
-                                            .and_then(|value| value.as_u64())
-                                            .and_then(|value| u16::try_from(value).ok())
+                                    movement::set_target(&app_handle, &value);
+                                }
+                                Ok(value)
+                                    if value.get("event").and_then(|event| event.as_str())
+                                        == Some("ready") =>
+                                {
+                                    if let Some(port) = value
+                                        .get("port")
+                                        .and_then(|value| value.as_u64())
+                                        .and_then(|value| u16::try_from(value).ok())
+                                    {
+                                        if let Some(state) = app_handle.try_state::<BackendState>()
                                         {
-                                            if let Err(error) = open_config_browser(config_port) {
-                                                set_startup_error(&app_handle, error);
+                                            if let Ok(mut current) = state.port.lock() {
+                                                *current = Some(port);
                                             }
-                                        } else if let Some(error) = value
-                                            .get("config_error")
-                                            .and_then(|value| value.as_str())
-                                        {
-                                            set_startup_error(&app_handle, error.to_string());
+                                            if let Ok(mut error) = state.startup_error.lock() {
+                                                *error = None;
+                                            }
+                                            if let Some(config_port) = value
+                                                .get("config_port")
+                                                .and_then(|value| value.as_u64())
+                                                .and_then(|value| u16::try_from(value).ok())
+                                            {
+                                                if let Err(error) = open_config_browser(config_port)
+                                                {
+                                                    set_startup_error(&app_handle, error);
+                                                }
+                                            } else if let Some(error) = value
+                                                .get("config_error")
+                                                .and_then(|value| value.as_str())
+                                            {
+                                                set_startup_error(&app_handle, error.to_string());
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Ok(value)
-                                if value.get("event").and_then(|event| event.as_str())
-                                    == Some("error") =>
-                            {
-                                set_startup_error(
-                                    &app_handle,
-                                    value
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("Backend startup failed")
-                                        .to_string(),
-                                );
-                            }
+                                Ok(value)
+                                    if value.get("event").and_then(|event| event.as_str())
+                                        == Some("error") =>
+                                {
+                                    set_startup_error(
+                                        &app_handle,
+                                        value
+                                            .get("message")
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("Backend startup failed")
+                                            .to_string(),
+                                    );
+                                }
                             _ => {}
                         },
                         Err(error) => {
@@ -556,12 +665,21 @@ fn launch_backend(app: &tauri::AppHandle) {
                     }
                 }
                 if let Some(state) = app_handle.try_state::<BackendState>() {
-                    if let Ok(mut port) = state.port.lock() {
-                        *port = None;
-                    }
-                    if let Ok(mut error) = state.startup_error.lock() {
-                        if error.is_none() {
-                            *error = Some("Vision backend exited".to_string());
+                    let exited = state
+                        .child
+                        .lock()
+                        .ok()
+                        .and_then(|mut child| child.as_mut()?.try_wait().ok())
+                        .flatten()
+                        .is_some();
+                    if exited {
+                        if let Ok(mut port) = state.port.lock() {
+                            *port = None;
+                        }
+                        if let Ok(mut error) = state.startup_error.lock() {
+                            if error.is_none() {
+                                *error = Some("Receiver backend exited".to_string());
+                            }
                         }
                     }
                 }
@@ -609,22 +727,28 @@ fn stop_backend(app: &tauri::AppHandle) {
                 let _ = child.wait();
             }
         }
+        if let Ok(mut runtime_dir) = state.runtime_dir.lock() {
+            if let Some(path) = runtime_dir.take() {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            app.manage(movement::MovementState::default());
             launch_backend(app.handle());
             start_device_monitor(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             backend_connection_info,
-            device_status
+            device_status,
+            ui_wasm_asset
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Receiver desktop application");

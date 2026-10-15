@@ -1,10 +1,10 @@
-# Receiver Protocol for a Future OBS Sender Plugin
+# Receiver Protocol for the SysX OBS Sender Plugin
 
-This document specifies how a future OBS plugin should send frames to the current Receiver. The plugin is not part of this repository yet. The protocol details below describe the implemented Receiver v1 behavior; they are intended to prevent a sender/receiver mismatch.
+This document specifies how the UI-less SysX OBS plugin sends frames to SysX. The protocol details below describe the implemented Rust receiver v1 behavior and the sender implementation in `obs-plugin/sysx-canvas-sender`; they are intended to prevent a sender/receiver mismatch.
 
 ## 1. Connection model
 
-The OBS plugin sends successive full-frame JPEG-encoded images (MJPEG) over UDP to the Receiver computer at the configured sender FPS. The Receiver applies its configured centered square crop after decoding and sends that image to the detection engine; Preview displays the crop. Each datagram sequence is one full frame using the Receiver's versioned UDP packet format; this is not an HTTP multipart MJPEG endpoint. The plugin does not connect to the desktop UI, Python WebSocket, or Tauri IPC. V1 has no sender/session identifier, so the current Receiver is designed for **one active sender at a time**; simultaneous senders can collide on frame IDs and are not supported.
+The OBS plugin sends successive full-frame JPEG-encoded images (MJPEG) over UDP to the SysX computer at the configured sender FPS. SysX applies its configured centered square crop after decoding and sends that image to the detection engine; Preview displays the crop. Each datagram sequence is one full frame using SysX's versioned UDP packet format; this is not an HTTP multipart MJPEG endpoint. The plugin does not connect to the desktop UI, the private WebSocket, or Tauri IPC. V1 has no sender/session identifier, so the receiver is designed for **one active sender at a time**; simultaneous senders can collide on frame IDs and are not supported.
 
 | Setting | Value |
 |---|---|
@@ -36,7 +36,7 @@ All integer fields use **network byte order (big-endian)**. Every datagram conta
 | 22 | 8 | `timestamp_ns` | Sender timestamp in nanoseconds |
 | 30 | variable | `payload` | JPEG bytes for this chunk |
 
-Python reference layout: `struct.Struct("!4sBBQHHHHQ")`. The current packetizer and parser are in `backend/src/receiver_backend/udp.py`.
+The Rust packetizer and parser are in `rust-backend/src/udp.rs`; the header uses the equivalent 30-byte big-endian layout.
 
 ### Chunking rules
 
@@ -76,26 +76,26 @@ There are no retransmissions or per-frame acknowledgements. Send each frame once
 
 ## 4. OBS plugin capture and send requirements
 
-The future plugin should:
+The plugin:
 
 1. Capture the full OBS output without cropping or resizing it for SysX. Each source dimension must be at least the configured Crop Resolution. The receiver takes the centered `N × N` crop before detection and Preview. Object Detection also requires that crop to match the selected model input dimensions; mismatches are rejected, not resized.
 2. Convert the captured output to an 8-bit sRGB image and JPEG-encode it without changing width or height. The Receiver decodes JPEG to BGR, applies its center crop, then converts the crop BGR → RGB → HSV for Pixel Seek.
 3. Assign a frame ID and capture timestamp, split the JPEG into 1,170-byte payloads, write the v1 header in big-endian order, and send all chunks to the Receiver IP and port.
 4. Run capture conversion, compression, and socket sends outside OBS's render callback. Use a bounded queue with latest-frame behavior; discard obsolete unsent frames if encoding or the network falls behind.
 5. Send chunks in order for efficiency, while still tolerating receiver-side reordering. Do not use IP fragmentation or datagrams larger than the 1,200-byte protocol limit.
-6. Surface sender-side configuration, encode, and socket errors in the OBS plugin. The current protocol has no Receiver acknowledgement, so a successful local `sendto` call does not prove that the Receiver accepted or processed that frame.
+6. Keeps sender configuration in compile-time constants and silently drops encode/socket failures. The current protocol has no Receiver acknowledgement, so a successful local `sendto` call does not prove that the Receiver accepted or processed that frame.
 
 Respect the cadence of the source OBS output. The requested 180–360 FPS is a system target to benchmark, not a promise that every source, encoder, network, Receiver, or UI can sustain it. At high rates, JPEG encoding and packets per second can become the bottleneck. Measure sender encode FPS, bytes per second, datagrams per second, Receiver source FPS, processing FPS, dropped frames, and preview FPS separately. Receiver source FPS counts valid decoded frames observed over a trailing one-second window. The desktop preview is currently published at a 60 FPS cadence by default; it is not intended to redraw 360 times per second.
 
 ### Pixel Seek color path
 
-Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The Receiver crops the decoded frame, converts BGR to RGB, then RGB to HSV using OpenCV. The code-defined HSV ranges are stored in `PIXEL_COLOR_PROFILES` in `backend/src/receiver_backend/service.py`. HSV thresholds are defined in code and are not configurable in the UI. A configured `PixelColorRule` may also specify a normalized source-frame ROI `(left, top, right, bottom)`; omitting it means the full frame. Output box coordinates remain relative to the original frame. The OBS plugin does not choose thresholds or ROI and should send the same frame regardless of the selected color.
+Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The Rust receiver decodes frames to RGB, applies the centered crop, and converts RGB to HSV in `rust-backend/src/pixel_seek.rs`. HSV thresholds are code-defined and are not configurable in the UI. Detection runs across the processed crop; FOV filters candidates passed to target selection, while detections outside FOV remain available to Preview. Box coordinates are mapped with the crop origin. The OBS plugin does not choose thresholds or ROI and should send the same frame regardless of the selected color.
 
 ## 5. Receiver operator workflow
 
 1. Install and launch the SysX desktop application on the secondary computer.
 2. In the local web config, set the UDP port (default `4200`) and Crop Resolution to a square that fits the OBS source; allow that port through the private-network firewall if needed.
-3. Configure the future OBS plugin with the Receiver computer's reachable LAN address and the same UDP port.
+3. Configure the OBS plugin source constants with the Receiver computer's reachable LAN address and the same UDP port, then build/install the module.
 4. For Object Detection, make the Crop Resolution match the active model input (square models are required by the square crop). Pixel Seek has no model-resolution requirement.
 5. Start the stream from OBS. The Receiver automatically changes to its live preview when valid frames arrive. Use its source resolution, processing FPS, preview FPS, processing latency, drop counters, and status to diagnose behavior.
 6. To verify the wire protocol during development, use the local `udp-send-image` / `udp-listen` protocol verifier. Those CLI commands are development verifiers, not the production OBS sender.
@@ -104,7 +104,7 @@ The repository includes `src/assets/red-cube-192.jpg`, a 192 × 192 JPEG fixture
 
 ## 6. Sender interoperability checklist
 
-Before calling a future plugin compatible, verify it against the current Receiver with:
+Before calling the plugin compatible with the current Receiver, verify it with:
 
 - 192×192 and non-square frame dimensions.
 - A one-datagram JPEG and a multi-chunk JPEG.
@@ -114,4 +114,4 @@ Before calling a future plugin compatible, verify it against the current Receive
 - Strategy switch during a stream and source resolution changes.
 - Sustained rate tests that record actual sender encode/network rates, Receiver processing/drop rates, and UI preview rate. Do not infer performance from the protocol verifier alone.
 
-The protocol verifier is currently exercised for local loopback frames. A real OBS plugin, Windows network/firewall validation, interoperability tests on separate computers, and 180–360 FPS hardware measurements remain future work.
+The protocol verifier is currently exercised for local loopback frames. Windows network/firewall validation, interoperability tests on separate computers, and 180–360 FPS hardware measurements remain deployment work.

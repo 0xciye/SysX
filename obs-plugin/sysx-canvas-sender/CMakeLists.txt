@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.20)
+project(sysx_canvas_sender LANGUAGES CXX)
+
+set(OBS_INCLUDE_DIR "" CACHE PATH "OBS libobs include directory")
+set(OBS_LIB_DIR "" CACHE PATH "Directory containing obs.lib/libobs.so")
+set(JPEG_INCLUDE_DIR "" CACHE PATH "libjpeg-turbo include directory")
+set(JPEG_LIBRARY "" CACHE FILEPATH "libjpeg-turbo jpeg library")
+
+find_path(OBS_INCLUDE_DIR obs-module.h REQUIRED)
+find_path(JPEG_INCLUDE_DIR jpeglib.h REQUIRED)
+find_library(OBS_LIBRARY NAMES obs libobs PATHS "${OBS_LIB_DIR}" REQUIRED)
+if(NOT JPEG_LIBRARY)
+  find_library(JPEG_LIBRARY NAMES jpeg libjpeg-turbo turbojpeg REQUIRED)
+endif()
+
+add_library(sysx-canvas-sender MODULE sysx_canvas_sender.cpp)
+target_compile_features(sysx-canvas-sender PRIVATE cxx_std_17)
+target_include_directories(sysx-canvas-sender PRIVATE "${OBS_INCLUDE_DIR}" "${JPEG_INCLUDE_DIR}")
+target_link_libraries(sysx-canvas-sender PRIVATE "${OBS_LIBRARY}" "${JPEG_LIBRARY}")
+target_compile_definitions(sysx-canvas-sender PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+set_target_properties(sysx-canvas-sender PROPERTIES PREFIX "" OUTPUT_NAME "sysx-canvas-sender")
+
+if(WIN32)
+  target_link_libraries(sysx-canvas-sender PRIVATE ws2_32)
+  set_target_properties(sysx-canvas-sender PROPERTIES SUFFIX ".dll")
+endif()

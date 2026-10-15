@@ -6,13 +6,6 @@
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "dialog:allow-save",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        { "name": "binaries/receiver-backend", "sidecar": true }
-      ]
-    },
-    "shell:allow-kill"
+    "dialog:allow-save"
   ]
 }

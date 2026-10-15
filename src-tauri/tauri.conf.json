@@ -5,11 +5,12 @@
   "identifier": "com.pixelobject.receiver",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://127.0.0.1:1421",
+    "beforeBuildCommand": "pnpm build:desktop",
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -24,25 +25,15 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data: blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost ws://127.0.0.1:*"
+      "csp": "default-src 'self' tauri: asset: http://asset.localhost; script-src 'self' tauri: asset: http://asset.localhost 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; img-src 'self' tauri: asset: data: blob:; style-src 'self' tauri: asset: 'unsafe-inline'; connect-src ipc: http://ipc.localhost ws://127.0.0.1:*",
+      "devCsp": "default-src 'self' tauri: asset: http://asset.localhost; script-src 'self' tauri: asset: http://asset.localhost 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; img-src 'self' tauri: asset: data: blob:; style-src 'self' tauri: asset: 'unsafe-inline'; connect-src ipc: http://ipc.localhost ws://127.0.0.1:*"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "resources": {
-      "../dist/config.html": "web-config/config.html",
-      "../dist/assets": "web-config/assets",
-      "../dist/receiver-mark.svg": "web-config/receiver-mark.svg"
-    },
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "category": "DeveloperTool",
     "shortDescription": "SysX realtime computer vision",
-    "longDescription": "SysX is a desktop application for continuous image processing and preview.",
-    "windows": {
-      "webviewInstallMode": {
-        "type": "offlineInstaller"
-      }
-    }
+    "longDescription": "SysX is a desktop application for continuous image processing and preview."
   }
 }

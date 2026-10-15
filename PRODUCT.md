@@ -2,11 +2,15 @@
 
 <!-- impeccable:product-schema 1 -->
 
+## Current implementation status
+
+SysX is maintained as a Rust application across the Tauri host, Leptos/WASM UI, and receiver sidecar. The current release bundle mounts the Rust UI through an embedded WASM bootstrap, with a visible square native preview startup state; the local configuration page runs the same Rust UI in Chrome. Settings are restored from and written to `app-settings.json`; Windows packaging and physical Medius/Ferrum movement remain target-environment validation work.
+
 ## Platform
 adaptive
 
 ## Stack
-Tauri 2 + React + TypeScript native monitor window with a separate Python backend sidecar and a loopback-only browser configuration page. The monitor is packaged as an installed desktop application; configuration runs in the user's separate browser.
+The application source is Rust: Tauri 2 hosts a Leptos/WebAssembly UI and an embedded Rust backend sidecar. The Windows release is one portable `SysX.exe`, with no installer; the executable extracts runtime files under app data while running. Configuration runs in a separate loopback-only browser page. Object Detection supports imported ONNX, TensorRT, and OpenVINO artifacts; no model or target-hardware validation is present. The legacy React/TypeScript frontend and Python backend have been removed.
 
 ## Users
 Developers or operators monitoring a continuous computer-vision stream between a sender computer and a receiver computer.
@@ -21,17 +25,19 @@ A receiver-only desktop tool that waits for a sender and automatically crops inc
 Used on a secondary computer while another computer continuously sends frames. The operator monitors preview, active strategy/model, and processing diagnostics. Target stream rates may exceed 180–360 FPS; this is a requirement to evaluate, not a measured performance claim.
 
 ## Capabilities and Constraints
-- Develop on macOS; target an installed Windows 10/11 x64 desktop distribution.
+- Develop on macOS; target a portable Windows 10/11 x64 `.exe` distribution with no installer.
 - Work locally without a cloud service or public internet connection. The browser configuration page is served only from loopback.
-- Use a Python vision backend independent from the desktop frontend.
+- Keep frame acquisition, processing, persistence, and rendering decoupled across the Rust backend and desktop frontend. A sender streams full-frame MJPEG continuously over the implemented UDP protocol; the receiver validates, reassembles, decodes, crops, processes, and previews it.
 - Support exactly two primary strategies: Pixel Seek and Object Detection.
+- Rust runtime supports Pixel Seek and imported YOLOv8 Object Detection bundles with ONNX Runtime, OpenVINO, or an optional TensorRT build. Do not claim real-model or hardware validation without running those artifacts on the target runtime.
 - Pixel Seek selects one target color at a time (yellow, red, or purple); HSV thresholds are maintained in code.
 - Crop Resolution in web config sets a centered `N × N` receiver crop. Pixel Seek rules support optional normalized region-of-interest bounds in original-frame coordinates; absent bounds cover the full source frame.
 - Wait for sender input automatically; show a waiting state before frames arrive and start preview on receipt. No Start/Pause/Stop controls in the primary workflow.
-- Keep the native window focused on Preview, five mouse-button states, device state, and receiver connection state. Preview is always visible; its compact HUD shows processing FPS, latency, and processing resolution.
-- Open a separate browser window to the local configuration page when the desktop app starts. Persist settings under application data and restore them at backend startup.
+- Keep the native window focused on a square Preview, five mouse-button states, device state, and receiver connection state. Preview is always visible and capped at 640 × 640 CSS pixels; its compact HUD shows processing resolution, FPS, and latency.
+- Open a separate browser window to the local configuration page when the desktop app starts. Keep all settings on one scrolling page, including signed X/Y target offsets with a relative position indicator. Persist settings under application data and restore them at backend startup.
 - Full-frame MJPEG from the OBS sender is the production input. The receiver applies the configured centered square crop before detection and Preview; see `docs/OBS_RECEIVER_PROTOCOL.md`.
-- Prioritize custom Ultralytics YOLO `.pt` detection models supplied by the user; do not download default models.
+- Import one user-provided model bundle containing `.onnx`, `.engine` or `.plan`, and the OpenVINO `.xml`/`.bin` pair; do not download default models.
+- Persist Sensitivity/DPI and the recoil profile in the local `app-settings.json` file. Load it when the backend starts and write it when the local configuration page applies changes. Movement output is gated by the selected held trigger and uses fresh, batched deltas through the verified Medius/Ferrum relative-move APIs. Reconstructed active-state, mode-predicate, direct-offset, and timed-click routes are not part of the current product.
 - Pixel Seek must support arbitrary valid input resolutions; AI input resolution follows each selected model's configuration.
 - Do not invent detections, FPS, latency, or benchmark results in production.
 - UDP v1 and authenticated loopback WebSocket transport are implemented. Achievable end-to-end throughput remains unmeasured and must be benchmarked on target hardware.
@@ -41,9 +47,9 @@ Used on a secondary computer while another computer continuously sends frames. T
 - Interface language: English.
 - Visual direction requested: dark, minimal, professional, technical.
 - Keep the native monitor window limited to Preview, device/connection status, and mouse-button states.
-- Put configuration in the separate local browser page, with General and FOV settings and a global Apply Changes action.
+- Put configuration in the separate local browser page on one vertically scrolling page, with a global Apply Changes action. Include General, signed X/Y target offsets with a target-relative position indicator, and FOV settings.
 - Keep Preview always visible and the FOV overlay always enabled, with a 1–360° control in the local configuration page.
-- Cap the Preview viewport at 640 × 640 CSS pixels; smoothly enlarge low-resolution sender frames while preserving their aspect ratio.
+- Cap the square Preview viewport at 640 × 640 CSS pixels; smoothly enlarge low-resolution sender frames while preserving their aspect ratio.
 - Let the configuration page accommodate additional options through vertical scrolling.
 - User-provided screenshot is a reference for the preview and compact HUD layout; do not copy it literally.
 

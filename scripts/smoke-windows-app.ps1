@@ -7,8 +7,8 @@ if ($env:OS -ne "Windows_NT") {
 
 $root = Split-Path -Parent $PSScriptRoot
 $releaseDir = Join-Path $root "src-tauri\target\release"
-$appExe = if ($ApplicationPath) { $ApplicationPath } else { Join-Path $releaseDir "receiver.exe" }
-if (-not (Test-Path $appExe)) { throw "Receiver desktop executable not found: $appExe" }
+$appExe = if ($ApplicationPath) { $ApplicationPath } else { Join-Path $releaseDir "SysX.exe" }
+if (-not (Test-Path $appExe)) { throw "SysX desktop executable not found: $appExe" }
 $appExe = (Resolve-Path -LiteralPath $appExe).Path
 $appDir = Split-Path -Parent $appExe
 
@@ -28,7 +28,7 @@ try {
     while ((Get-Date) -lt $startupDeadline) {
         $app.Refresh()
         if ($app.HasExited) {
-            throw "Receiver exited during startup with code $($app.ExitCode)."
+            throw "SysX exited during startup with code $($app.ExitCode)."
         }
 
         $backend = Get-Process -Name "receiver-backend*" -ErrorAction SilentlyContinue |
@@ -44,20 +44,20 @@ try {
     }
 
     if (-not $backend) {
-        throw "Receiver did not launch its bundled Python backend within 120 seconds."
+        throw "SysX did not launch its bundled Rust backend within 120 seconds."
     }
     if (-not $udpListener) {
-        throw "Receiver backend did not bind the default UDP port 4200 within 120 seconds."
+        throw "SysX backend did not bind the default UDP port 4200 within 120 seconds."
     }
     $testBackendIds = @($backend.Id)
-    Write-Host "Receiver desktop process launched its bundled backend (PID $($backend.Id)), which bound UDP port 4200."
+    Write-Host "SysX launched its bundled backend (PID $($backend.Id)), which bound UDP port 4200."
 
     $closeDeadline = (Get-Date).AddSeconds(10)
     $closeRequested = $false
     while ((Get-Date) -lt $closeDeadline) {
         $app.Refresh()
         if ($app.HasExited) {
-            throw "Receiver exited before the smoke test could request a normal window close."
+            throw "SysX exited before the smoke test could request a normal window close."
         }
         if ($app.MainWindowHandle -ne [IntPtr]::Zero -and $app.CloseMainWindow()) {
             $closeRequested = $true
@@ -66,10 +66,10 @@ try {
         Start-Sleep -Milliseconds 200
     }
     if (-not $closeRequested) {
-        throw "Could not request a normal close of the Receiver window."
+        throw "Could not request a normal close of the SysX window."
     }
     if (-not $app.WaitForExit(15000)) {
-        throw "Receiver did not exit after its main window was closed."
+        throw "SysX did not exit after its main window was closed."
     }
 
     $shutdownDeadline = (Get-Date).AddSeconds(10)
@@ -83,7 +83,7 @@ try {
     } while ((Get-Date) -lt $shutdownDeadline)
 
     if ($remainingBackend.Count -gt 0) {
-        throw "Receiver exited but left its bundled backend running."
+        throw "SysX exited but left its bundled backend running."
     }
 
     Write-Host "Windows desktop smoke test passed: app launch, backend startup, and shutdown."

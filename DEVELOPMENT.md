@@ -1,18 +1,21 @@
 # Development
 
-## Architecture decision
+## Current milestone status (2026-10-15)
 
-Use **Tauri 2 + React + TypeScript** for the installed desktop window and a separate **Python sidecar** for frame acquisition, detection, and persistence.
+The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The release macOS bundle was rebuilt from the current source and visually checked with the native Rust UI mounted through embedded WASM; its square preview startup state and FPS/latency/resolution HUD are visible. Chrome configuration mounts the same Rust WASM UI and uses the persisted app-data settings file. Windows and physical-device validation remain outstanding.
 
-The monitor is bundled as a native desktop window and rendered through the operating system's WebView (WebView2 on Windows and WKWebView on macOS). Configuration runs in a separate browser window against a loopback-only page served by the Python sidecar; it is not public or cloud hosted. Tauri fits the requested desktop distribution while preserving the independent Python engine. Neither framework by itself guarantees a 180–360 FPS processing rate; that depends on frame size, model, device, and bounded pipeline behavior and must be benchmarked.
+## Architecture
 
-For Windows offline installation, the release build should bundle the WebView2 offline installer. This adds roughly 127 MB to the installer per current Tauri documentation. Windows installers and PyInstaller sidecars must be built on Windows CI, not cross-compiled from macOS.
+The application source is Rust: **Tauri 2 + a Leptos/WebAssembly UI + a Rust sidecar**. Trunk builds the UI bundle consumed by the native monitor and by the sidecar's loopback-only `/config.html` route. Windows release builds embed both the sidecar and config assets into one portable `SysX.exe`; the app extracts them under app data while it runs. The legacy React/TypeScript frontend, Python backend, Python benchmark scripts, and PyInstaller spec have been removed. Rust Object Detection has ONNX Runtime, OpenVINO, and optional TensorRT adapters; no real model or target hardware has validated inference.
+
+The monitor is a native desktop window rendered through the operating system's WebView (WebView2 on Windows and WKWebView on macOS). Configuration runs in a separate browser window against a loopback-only page served by the Rust sidecar; it is not public or cloud hosted. Windows builds emit a single executable without an installer. The Windows host must provide WebView2 Runtime, and accelerator backends may require their vendor runtime. Neither framework by itself guarantees a 180–360 FPS processing rate; that depends on frame size, model, device, and bounded pipeline behavior and must be benchmarked.
+
+Build the Windows executable and its embedded sidecar on Windows; do not claim Windows validation from a macOS build.
 
 References:
 
 - [Tauri process model](https://v2.tauri.app/concept/process-model/)
 - [Tauri sidecar binaries](https://v2.tauri.app/develop/sidecar/)
-- [Tauri Windows installer and WebView2 modes](https://v2.tauri.app/distribute/windows-installer/)
 - [Electron process model](https://www.electronjs.org/docs/latest/tutorial/process-model)
 - [Electron IPC](https://www.electronjs.org/docs/latest/tutorial/ipc)
 
@@ -23,16 +26,26 @@ References:
 - `public/receiver-mark.svg` is the canonical SysX mark. Keep the title-bar mark and the Tauri PNG/ICO exports visually aligned with it.
 - `src-tauri/tauri.conf.json` lists the PNG and ICO used by desktop bundles.
 
+### Rust UI
+
+- UI components live in `rust-ui/src`; `layout.rs` contains pure preview geometry helpers.
+- `scripts/build-rust-ui.mjs` runs Trunk for both development and release builds. The same output directory feeds Tauri's monitor and the Rust sidecar's local configuration server.
+- Tauri enables `withGlobalTauri` so the Rust UI can select the monitor view and call native commands. The browser-served configuration view uses the local backend HTTP/WebSocket APIs.
+
 ### Desktop frontend
 
 - Keep the native monitor window focused on Preview, Mouse State, device state, and receiver connection state. Preview is always visible; its HUD shows only processing FPS, latency, and processing resolution.
-- Put settings in the separate browser page, with General and FOV sections and one global Apply Changes action. Persist settings in app data and restore them when the backend starts.
+- Put all settings in one vertically scrolling page in the separate browser window, grouped into General and FOV sections with one global Apply Changes action. Persist settings in app data and restore them when the backend starts.
 - Cap Preview at 640 × 640 px; preserve aspect ratio and enlarge smaller frames with smooth or nearest-neighbor scaling.
 - Keep a circle-only FOV overlay always enabled; expose its size as a 1–360° setting in the local config page, with no enable/disable control. Scale its diameter against the shorter side of the displayed image so it stays proportional across source resolutions; 360° is the largest inscribed circle.
+- Persist `offsetX` and `offsetY` as signed crop-pixel settings and display them relative to the selected target in the web config. Movement adds these offsets to the selected point before calculating crop-center error.
+- Persist a Trigger button preference in the web config with Right, Middle, M4, and M5 choices; exclude Left. Device output is sent only while that physical button is held.
+- Provide independent X/Y exponential-smoothing alpha sliders in the local config. The backend applies `previous + alpha * (current - previous)` to selected target coordinates; the filtered point feeds Preview and device movement while raw detections remain intact. Alpha `1.0` disables filtering. Clear smoothing history when a target is lost or pipeline configuration changes.
+- Provide persisted user-entered sensitivity (`0.01..10`) and DPI (`100..100000`) in the local config. Movement scale uses `360 * 2.54 * max(sens, 0.01) / (54.54 * DPI)`.
 - Reflect backend IPC readiness in the connection status; show “Waiting for sender” after the authenticated socket connects and reserve “Starting receiver” for startup.
 - Retry frame-source runtime failures every 3 seconds. Retain the active listener while a requested port is occupied, then switch to the requested port and clear its error after a successful bind. Startup bind failures and later UDP read/decode failures retry until the listener returns.
 - Let the local configuration page scroll vertically as additional settings are added.
-- Keep backend, precision, and compute preferences disconnected from inference runtime selection.
+- Apply backend and compute selections to inference. Precision remains a saved preference because the imported model artifact supplies its precision.
 - Send receiver, crop, and detection configuration to the backend. The sender provides full-frame MJPEG; the receiver takes a centered square crop before detection and publishes that cropped image to Preview.
 - Default the UDP listener to port `4200`. Show model controls (including import) only in Object Detection mode. Do not add a Data or export section to the desktop UI.
 - Object Detection's Min confidence threshold ranges from `0` to `1` and filters which detections are drawn in Preview.
@@ -40,20 +53,19 @@ References:
 - Render Pixel Seek detections as boxes tinted with the selected target color, without AI class/confidence labels. Object Detection filters by minimum confidence, draws stable per-class boxes, and shows `[id] score% | ...` in a compact summary badge.
 - Never run inference on the UI thread.
 
-### Python backend
+### Rust backend
 
-- UDP receiver for successive full-frame JPEG images (MJPEG); require JPEG SOI/EOI markers before OpenCV decoding so PNG or other formats cannot pass as sender frames. Apply the configured centered square crop after decode and before processing.
-- Validate SOI/EOI on UDP boundary chunks before adding payloads to a reassembly, and discard any existing partial frame if a boundary marker is invalid.
-- Bounded latest-frame pipeline.
-- `DetectionStrategy`, `PixelSeekStrategy`, `ObjectDetectionStrategy`, and `StrategyFactory`.
-- Shared detection result schema and storage.
-- Pixel Seek target profiles for yellow, red, and purple are code-defined in `receiver_backend.service.PIXEL_COLOR_PROFILES`; only the selected color's profile reaches the processing pipeline. Decoded BGR frames are converted to RGB and then HSV. The OpenCV ranges are red H 0–10/S 50–255/V 180–255, yellow H 20–40/S 157–255/V 252–255, and purple H 140–160/S 60–255/V 240–255. `PixelColorRule.roi` optionally restricts a rule to normalized source-frame coordinates `(left, top, right, bottom)`; `None` means the whole frame.
-- Model registry removal deletes only its YAML entry, never the user's model file. Removing the active model while Object Detection is selected returns processing to Pixel Seek; removing an inactive model keeps the active strategy/model.
-- Optional Ultralytics integration for user-provided `.pt` models only.
-- The supplied DetectionMode reconstruction matches the two `StrategyName` branches; unsupported values are rejected by the enum parser. Pixel Seek applies the supplied inclusive RGB-to-HSV mask thresholds. Object Detection passes configured confidence and IoU thresholds to Ultralytics and keeps class-aware NMS (`agnostic_nms=False`). Its 6/7-field raw-row decoder stays in Ultralytics because the current `.pt` path returns decoded, NMS-filtered boxes and owns coordinate restoration. The recovered mode-5 center crop is applied before either strategy; crop-relative detections are translated to original-frame coordinates.
-- Sidecar lifecycle managed by the Tauri process.
+- Packet reassembly and JPEG boundary validation live in `rust-backend/src/udp.rs`; UDP receive and JPEG decode live in `receiver.rs`; centered crop geometry is isolated in `crop.rs`.
+- Bounded latest-frame processing lives in `pipeline.rs`. Pixel Seek profiles and target selection live in `pixel_seek.rs` and `targeting.rs`.
+- Model loading, NCHW RGB preprocessing, runtime adapters, YOLOv8 output decoding, confidence/IoU filtering, and class-aware NMS live in `inference.rs`. The pipeline caches the selected runtime and uses model artifact paths plus backend/compute selection to choose it.
+- Movement conversion/batching, persistence, and loopback web configuration live in `movement.rs`, `storage.rs`, and `web_config.rs`.
+- User settings live in `app-settings.json` under the operating system's app-data directory. The backend creates a defaults file on first launch, loads it at startup, and the local page reads and atomically updates the same file through `GET/PUT /api/settings` when Apply Changes is used.
+- Import one bundle with ONNX `.onnx`, TensorRT `.engine`/`.plan`, and OpenVINO IR `.xml`/`.bin`. ONNX Runtime is CPU-only; OpenVINO requests CPU/GPU/NPU from the installed runtime; TensorRT is compiled only when TensorRT headers and `CUDA_PATH` are set during backend build and needs GPU hardware. Inference rejects crop dimensions that differ from the configured model input; it does not resize.
+- The supported decoder expects raw YOLOv8 output shaped `[1, 4+classes, anchors]` or `[1, anchors, 4+classes]`. Confidence and IoU come from the model registry; class-aware NMS precedes the common FOV/prior-box/anchor selector. The Precision selector is saved UI preference only.
+- Runtime adapters compile, the pure output decoder and crop mismatch path have unit coverage, but no user model is present. Actual model inference and accelerator/runtime availability remain unverified.
+- `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the Tauri executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
 
-Implemented backend modules include a YAML model registry, shared detection types, Pixel Seek, lazy Ultralytics inference, UDP reassembly, a one-pending-frame worker, and asynchronous JSONL persistence. The desktop receives uncropped MJPEG frames, crops them before processing, and shows the crop in Preview. Tauri manages the backend process; the frontend uses a typed command channel and authenticated loopback WebSocket for state, configuration, diagnostics, and binary preview frames.
+The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pixel Seek or a selected Object Detection runtime, persists detections, and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
 
 ### Frame flow
 
@@ -66,25 +78,22 @@ Implemented backend modules include a YAML model registry, shared detection type
 
 ### Target selection and mouse output
 
-- `receiver_backend.targeting` applies Object Detection score gates and reconstructs center-ellipse eligibility, nearest box-center ranking, previous-box coverage preference, and class-dependent vertical anchor. Class-group configuration is unavailable and remains unset.
-- Detection runs over the full processed crop. FOV filters only downstream targeting candidates; Pixel Seek chooses the highest accepted mask pixel inside the configured centered FOV, while full-frame detections remain available for Preview. The selected point is sent with frame metadata and Preview draws a center-to-target line and ring.
-- Pixel Seek's source-specific center-bounded scan and upper-half fallback, and LogicManager error/offset/divisor interpolation remain extension points because their complete algorithms and parameters are unavailable.
-- Fractional relative deltas retain sub-pixel residuals before integer conversion. Axis locks and command/method mouse transport are typed skeletons only; no mouse injection is wired to the device monitor.
-- `receiver_backend.serial_command_queue` models the recovered type-0 async serial handoff: it keeps immutable command bytes and completion state alive until the writer callback retires them, then reports completion so a caller can resume draining. The actual Win32 `WriteFile`/IOCP adapter, command producer, nonzero timer variants, and vendor output wiring remain unimplemented; `request_ms` is metadata, not a deadline.
-- Do not expose these paths as active controls or claim movement support until the source logic, runtime configuration, device adapters, and validation are available.
+- Rust `targeting.rs` and `pipeline.rs` preserve full-crop detection and FOV-gated Pixel Seek/Object Detection selection, including nearest box, prior-box overlap, and the existing class anchor rule. Preview retains detections outside FOV.
+- Rust `movement.rs` converts fresh filtered crop targets and batches deltas before Tauri receives them. `src-tauri/src/movement.rs` also sums fresh pending deltas, applies the held-trigger gate and 100 ms freshness limit, adds the sampled recoil value to Y, then caps each device command to ±32 per axis. Medius and Ferrum calls remain in Tauri's device monitors.
+- `src-tauri/src/serial_queue.rs` ports the type-0 asynchronous command consumer behind a writer interface. It retains command bytes until completion and is intentionally not connected to a device.
 
-The development launcher uses the project Python environment. The Windows build script creates a PyInstaller backend executable and packages it with Tauri. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
+The CapkfaPlus mapping in [`docs/CAPKFA_RECONSTRUCTION_MAPPING.md`](docs/CAPKFA_RECONSTRUCTION_MAPPING.md) is reference material only. SysX does not expose or run the reconstructed active-state, mode-predicate, direct-offset, or timed-click branches because their live state producers are unavailable. The supported output path uses fresh summed deltas, the configured physical trigger, sampled recoil on Y, and the documented Medius/Ferrum relative-move APIs.
 
-The Tauri host runs a background device monitor independently from the Python vision backend. It checks Medius devices using the official `medius` Rust client (CH343 USB identity followed by the protocol handshake and version/name read; the crate uses its fixed 6,000,000 baud setting), then listens for the five physical button edges with `input_events`. The current Ferrum probe opens Silicon Labs CP210x at the documented Legacy API baud (115,200), verifies `km.version()`, and parses button callback payloads as raw five-bit values, not UTF-8 text. These are Medius/Ferrum rates; do not use Makcu baud values. The App-managed Ferrum Software API remains preferred; its configured serial endpoint is not discoverable from the public docs and is not yet wired. The header caches the device state and displays Left, Right, Middle, Mouse4, and Mouse5; values stay unknown until an event arrives. This is read-only physical telemetry and sends no mouse/key injection. Ferrum endpoint/firmware compatibility and both vendors' hardware behavior are not yet validated on Windows in this workspace.
+The development and release launchers build the Rust UI before the Rust backend. Tauri embeds the sidecar and static config bundle; Windows emits the `SysX.exe` portable executable with `--no-bundle`. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
 
-No GitHub Actions build workflow is configured. The Windows x64 build and smoke-test scripts remain available for manual validation: they build the Python sidecar, verify UDP `4200` and 192×192 frame receipt, package the Tauri app, silently install the NSIS artifact, check installed app/backend startup and shutdown, and uninstall it. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
+The Tauri host runs the vision sidecar and a background device monitor as separate Rust processes/threads. Pending movement-delta merging, freshness checks, trigger mapping, and the ±32 per-axis command clamp live in `src-tauri/src/movement.rs`; device monitors retain the Medius and Ferrum API calls. The host checks Medius devices using the official `medius` Rust client and watches five physical button states. Ferrum currently uses a Silicon Labs CP210x Legacy API connection at 115,200 baud, verified by `km.version()`. While the configured trigger is held, the host sends the merged movement through that same verified connection. The X/Y exponential filters are applied before movement. The Ferrum App Software API endpoint and movement behavior on either vendor's hardware remain unverified on Windows.
+
+No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` builds the Rust sidecar and UI, emits one `SysX.exe` without an installer, verifies UDP `4200` and 192×192 frame receipt, then checks executable startup, embedded backend bind, and normal shutdown. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
 
 ## Build prerequisites
 
-- Node.js 20+ and pnpm.
-- Rust stable and the Tauri platform prerequisites.
-- Python 3.11+ for the backend.
-- For Windows release builds: Windows x64 runner, WebView2 offline installer, and a Windows-built Python sidecar.
+- Node.js 20+, pnpm, Rust stable, Trunk, and the Tauri platform prerequisites.
+- For Windows release builds: Windows x64 runner and an available WebView2 Runtime on the validation machine.
 
 ## Commands
 
@@ -97,40 +106,30 @@ pnpm build
 pnpm tauri build
 ```
 
-Python setup and checks from the repository root:
+Rust backend checks from the repository root:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e 'backend[dev]'
-.venv/bin/python -m pytest backend/tests
+cargo check --manifest-path rust-backend/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path rust-backend/Cargo.toml
+cargo test --manifest-path rust-ui/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+The Rust UI release bundle is built with `pnpm build` (or `node scripts/build-rust-ui.mjs build`).
 
 Local UDP protocol verification:
 
 ```sh
-.venv/bin/receiver-backend udp-listen --host 127.0.0.1 --port 4200
-.venv/bin/receiver-backend udp-send-image path/to/image.png --host 127.0.0.1 --port 4200
+cargo run --manifest-path rust-backend/Cargo.toml -- udp-listen --host 127.0.0.1 --port 4200
+cargo run --manifest-path rust-backend/Cargo.toml -- udp-send-image src/assets/red-cube-192.jpg --host 127.0.0.1 --port 4200
 ```
 
-Receiver backend loopback benchmark (synthetic JPEG fixture; includes UDP packetization/reassembly, JPEG decode, Pixel Seek, and binary WebSocket preview transport; excludes OBS capture, Tauri renderer, Windows, and production HSV profiles):
-
-```sh
-.venv/bin/python scripts/benchmark_receiver_udp.py --width 1280 --height 720 --fps 360 --duration 3
-```
-
-Current repeat runs on macOS 15.3.1 ARM64 used 1280×720 JPEG frames (16,634 bytes, 15 datagrams each) for 3 seconds. At 180 requested sender FPS, sender/source/processing measured 179.95/179.93/180.05 FPS. At 360 requested FPS, they measured 359.99/359.81/359.79 FPS. Both runs had 0 input drops, transport drops, invalid packets, and rejected frames, with 181 WebSocket preview frames. An earlier 360 FPS run measured 348.4 processing FPS and 4 input drops, showing that throughput varies by run. These are local synthetic backend measurements, not Windows, OBS, target-network, production-profile, or Tauri-renderer validation.
-
-Pixel Seek strategy-only microbenchmark (synthetic full-mask fixture; not an end-to-end application or hardware acceptance test):
-
-```sh
-.venv/bin/python scripts/benchmark_pixel_seek.py --width 1280 --height 720 --frames 3000
-```
-
-The fixture HSV range is intentionally synthetic and is not installed in `PIXEL_COLOR_PROFILES`. The strategy-only result excludes UDP, JPEG decoding, storage, Object Detection, Tauri, and UI preview. Measure those separately before making a system throughput claim.
+The verifier reports frames it actually receives; it does not measure inference throughput. Historical 1280×720 synthetic rates in older project records came from the retired Python backend and are not Rust performance evidence. No current Rust end-to-end benchmark has been run.
 
 Use `0.0.0.0` as the listener host only when intentionally accepting frames from other computers on the network. The verifier reports frames it actually receives; it does not measure inference throughput.
 
-The OBS sender is out of scope for the current application. Its interoperable Receiver contract and implementation limits are documented in [`docs/OBS_RECEIVER_PROTOCOL.md`](docs/OBS_RECEIVER_PROTOCOL.md). Keep that document synchronized with `receiver_backend.udp` if the wire protocol changes.
+The OBS sender is out of scope for the current application. Its interoperable SysX contract and implementation limits are documented in [`docs/OBS_RECEIVER_PROTOCOL.md`](docs/OBS_RECEIVER_PROTOCOL.md). Keep that document synchronized with `rust-backend/src/udp.rs` if the wire protocol changes.
 
 ## Milestones
 
@@ -143,7 +142,7 @@ The OBS sender is out of scope for the current application. Its interoperable Re
 7. [x] Versioned UDP receiver integrated with the desktop preview; full-frame MJPEG from the sender is the desktop input source.
 8. [x] JSONL/CSV persistence module, bounded processing worker, and application diagnostics.
 9. [x] Backend and frontend checks (50 backend tests and 11 frontend tests pass; UI integration coverage remains limited).
-10. [x] Windows x64 build scripts and UDP sidecar/desktop executable lifecycle smoke tests; [ ] manual Windows build, NSIS installation, and visual application validation. GitHub Actions build workflow removed.
+10. [x] Windows x64 build and smoke scripts; [ ] manual Windows executable build, startup/shutdown, and visual application validation. GitHub Actions build workflow removed.
 11. [x] Impeccable and UI UX Pro Max review: developer-tool dark/minimal direction and keyboard/focus guidance checked; the earlier Impeccable detector returned `[]`. Existing `design-review/` captures predate the current UI and are historical only; current native review has been performed, while Windows visual review remains pending.
 12. [x] Preview HUD reports source and inference resolution, measured performance, and input/transport drops; `pnpm build` passes.
 13. [x] UDP defaults to port `4200`; Pixel Seek hides model configuration and the desktop UI has no Data/export section. Frontend build/tests and backend tests pass.
@@ -171,7 +170,7 @@ The OBS sender is out of scope for the current application. Its interoperable Re
 35. [x] Rechecked native readiness and recovery states: the bundled release app reports a port bind failure when `4200` is occupied, then reports “Waiting for sender” after IPC connects and a free UDP port is selected. The 192 × 192 sample stream changes the status to “Receiving frames.”
 36. [x] Processing FPS now uses a trailing one-second window instead of retaining idle completions; the focused regression test, 45 backend tests, frontend build, and all 8 frontend tests pass.
 37. [x] Current release-bundle native smoke review with the 192 × 192 sample at a 180 FPS send target showed 180.0 source FPS, 179.5 processing FPS, 60.1 preview FPS, 5 input drops, and 0 transport drops. At 980 × 680, Detection Engine choices stack and Settings scrolls. This does not verify Windows or OBS interoperability.
-38. [ ] Object Detection's Backend, Precision, and Compute controls are visual placeholders: selected preferences can be saved, but they are not applied to inference. The implemented inference path accepts user `.pt` models through Ultralytics; implement and validate each runtime adapter before presenting these selections as active settings.
+38. [x] Backend and Compute now configure Rust inference runtime selection. Precision remains a saved preference because precision is determined by each imported model artifact; real-model and device validation is still pending.
 39. [x] Increased processing-FPS sample capacity to 4096 so the rolling estimator can represent rates above 360 FPS; a 600-FPS timestamp regression check passes. All 46 backend tests pass, PyInstaller rebuilt the ARM64 sidecar, the release bundle's sidecar `--help` check passes, and the latest 300.42 MiB unsigned macOS `Receiver.app` release bundle builds successfully. This does not validate Windows or OBS interoperability.
 40. [x] Hardened `scripts/build-windows.ps1` to fail immediately when Python, pytest, PyInstaller, or Tauri native commands return nonzero; this prevents a later successful build step from hiding an earlier failed test. PowerShell/Windows execution is unavailable on this macOS workspace, so syntax and runtime validation require a Windows machine.
 41. [x] Added an NSIS artifact smoke test for silent install, installed app/backend startup and shutdown, and uninstall; the installed executable is exercised by the existing lifecycle check. Windows execution remains pending because this workspace has no Windows host or PowerShell runtime.
@@ -207,14 +206,37 @@ The OBS sender is out of scope for the current application. Its interoperable Re
 71. [x] Pixel Seek continues to detect across the full processed crop, then selects the highest accepted mask pixel inside the configured FOV for downstream targeting. The selected frame coordinate is carried in detection metadata and rendered as a center-to-target line and ring in Preview. Object Detection candidates are FOV-filtered before its ranking extension point; detections outside FOV remain visible. Backend/frontend regression tests cover this behavior and crop-coordinate mapping.
 72. [x] Wired Object Detection to the reconstructed FOV/nearest-box/prior-box/class-anchor selector and the Preview target point. Preview now draws a solid center-to-target line, a complete target ring, per-class colored corner boxes, and a `[id] score% | ...` summary badge. Medius remains at its official crate rate (6,000,000 baud) and Ferrum Legacy at 115,200 baud; no Makcu rate is used. Backend/frontend tests cover target selection and summary formatting; Windows/device visual validation remains pending.
 73. [x] Added the recovered type-0 async serial queue-consumer contract. The consumer retains command bytes and completion state until the writer reports completion, handles synchronous submission failures, and ignores unimplemented request kinds. This is a tested writer-interface skeleton only; no Win32 overlapped writer or device movement is active. The RAR's 17 files currently map to 6 integrated/equivalent behaviors, 6 partial or skeleton behaviors, and 5 intentionally unported or out-of-scope behaviors; this async consumer is an additional partial reconstruction from the pasted snippet.
+74. [x] Combined General and FOV controls into one vertically scrolling web configuration page and removed page navigation. `pnpm build` and `git diff --check` pass; Windows visual validation remains pending.
+75. [x] Added persistent signed X/Y Target Offset settings and a target-relative map in the single-page web config; offsets validate as finite numbers and restore through backend app settings. The values are not yet applied to mouse motion. Frontend production build, frontend tests, backend web-config/service tests, and diff checks pass; Windows visual/device validation remains pending.
+76. [x] Added a persisted Trigger button preference with Right, Middle, M4, and M5 choices; Left and unknown values are rejected by backend validation. The selection is configuration only because trigger-driven movement is not implemented. Frontend and backend regression coverage added.
+77. [x] Connected held-trigger movement to the selected physical device. Processed results send filtered targets through the sidecar pipe; the backend applies crop-center error, saved offsets, sensitivity/DPI scaling, fractional residuals, and X/Y filtering before Medius `move_rel` or Ferrum Legacy `km.move`. Commands are limited to ±32 units per axis and stale targets expire after 100 ms. Backend and Rust unit tests pass; physical device or Windows hardware validation remains unavailable.
+78. [x] Extracted filtered-target to relative-delta calculation into `receiver_backend.movement.MovementController`; `ReceiverService` retains pipe publication and lifecycle duties. Added focused movement-controller regression tests.
+79. [x] Integrated the supplied NCAF single-step movement controller, including three-zone response, prediction, scaling, cubic Bézier response, residual accumulation, and occasional micro-corrections. Retained latest-frame movement and Tauri's stale/±32 safeguards; source path queues and delays remain unused.
+80. [x] Added persisted Sensitivity and DPI controls and applied the screenshot's movement conversion formula. Movement deltas are summed over a short backend batch and again while pending at the Tauri device monitor, then sent as one relative API command. At that milestone, the special-route state inputs were still absent; they are now explicitly configured as recorded in milestone 92.
+81. [x] Consolidated the supported UDP/JPEG frame source and centered crop helper in `receiver.py`; packet parsing stays in `udp.py`, processing stays in `pipeline.py`, movement stays in `movement.py`, and the local config server stays in `web_config.py`. Removed unused local image/video source classes and their tests. Existing two-stage movement delta aggregation remains in place.
+82. [x] Moved the legacy Python backend 4 ms movement batching worker into `movement.py`; the current Rust sidecar has its own movement module.
+83. [x] Extracted Tauri pending-movement aggregation, freshness checks, trigger mapping, and command clamping into `src-tauri/src/movement.rs`; Medius and Ferrum monitors keep the vendor API calls. `cargo check` passes; hardware behavior remains unverified.
+84. [x] Tauri now launches and packages the Rust sidecar using a target-aware build hook. The Rust UDP CLI can send the actual JPEG fixture; an isolated macOS service smoke processed one 192×192 frame on UDP `4202` with zero rejected frames. The UI remains React/TypeScript, Rust Object Detection is unavailable, and Windows/hardware behavior remains unverified.
+85. [x] Replaced the active React frontend build with a Leptos/WebAssembly Rust UI. Trunk now builds the monitor and configuration UI bundle; Tauri uses it for the monitor, and the Rust sidecar serves the same `index.html` at `/config.html`. At that milestone, Object Detection remained unavailable and legacy Python/React sources were still present.
+86. [x] Added Rust Object Detection runtime integration for a four-file model bundle: ONNX, TensorRT engine/plan, and OpenVINO XML/BIN. The pipeline caches the selected runtime, enforces exact crop/model dimensions, applies model confidence/IoU, decodes raw YOLOv8 output with class-aware NMS, and passes candidates through the Rust FOV/prior-box/class-anchor selector. Added runtime/decoder/target-selection coverage. Rust backend has 22 passing tests; Rust UI release build and Tauri `cargo check` pass. `cargo check --features tensorrt` passes, but the TensorRT SDK shim, OpenVINO device runtime, real model inference, Windows, and hardware have not been validated.
+87. [x] Removed the legacy Python backend/tests, React/TypeScript UI/tests, PyInstaller spec, and Python benchmark scripts. The active application/runtime source is Rust; pnpm/Node remain build tooling for Tauri and Trunk. Added the Rust type-0 serial queue consumer behind an async-writer interface and Rust tests for its buffer lifetime and completion order.
+88. [x] Translated supported CapkfaPlus reconstruction formulas into Rust helpers and mapped all reconstruction files in `docs/CAPKFA_RECONSTRUCTION_MAPPING.md`. At that milestone direct/timed click and recoil were helper-only; milestone 92 connects them through explicit persisted state. No reconstructed UDP device packet is used.
+89. [x] Rechecked the two movement aggregation stages and fixed stale-delta carryover: each stage now excludes a pending delta older than 100 ms before summing it with a newer frame. Backend tests (28), Tauri tests (9), UI tests (4), Trunk release build, per-crate `cargo fmt --check`, and `git diff --check` pass. Windows, OBS sender interoperability, and device movement remain unverified.
+90. [x] Added the required Rust service integration test: change from an ephemeral UDP port to another port, verify the new port is active, send `src/assets/red-cube-192.jpg` through the implemented packet format, and confirm the processing pipeline completes the frame. This exercises local Rust receiver behavior and does not validate a production OBS plugin, Windows, or device hardware. Backend suite: 29 passed.
+91. [x] Added a web-config upload/commit integration test for all four files in the selected model bundle: ONNX, TensorRT engine, and OpenVINO XML/BIN. The test verifies that the committed artifacts exist at the paths returned to the model registry. Current full suites: backend 30, Tauri 9, UI 4 passed; TensorRT feature `cargo check`, Trunk release build, per-crate `cargo fmt --check`, and `git diff --check` pass. No model was supplied, so actual inference remains unverified.
+92. [x] Added explicit reconstructed movement state and timed-action settings. This milestone is superseded by milestone 94: those state/timed branches were removed because their state producers and behavior are not available in the active source. Recoil remains in the normal movement path.
+93. [x] Changed Windows output to a portable single `SysX.exe` with no installer. The Rust backend and local configuration assets are embedded, extracted to per-process app data at launch, and removed on normal shutdown. Updated the Windows smoke path to check the standalone executable and removed the NSIS installer smoke script. The macOS release app compiles with embedded assets; Windows output and runtime validation remain pending.
+94. [x] Removed Native Motion State and Timed Action from the active UI/runtime. Restored the Tauri movement module with fresh pending-delta summing, selected-trigger gating, recoil sampling into Y, and ±32 command clamps. The backend now creates `app-settings.json` on first launch; the web config reads and writes that file through its local settings API. Added persistence and movement regression tests; Windows and hardware movement remain unverified.
+95. [x] Fixed packaged WebView startup: production CSP now permits the Trunk WASM bootstrap, and the embedded page includes a visible `NO FRAME` startup fallback if a platform WebView cannot initialize WASM. Rebuilt and opened the release macOS bundle successfully; it shows the SysX startup state instead of a black window. The fallback does not replace the Rust UI when WASM initializes normally.
+96. [x] Made the native Preview viewport square at up to 640 × 640 CSS pixels and kept its HUD to the three requested measured fields: resolution, FPS, and latency. The startup fallback follows the same square preview and HUD shape.
 
 ## Limitations to preserve
 
 - There are no sender binaries, user models, or target-Hardware measurements in the repository.
-- Object Detection's ONNX Runtime/TensorRT/OpenVINO, FP16/INT8, and CPU/GPU/NPU controls persist only as UI preferences and are not wired to inference runtime selection. Do not report those backends or compute targets as supported; `.pt` inference is implemented through Ultralytics.
+- No user model is present. Object Detection supports raw YOLOv8 output only; ONNX Runtime uses CPU, OpenVINO requires the matching installed runtime/device plugin, and TensorRT requires a build with TensorRT headers plus `CUDA_PATH` and a compatible GPU. Precision remains a saved preference. No real-model, Windows, accelerator, or hardware inference has been validated.
 - Do not report the sample values in the prototype as live measurements.
 - The app can only be called Windows-tested after a Windows CI or device build and runtime check.
 - `scripts/smoke-windows-app.ps1` has not been executed locally because this workspace is macOS and has no PowerShell runtime; run it on a Windows machine for authoritative validation.
-- The local macOS app bundle contains the Tauri executable, icon, and Python sidecar. A short 192 × 192 local-sender run at a 360-FPS target measured 350.74 sender FPS (74 skipped slots), with a live HUD snapshot of 355.0 source/processing FPS and 60.0 preview FPS, and zero receiver drops. This does not verify OBS interoperability, Windows behavior, sustained 360-FPS sender throughput, or target hardware.
+- Previous macOS app bundles and benchmark results include the retired Python path. The 350.74 sender FPS / 355.0 source-processing FPS run is historical and is not Rust or current Tauri measurement. It does not verify OBS interoperability, Windows behavior, sustained 360-FPS sender throughput, or target hardware.
 - Except for `design-review/receiver-visual-qa-980x680.png`, the PNGs in `design-review/` are historical captures of earlier layouts. The current screenshot verifies layout only and shows a UDP bind error; Preview fit, overlay mapping, and HiDPI geometry have automated unit coverage, while Windows visual behavior remains unverified.
 

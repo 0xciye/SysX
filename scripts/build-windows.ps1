@@ -1,13 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64") {
-    throw "Build the Receiver installer on a Windows x64 runner."
+    throw "Build the SysX executable on a Windows x64 runner."
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $root ".venv\Scripts\python.exe"
-$binaryDir = Join-Path $root "src-tauri\binaries"
-$sidecar = Join-Path $binaryDir "receiver-backend-x86_64-pc-windows-msvc.exe"
 
 function Invoke-CheckedNative {
     param(
@@ -22,31 +19,18 @@ function Invoke-CheckedNative {
     }
 }
 
-if (-not (Test-Path $python)) {
-    Invoke-CheckedNative -Command "py" -CommandArguments @("-3.12", "-m", "venv", (Join-Path $root ".venv"))
-}
-Invoke-CheckedNative -Command $python -CommandArguments @("-m", "pip", "install", "--upgrade", "pip")
-Invoke-CheckedNative -Command $python -CommandArguments @("-m", "pip", "install", "-e", "backend[dev,package]")
-Invoke-CheckedNative -Command $python -CommandArguments @("-m", "pytest", "backend\tests")
-
 Push-Location $root
 try {
-    Invoke-CheckedNative -Command $python -CommandArguments @(
-        "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console", "--name", "receiver-backend",
-        "--paths", "backend\src", "--collect-all", "ultralytics", "--collect-all", "torch", "--collect-all", "cv2",
-        "backend\entrypoint.py"
-    )
-} finally {
-    Pop-Location
-}
-
-New-Item -ItemType Directory -Force -Path $binaryDir | Out-Null
-Copy-Item (Join-Path $root "dist\receiver-backend.exe") $sidecar -Force
-& (Join-Path $PSScriptRoot "smoke-windows-udp.ps1")
-Push-Location $root
-try {
-    Invoke-CheckedNative -Command "pnpm" -CommandArguments @("tauri:build", "--config", "src-tauri\tauri.windows.conf.json")
-    & (Join-Path $PSScriptRoot "smoke-windows-installer.ps1")
+    Invoke-CheckedNative -Command "pnpm" -CommandArguments @("tauri:build", "--no-bundle", "--config", "src-tauri\tauri.windows.conf.json")
+    Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-backend\Cargo.toml")
+    Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-ui\Cargo.toml")
+    Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "src-tauri\Cargo.toml")
+    $builtExe = Join-Path $root "src-tauri\target\release\receiver.exe"
+    $sysxExe = Join-Path $root "src-tauri\target\release\SysX.exe"
+    if (-not (Test-Path $builtExe)) { throw "Tauri did not produce the desktop executable: $builtExe" }
+    Copy-Item -LiteralPath $builtExe -Destination $sysxExe -Force
+    & (Join-Path $PSScriptRoot "smoke-windows-udp.ps1")
+    & (Join-Path $PSScriptRoot "smoke-windows-app.ps1") -ApplicationPath $sysxExe
 } finally {
     Pop-Location
 }

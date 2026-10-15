@@ -1,0 +1,11 @@
+[build]
+target = "index.html"
+dist = "../dist"
+public_url = "./"
+filehash = false
+inject_scripts = false
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 1421
+open = false

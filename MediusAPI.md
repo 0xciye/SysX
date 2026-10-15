@@ -1,6 +1,6 @@
 # Medius API
 
-Implementation reference for connecting Receiver to a Medius box, identifying the box and attached peripheral, checking readiness, and optionally sending detection-derived mouse movement. This is a Vietnamese-language summary of the official API documentation, not a verbatim copy.
+Implementation reference for connecting SysX to a Medius box, identifying the box and attached peripheral, checking readiness, and sending trigger-gated detection-derived mouse movement. This is a summary of the official API documentation, not a verbatim copy.
 
 **Documentation checked:** 2026-10-15  
 **Current documented protocol:** 9  
@@ -19,13 +19,13 @@ Medius is firmware and a binary control protocol for a USB passthrough box. A re
 | Framing | `8N1` |
 | Protocol | Binary from the first byte; no text console or baud negotiation |
 
-Hardware ports in the documented layout: USB1 clone → target/game PC, USB2 control → computer running Receiver, USB3 → physical mouse. The hardware guide warns not to connect USB1 and USB3 to the same computer because of the 5V back-feed risk.
+Hardware ports in the documented layout: USB1 clone → target/game PC, USB2 control → computer running SysX, USB3 → physical mouse. The hardware guide warns not to connect USB1 and USB3 to the same computer because of the 5V back-feed risk.
 
 ## 2. Discovery, handshake, and identity
 
 ### Recommended Rust client path
 
-The official Rust crate should own port scanning, framing, CRC, response matching, handshake, reader threads, and teardown. Avoid writing a second raw-protocol stack in Receiver.
+The official Rust crate should own port scanning, framing, CRC, response matching, handshake, reader threads, and teardown. Avoid writing a second raw-protocol stack in SysX.
 
 ```rust
 use medius::Device;
@@ -178,14 +178,15 @@ while let Some(event) = input.recv_timeout(std::time::Duration::from_millis(100)
 
 `INJECT` payload: `class:u8`, `id:u16 LE`, `action:u8`; class `0=button`, `1=keyboard`, `2=media`; action `0=soft release`, `1=press`, `2=force release`. Soft release removes the software override and lets a physical hold pass through. Force release masks a physical hold. Check `CAPS` first. Always release input owned by the app on shutdown/error; avoid leaving buttons or keys held.
 
-## 7. Errors, lifecycle, and Receiver behavior
+## 7. Errors, lifecycle, and SysX behavior
 
 - Errors to distinguish: no matching VID/PID, open/permission/busy error, query timeout/no reply, invalid CRC/frame, unsupported `proto_ver`, device removed, and a healthy box with no physical peripheral.
-- Keep USB/serial reads and queries outside the frame-processing worker. Use one owned connection and a bounded command queue if detections issue movement.
+- Keep USB/serial reads and queries outside the frame-processing worker. SysX's device monitor owns the connection; movement targets arrive through a bounded latest-value channel.
 - Do not rescan/open the same port every frame. Rescan on startup and reconnect with backoff on disconnect.
 - Drop the client handle on shutdown; the official client stops its reader/keepalive threads and closes serial on drop.
 - Do not report `input chain ready` based only on `VERSION`; call `query_health()` and evaluate the flags relevant to the product.
-- Current Receiver monitor uses `find_medius()` + `Device::open()` + `query_version()` and displays `Version.name`. It does **not** currently call `query_health()`, `device_info()`, or any write/injection method.
+- Current SysX monitor discovers the CH343 VID/PID, opens the path, verifies `query_version()`, and subscribes to all five physical buttons. While the configured Right/Middle/M4/M5 button is held, it sends fresh movement through `Device::move_rel()`, capped to ±32 per axis. It does not yet call `query_health()`, `device_info()`, or `inject()`.
+- No Medius hardware or Windows movement test has been run. The implemented call path and software caps do not establish physical calibration or end-to-end device latency.
 
 ## 8. API map and official references
 

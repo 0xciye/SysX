@@ -1,6 +1,6 @@
 # Ferrum API
 
-Implementation reference for connecting Receiver to Ferrum Software API, verifying Ferrum identity, reading command replies, and understanding the available input-control APIs. This is a Vietnamese-language summary of the official API documentation.
+Implementation reference for connecting SysX to Ferrum, verifying Ferrum identity, reading command replies, and understanding the available input-control APIs. This is a summary of the official API documentation.
 
 **Documentation checked:** 2026-10-15  
 **Preferred API:** Software API through Ferrum App on Windows  
@@ -102,7 +102,7 @@ km.<bitmap byte>   callback: 5-bit held-button bitmap
 km.buttons(0)      disable callback
 ```
 
-The command syntax and byte format are documented in Ferrum's older KM callback reference, while the current `docs.xferrum.dev` mouse-button page lists the five names but does not specify this callback. Confirm callback availability on the selected Software API endpoint/build before depending on it. Do not parse the callback byte as UTF-8 text or confuse echoed `km.buttons(1)` with a state event. The Receiver integration keeps each button unknown until it receives the first bitmap.
+The command syntax and byte format are documented in Ferrum's older KM callback reference, while the current `docs.xferrum.dev` mouse-button page lists the five names but does not specify this callback. Confirm callback availability on the selected Software API endpoint/build before depending on it. Do not parse the callback byte as UTF-8 text or confuse echoed `km.buttons(1)` with a state event. SysX keeps each button unknown until it receives the first bitmap.
 
 `km.left()` through `km.side2()` are not equivalent to the callback: KM-compatible APIs may return ownership/lock state rather than a clean physical-only boolean. Prefer the bitmap callback for held physical state when that callback is supported.
 
@@ -134,7 +134,7 @@ Ferrum Software API also supports KMBox Net and DHZBox-style command sets over U
 
 The Legacy API is a small KM-style command set for platforms that cannot use Ferrum App APIs. Docs say connect directly to the Silicon Labs CP210x COM port at `115200` baud; it resets to that baud after device power cycle. The same move commands have behavior matching Software API, but Legacy has no command echo. Use only when Software API is unavailable and the user explicitly configures it; do not silently fall back because baud, endpoint ownership and response framing differ.
 
-## 8. Receiver integration rules
+## 8. SysX integration rules
 
 ### Presence status
 
@@ -144,11 +144,11 @@ The Legacy API is a small KM-style command set for platforms that cannot use Fer
 - The string to display is `Ferrum`, since public `km.version()` does not reveal a per-unit/peripheral product name.
 - A verified version reply establishes the Ferrum API family only; it does not prove that a cloned physical mouse is present or that the current UI endpoint can stream physical button state.
 - Run serial discovery/query on a background worker, not on the image processing path. Cache status and refresh at a low cadence.
-- The current Receiver monitor probes a Silicon Labs CP210x COM port with the Legacy API at its documented 115200 baud. This is a compatibility path, not the preferred Ferrum Software API. The Software API is powered by Ferrum App and its endpoint must be obtained/configured from that app; public docs reviewed do not provide automatic serial-port discovery for it.
+- The current SysX monitor probes a Silicon Labs CP210x COM port with the Legacy API at its documented 115200 baud, verifies `km.version()`, and requests the button bitmap. This is a compatibility path, not the preferred Ferrum Software API. The Software API is powered by Ferrum App and its endpoint must be obtained/configured from that app; public docs reviewed do not provide automatic serial-port discovery for it.
 
-### Optional detector-to-mouse control
+### Detector-to-mouse control
 
-`km.move(dx,dy)` is relative movement. Convert detection center error from original sender-frame coordinates to calibrated device counts; do not use resized Preview canvas coordinates and do not send raw pixel counts. Clamp outputs, bound command rate, expose a deliberate enable/configuration step, and ensure releases/stop behavior on disconnect. The present Receiver device integration is status-only and does not send mouse/key commands.
+`km.move(dx,dy)` is relative movement. SysX converts the filtered target from original frame/crop coordinates using saved offsets and Sensitivity/DPI, batches deltas, checks trigger state and 100 ms freshness, and clamps each command to ±32 per axis. It sends `km.move` only while the selected Right/Middle/M4/M5 physical trigger is held. This path has not been validated on Ferrum hardware or Windows; device-count calibration and disconnect behavior still need hardware testing. The reconstructed KM serial queue is isolated behind a Rust writer interface and is not attached to this Legacy writer path.
 
 ## 9. Official references
 
@@ -172,9 +172,9 @@ The Legacy API is a small KM-style command set for platforms that cannot use Fer
 
 This is a developer-oriented index of the published API families, not a promise that every command is supported by every endpoint or firmware build.
 
-| Family | Surface | Receiver relevance |
+| Family | Surface | SysX relevance |
 |---|---|---|
-| Keyboard Mouse | `km.version`, `km.move`, five mouse buttons, click scheduling, wheel, key press/release/state, masks/locks, button/key/axis streams | Preferred Software API for device identity, button telemetry, and future relative movement. Confirm the configured serial endpoint and callback support. |
+| Keyboard Mouse | `km.version`, `km.move`, five mouse buttons, click scheduling, wheel, key press/release/state, masks/locks, button/key/axis streams | Preferred Ferrum Software API. Its app-managed endpoint is not currently configured in SysX; the active compatibility path uses Legacy serial. |
 | Mouse Proxy | `start`, `fetch`, `modify`, `stop` | Full physical-frame interception/replacement. It occupies the mouse API while active and is not required for current button telemetry. |
 | KMBox Net compatibility | UDP command protocol configured in Ferrum App | Supported subset only; vendor discourages it for new work. Requires configured address/port, not generic discovery. |
 | DHZBox compatibility | UDP command protocol configured in Ferrum App | Supported subset only; use only if a required command is unavailable in KM. |

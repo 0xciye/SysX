@@ -1,0 +1,201 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RecoilSettings {
+    pub recoil_enabled: bool,
+    pub recoil_levels: Vec<i32>,
+    pub recoil_start_delay_ms: u32,
+    pub recoil_level_duration_ms: u32,
+    pub recoil_percentage: u8,
+    pub recoil_allow_early_resample: bool,
+}
+
+impl Default for RecoilSettings {
+    fn default() -> Self {
+        Self {
+            recoil_enabled: false,
+            recoil_levels: Vec::new(),
+            recoil_start_delay_ms: 0,
+            recoil_level_duration_ms: 0,
+            recoil_percentage: 0,
+            recoil_allow_early_resample: false,
+        }
+    }
+}
+
+impl RecoilSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.recoil_levels.len() > 64
+            || self
+                .recoil_levels
+                .iter()
+                .any(|value| !(-10_000..=10_000).contains(value))
+        {
+            return Err("Use at most 64 recoil levels, each from -10000 to 10000.");
+        }
+        if self.recoil_start_delay_ms > 60_000 || self.recoil_level_duration_ms > 5_000 {
+            return Err("Recoil delay must be from 0 to 60000 ms and interval from 0 to 5000 ms.");
+        }
+        if self.recoil_enabled
+            && !self.recoil_levels.is_empty()
+            && self.recoil_level_duration_ms == 0
+        {
+            return Err("Recoil interval must be greater than 0 ms when levels are configured.");
+        }
+        if self.recoil_percentage > 100 {
+            return Err("Recoil percentage must be from 0 to 100.");
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_recoil_levels(value: &str) -> Result<Vec<i32>, &'static str> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let levels = value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<i32>()
+                .map_err(|_| "Use comma-separated whole numbers for recoil levels.")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if levels.len() > 64
+        || levels
+            .iter()
+            .any(|level| !(-10_000..=10_000).contains(level))
+    {
+        return Err("Use at most 64 recoil levels, each from -10000 to 10000.");
+    }
+    Ok(levels)
+}
+
+pub fn format_recoil_levels(levels: &[i32]) -> String {
+    levels
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AppSettings {
+    pub trigger_button: String,
+    pub strategy: String,
+    pub fov_degrees: u16,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub smoothing_alpha_x: f32,
+    pub smoothing_alpha_y: f32,
+    pub sens: f64,
+    pub dpi: u32,
+    pub scale: String,
+    pub show_preview: bool,
+    pub crop_resolution: u32,
+    pub port: String,
+    pub pixel_color: String,
+    pub active_model_id: Option<String>,
+    pub model_width: String,
+    pub model_height: String,
+    pub model_confidence: String,
+    pub model_iou: String,
+    pub model_backend: String,
+    pub model_precision: String,
+    pub compute_target: String,
+    #[serde(rename = "recoil", alias = "nativeMotion", alias = "native_motion")]
+    pub recoil: RecoilSettings,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            trigger_button: "right".into(),
+            strategy: "pixel_seek".into(),
+            fov_degrees: 36,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            smoothing_alpha_x: 1.0,
+            smoothing_alpha_y: 1.0,
+            sens: 0.235,
+            dpi: 800,
+            scale: "Smooth".into(),
+            show_preview: true,
+            crop_resolution: 640,
+            port: "4200".into(),
+            pixel_color: "yellow".into(),
+            active_model_id: None,
+            model_width: "640".into(),
+            model_height: "640".into(),
+            model_confidence: "0.5".into(),
+            model_iou: "0.45".into(),
+            model_backend: "onnxruntime".into(),
+            model_precision: "fp16".into(),
+            compute_target: "cpu".into(),
+            recoil: RecoilSettings::default(),
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+            return Err("Choose Right, Middle, M4, or M5 for the trigger button.");
+        }
+        if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
+            return Err("Choose a supported detection engine.");
+        }
+        if !(1..=360).contains(&self.fov_degrees) {
+            return Err("FOV must be from 1 to 360 degrees.");
+        }
+        if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
+            return Err("Target offsets must be finite numbers.");
+        }
+        if ![self.smoothing_alpha_x, self.smoothing_alpha_y]
+            .iter()
+            .all(|value| value.is_finite() && (0.01..=1.0).contains(value))
+        {
+            return Err("Smoothing alpha must be between 0.01 and 1.00.");
+        }
+        if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
+            return Err("Sensitivity must be from 0.01 to 10.");
+        }
+        if !(100..=100_000).contains(&self.dpi) {
+            return Err("DPI must be from 100 to 100000.");
+        }
+        if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
+            return Err("Choose Smooth or Pixel perfect preview scaling.");
+        }
+        let port = self
+            .port
+            .parse::<u16>()
+            .map_err(|_| "UDP port must be from 1 to 65535.")?;
+        if port == 0 || !self.port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("UDP port must be from 1 to 65535.");
+        }
+        if !["yellow", "red", "purple"].contains(&self.pixel_color.as_str()) {
+            return Err("Choose Yellow, Red, or Purple for Pixel Seek.");
+        }
+        if !(1..=8192).contains(&self.crop_resolution) {
+            return Err("Crop resolution must be from 1 to 8192 pixels.");
+        }
+        self.recoil.validate()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_recoil_levels, parse_recoil_levels};
+
+    #[test]
+    fn recoil_levels_parse_and_format_as_signed_integer_lists() {
+        let levels = parse_recoil_levels("1, -2, 3").unwrap();
+        assert_eq!(levels, [1, -2, 3]);
+        assert_eq!(format_recoil_levels(&levels), "1, -2, 3");
+        assert!(parse_recoil_levels("1, nope").is_err());
+        assert!(parse_recoil_levels(&vec!["1"; 65].join(",")).is_err());
+    }
+}
