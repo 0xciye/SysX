@@ -188,8 +188,8 @@ body:has(.config-window) { overflow: auto; }
   --m-wait: #e8b858;
   --m-error: #ef6c6c;
   --m-bar-h: 48px;
-  --m-gap: 12px;
-  --m-mouse-h: 40px;
+  --m-gap: 10px;
+  --m-mouse-h: 30px;
   --m-pad: 20px;
   --m-side: max(240px, min(640px, calc(100vw - 2 * var(--m-pad)), calc(100vh - var(--m-bar-h) - var(--m-gap) - var(--m-mouse-h) - 2 * var(--m-pad))));
   height: 100vh;
@@ -226,14 +226,15 @@ body:has(.config-window) { overflow: auto; }
 .feed-empty strong { display: inline-flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; }
 .feed-empty p { max-width: 340px; margin: 0; color: var(--m-muted); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
 
-.mouse { height: var(--m-mouse-h); display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
-.mouse-key { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--m-border-faint); border-radius: 6px; background: var(--m-bg); color: var(--m-muted); font-size: 12.5px; transition: background-color .12s ease, border-color .12s ease, color .12s ease; }
-/* Shape and color: dash = unknown, ring = released, filled dot = held. */
-.mouse-key i { width: 7px; height: 1.5px; flex: 0 0 auto; background: var(--m-muted); }
-.mouse-key[data-state="up"] { border-color: var(--m-border); background: var(--m-cell); }
-.mouse-key[data-state="up"] i { width: 7px; height: 7px; border: 1.25px solid var(--m-muted); border-radius: 50%; background: none; }
-.mouse-key[data-state="down"] { border-color: rgb(67 207 160 / 75%); background: rgb(67 207 160 / 14%); color: var(--m-text); }
-.mouse-key[data-state="down"] i { width: 7px; height: 7px; border-radius: 50%; background: var(--m-live); }
+/* Mouse State: one segmented strip. Held = green fill + bottom bar (shape, not
+   only color); released = muted label; no device = whole strip dimmed. */
+.mouse { height: var(--m-mouse-h); display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--m-border); border-radius: 7px; background: var(--m-bar); transition: opacity .2s ease; }
+.mouse[data-device="off"] { opacity: .5; }
+.mouse-key { min-width: 0; position: relative; display: grid; place-items: center; overflow: hidden; color: var(--m-muted); font-size: 12px; letter-spacing: .01em; white-space: nowrap; text-overflow: ellipsis; transition: background-color .1s ease, color .1s ease; }
+.mouse-key + .mouse-key { border-left: 1px solid var(--m-border-faint); }
+.mouse-key::after { content: ""; position: absolute; left: 22%; right: 22%; bottom: 0; height: 2px; border-radius: 2px 2px 0 0; background: var(--m-live); transform: scaleX(0); transition: transform .1s ease; }
+.mouse-key[data-state="down"] { background: rgb(67 207 160 / 16%); color: var(--m-text); font-weight: 600; }
+.mouse-key[data-state="down"]::after { transform: scaleX(1); }
 
 @media (max-width: 520px) {
   .monitor { --m-pad: 12px; }

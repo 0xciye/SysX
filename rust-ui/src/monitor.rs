@@ -180,7 +180,7 @@ pub fn MonitorApp() -> impl IntoView {
                             </div>
                         </Show>
                     </div>
-                    <div class="mouse" role="group" aria-label="Physical mouse buttons">
+                    <div class="mouse" role="group" aria-label="Physical mouse buttons" data-device=move || if device.get().state == "connected" { "on" } else { "off" }>
                         {["Left", "Right", "Middle", "M4", "M5"].into_iter().enumerate().map(|(index, label)| {
                             let state = move || {
                                 let device = device.get();
@@ -191,9 +191,7 @@ pub fn MonitorApp() -> impl IntoView {
                                 }
                             };
                             view! {
-                                <span class="mouse-key" data-state=state aria-label=move || format!("{label}: {}", state())>
-                                    <i aria-hidden="true"/>{label}
-                                </span>
+                                <span class="mouse-key" data-state=state aria-label=move || format!("{label}: {}", state())>{label}</span>
                             }
                         }).collect_view()}
                     </div>
