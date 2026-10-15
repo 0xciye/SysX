@@ -93,6 +93,7 @@ impl ReceiverService {
             return Err("IPC token must contain at least 32 characters".into());
         }
         std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+        crate::pixel_seek::warm_profile_luts();
         let settings_path = data_dir.join("app-settings.json");
         let had_settings = settings_path.is_file();
         let mut settings_value = load_settings(&settings_path);

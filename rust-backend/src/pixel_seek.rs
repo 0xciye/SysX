@@ -2,6 +2,7 @@ use crate::crop::CropRect;
 use crate::results::DetectionObject;
 use crate::targeting::{highest_pixel_in_fov, highest_pixel_in_fov_within, FrameCoordinate};
 use image::RgbImage;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelTargetColor {
@@ -81,11 +82,12 @@ pub fn process_pixel_seek(
 ) -> PixelSeekOutput {
     let width = image.width();
     let height = image.height();
-    let mut mask = vec![0u8; (width * height) as usize];
-    for (x, y, pixel) in image.enumerate_pixels() {
-        let (h, s, v) = rgb_to_hsv(pixel.0[0], pixel.0[1], pixel.0[2]);
-        mask[(y * width + x) as usize] = u8::from(in_profile(color, h, s, v));
-    }
+    let lut = profile_lut(color);
+    let mask: Vec<u8> = image
+        .as_raw()
+        .chunks_exact(3)
+        .map(|pixel| lut_hit(lut, pixel[0], pixel[1], pixel[2]))
+        .collect();
     // Exactly one target per frame. While a fresh lock exists, take the
     // topmost FOV pixel near the locked target so two targets in the FOV do
     // not alternate; when the locked target is gone, take the topmost mask
@@ -158,6 +160,42 @@ pub fn process_pixel_seek(
     }
 }
 
+/// One bit per 24-bit RGB color (2 MiB per profile): the HSV test below,
+/// evaluated once for every color, so a frame costs one lookup per pixel
+/// instead of a float HSV conversion. Results are identical by construction.
+static PROFILE_LUTS: [OnceLock<Box<[u64]>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+
+fn profile_lut(color: PixelTargetColor) -> &'static [u64] {
+    PROFILE_LUTS[color as usize].get_or_init(|| {
+        let mut bits = vec![0u64; (1 << 24) / 64].into_boxed_slice();
+        for rgb in 0..1u32 << 24 {
+            let (h, s, v) = rgb_to_hsv((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+            if in_profile(color, h, s, v) {
+                bits[(rgb >> 6) as usize] |= 1 << (rgb & 63);
+            }
+        }
+        bits
+    })
+}
+
+#[inline]
+fn lut_hit(lut: &[u64], r: u8, g: u8, b: u8) -> u8 {
+    let rgb = (r as usize) << 16 | (g as usize) << 8 | b as usize;
+    ((lut[rgb >> 6] >> (rgb & 63)) & 1) as u8
+}
+
+/// Builds all three profile tables off the processing thread so the first
+/// frame after start or a color change does not pay for it.
+pub fn warm_profile_luts() {
+    let _ = std::thread::Builder::new()
+        .name("pixel-seek-lut".into())
+        .spawn(|| {
+            for color in [PixelTargetColor::Yellow, PixelTargetColor::Red, PixelTargetColor::Purple] {
+                profile_lut(color);
+            }
+        });
+}
+
 fn in_profile(color: PixelTargetColor, h: f32, s: f32, v: f32) -> bool {
     match color {
         PixelTargetColor::Red => {
@@ -224,6 +262,24 @@ mod tests {
         assert_eq!(output.objects[0].bbox_xyxy, [13.0, 22.0, 16.0, 25.0]);
         assert_eq!(output.objects[0].confidence, None);
         assert_eq!(output.objects[0].pixel_count, Some(9));
+    }
+
+    #[test]
+    fn lookup_tables_match_the_hsv_profiles_exactly() {
+        for color in [PixelTargetColor::Yellow, PixelTargetColor::Red, PixelTargetColor::Purple] {
+            let lut = profile_lut(color);
+            // A coprime stride walks ~450k colors spread over the whole cube.
+            for rgb in (0..1u32 << 24).step_by(37) {
+                let (r, g, b) = ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+                let (h, s, v) = rgb_to_hsv(r, g, b);
+                assert_eq!(lut_hit(lut, r, g, b), u8::from(in_profile(color, h, s, v)), "{color:?} {r},{g},{b}");
+            }
+        }
+        // Profile edges from the spec.
+        assert_eq!(lut_hit(profile_lut(PixelTargetColor::Red), 255, 0, 0), 1);
+        assert_eq!(lut_hit(profile_lut(PixelTargetColor::Yellow), 255, 255, 0), 1);
+        assert_eq!(lut_hit(profile_lut(PixelTargetColor::Red), 255, 255, 0), 0);
+        assert_eq!(lut_hit(profile_lut(PixelTargetColor::Purple), 0, 0, 0), 0);
     }
 
     fn paint(image: &mut RgbImage, x0: u32, y0: u32, size: u32) {

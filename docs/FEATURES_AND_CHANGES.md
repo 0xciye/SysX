@@ -49,6 +49,7 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 ## 4. Pixel Seek (`rust-backend/src/pixel_seek.rs`, `targeting.rs`)
 
 - **Mask toàn frame** theo ngưỡng HSV cố định trong code: đỏ H 0–10/S 50–255/V 180–255, vàng H 20–40/S 157–255/V 252–255, tím H 140–160/S 60–255/V 240–255 (H thang 0–179). Mỗi lúc chỉ chọn một màu.
+- **Xử lý màu bằng bảng tra (giảm latency):** thay vì đổi RGB→HSV bằng phép chia số thực cho từng pixel, mỗi màu có một bảng 2 MiB (1 bit cho mỗi màu trong 16,7 triệu màu RGB), tính sẵn một lần bằng chính hàm HSV cũ trong luồng nền khi backend khởi động. Mỗi pixel giờ chỉ là 1 phép tra bảng; kết quả giống hệt (test `lookup_tables_match_the_hsv_profiles_exactly`).
 - **Một mục tiêu duy nhất mỗi frame:** pixel cao nhất nằm trong vòng FOV (cùng hàng thì lấy pixel gần tâm ngang nhất). Chỉ vùng màu (blob) chứa pixel đó được flood-fill và báo về, nên Preview chỉ có một box và một đường nối.
 - **Liên tục leo lên pixel cao hơn:** mỗi frame tìm lại; nếu đang nhắm hàng 4 mà hàng 3, 2, 1, 0 xuất hiện thì target chuyển lên tương ứng.
 - **Khoá mục tiêu (chống nhảy qua lại giữa 2 mục tiêu trong FOV):**
@@ -85,6 +86,7 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 - **Preview đủ FPS đầu vào:** backend báo socket ngay khi có frame mới (kênh `watch`, không dùng timer vì timer Windows ~15,6 ms từng giới hạn ~60 FPS), gửi thẳng JPEG gốc không nén lại, chia sẻ frame bằng `Arc`, `state()` không còn khoá chờ luồng UDP; trang giải mã bằng `createImageBitmap` ngoài main thread. Đo với nguồn 240 FPS: trang nhận 230,3 và vẽ 229,7 frame/s (trước đó ~60). Mắt chỉ thấy tối đa bằng tần số quét màn hình.
 - **Giảm lag (2026-10-16):** mỗi frame chỉ giải mã + vẽ đúng 1 lần (trước đó 3 tín hiệu cùng báo nên mỗi frame bị giải mã ~3 lần), tại một thời điểm chỉ có 1 lượt giải mã (frame mới đến thì vẽ frame mới nhất kế tiếp), canvas chỉ cấp phát lại khi đổi kích thước, state 100 ms chỉ cập nhật khi giá trị thay đổi. Đo headless: frame = decode = draw, 0 lần resize canvas/s.
 - **Trang config chỉ để lưu cấu hình:** backend không gửi frame preview cho trang config (chỉ cửa sổ monitor nhận), nên Chrome không còn phải nhận 240 JPEG/s; đã bỏ ô "Actual inference device".
+- **Màu FPS và latency trên HUD** (so với FPS đầu vào, nên sender 60 FPS chạy đủ vẫn xanh): FPS xử lý ≥ 95 % FPS đầu vào = xanh, ≥ 80 % = vàng, thấp hơn = đỏ; latency ≤ nửa thời gian 1 frame (1000/FPS đầu vào) = xanh, ≤ 1 frame = vàng, dài hơn 1 frame = đỏ (không theo kịp). Hàm `fps_tone`/`latency_tone` trong `rust-ui/src/layout.rs` có test.
 - Ảnh kiểm tra: `design-review/receiver-monitor-web-*.png`.
 
 ## 8. Host native và vòng đời (`src-tauri`)

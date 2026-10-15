@@ -220,6 +220,9 @@ body:has(.config-window) { overflow: auto; }
 .feed-hud span { display: inline-flex; align-items: baseline; gap: 4px; }
 .feed-hud b { font: 500 12px "Cascadia Mono", Consolas, ui-monospace, monospace; font-variant-numeric: tabular-nums; color: var(--m-text); }
 .feed-hud i { font-size: 11px; font-style: normal; color: var(--m-muted); }
+.feed-hud [data-level="live"] b { color: var(--m-live); }
+.feed-hud [data-level="wait"] b { color: var(--m-wait); }
+.feed-hud [data-level="error"] b { color: var(--m-error); }
 
 .feed-empty { position: absolute; inset: 0; display: grid; align-content: center; justify-items: center; gap: 10px; padding: 24px; text-align: center; }
 .feed-empty-tag { color: var(--m-muted); font: 11px "Cascadia Mono", Consolas, ui-monospace, monospace; letter-spacing: .08em; }

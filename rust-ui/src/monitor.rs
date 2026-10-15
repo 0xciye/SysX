@@ -1,5 +1,5 @@
 use crate::client::{command_channel, start_backend_client};
-use crate::layout::preview_detections;
+use crate::layout::{fps_tone, latency_tone, preview_detections};
 use crate::preview::{PreviewCanvas, PreviewFrame};
 use crate::protocol::{BackendEvent, BackendState, DeviceStatus};
 use leptos::prelude::*;
@@ -148,6 +148,27 @@ pub fn MonitorApp() -> impl IntoView {
             None => ("—".into(), "—".into(), "—".into()),
         })
     };
+    let fps_level = move || {
+        frame.with(|frame| {
+            frame
+                .as_ref()
+                .and_then(|value| fps_tone(value.frame.processing_fps, value.frame.source_fps))
+                .unwrap_or("none")
+        })
+    };
+    let latency_level = move || {
+        frame.with(|frame| {
+            frame
+                .as_ref()
+                .and_then(|value| {
+                    latency_tone(
+                        value.frame.detection.total_processing_ms,
+                        value.frame.source_fps,
+                    )
+                })
+                .unwrap_or("none")
+        })
+    };
     // Only errors get a detail line under the empty-state headline.
     let empty_detail = move || match status.get() {
         MonitorStatus::RuntimeError | MonitorStatus::ConnectionError => backend_error.get(),
@@ -173,8 +194,8 @@ pub fn MonitorApp() -> impl IntoView {
                         <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov/>
                         <div class="feed-hud" aria-label="Processing resolution, FPS and latency">
                             <span><i>"Res:"</i><b>{move || hud().0}</b></span>
-                            <span><b>{move || hud().1}</b><i>"FPS"</i></span>
-                            <span><b>{move || hud().2}</b><i>"ms"</i></span>
+                            <span data-level=fps_level><b>{move || hud().1}</b><i>"FPS"</i></span>
+                            <span data-level=latency_level><b>{move || hud().2}</b><i>"ms"</i></span>
                         </div>
                         <Show when=move || frame.with(Option::is_none)>
                             <div class="feed-empty" role="status" aria-live="polite">
