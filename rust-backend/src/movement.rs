@@ -276,6 +276,203 @@ pub struct MovementEvent {
     pub recoil: RecoilSettings,
 }
 
+#[derive(Clone, Debug)]
+pub struct MovementRuntimeSettings {
+    pub sens: f64,
+    pub dpi: f64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub trigger_button: String,
+    pub recoil: RecoilSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct MovementTargetSample {
+    pub frame_id: u64,
+    pub target: Option<(f64, f64)>,
+    pub crop_origin: (u32, u32),
+    pub processed_size: (u32, u32),
+}
+
+struct TickerState {
+    latest: Option<(MovementTargetSample, Instant)>,
+    stopping: bool,
+}
+
+/// Recomputes a small relative delta on a fixed cadence from the newest target.
+/// Detection updates this state; movement never waits for the next detection frame.
+pub struct MovementTicker {
+    shared: Arc<(Mutex<TickerState>, Condvar)>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl MovementTicker {
+    pub fn new(
+        initial_sens: f64,
+        initial_dpi: f64,
+        settings: Arc<dyn Fn() -> Option<MovementRuntimeSettings> + Send + Sync>,
+        on_event: Arc<dyn Fn(MovementEvent) + Send + Sync>,
+    ) -> Self {
+        let shared = Arc::new((
+            Mutex::new(TickerState {
+                latest: None,
+                stopping: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("sysx-movement-ticker".into())
+            .spawn(move || {
+                let mut controller = MovementController::new(initial_sens, initial_dpi);
+                let mut calibration = (initial_sens, initial_dpi);
+                let mut sent_invalid = false;
+                loop {
+                    let (sample, updated_at) = {
+                        let (lock, wake) = &*worker_shared;
+                        let Ok(mut state) = lock.lock() else {
+                            return;
+                        };
+                        while !state.stopping && state.latest.is_none() {
+                            let Ok(next) = wake.wait(state) else {
+                                return;
+                            };
+                            state = next;
+                        }
+                        if state.stopping {
+                            return;
+                        }
+                        let latest = state.latest.clone().expect("latest movement target");
+                        (latest.0, latest.1)
+                    };
+
+                    let fresh = updated_at.elapsed() <= Duration::from_millis(100);
+                    if fresh {
+                        let Some(runtime) = settings() else {
+                            controller.reset();
+                            thread::sleep(Duration::from_millis(4));
+                            continue;
+                        };
+                        if sample.target.is_none() {
+                            controller.reset();
+                            if !sent_invalid {
+                                on_event(MovementEvent {
+                                    event: "movement_target".into(),
+                                    frame_id: sample.frame_id,
+                                    target_valid: false,
+                                    dx: 0,
+                                    dy: 0,
+                                    trigger_button: runtime.trigger_button,
+                                    timestamp_ms: unix_ms(),
+                                    recoil: runtime.recoil,
+                                });
+                                sent_invalid = true;
+                            }
+                            thread::sleep(Duration::from_millis(4));
+                            continue;
+                        }
+                        if calibration != (runtime.sens, runtime.dpi) {
+                            let _ = controller.set_calibration(runtime.sens, runtime.dpi);
+                            calibration = (runtime.sens, runtime.dpi);
+                        }
+                        let now = monotonic_seconds();
+                        let (dx, dy) = controller.delta(
+                            sample.target,
+                            sample.crop_origin,
+                            sample.processed_size,
+                            (runtime.offset_x, runtime.offset_y),
+                            now,
+                        );
+                        on_event(MovementEvent {
+                            event: "movement_target".into(),
+                            frame_id: sample.frame_id,
+                            target_valid: sample.target.is_some(),
+                            dx,
+                            dy,
+                            trigger_button: runtime.trigger_button,
+                            timestamp_ms: unix_ms(),
+                            recoil: runtime.recoil,
+                        });
+                        sent_invalid = false;
+                    } else if !sent_invalid {
+                        controller.reset();
+                        if let Some(runtime) = settings() {
+                            on_event(MovementEvent {
+                                event: "movement_target".into(),
+                                frame_id: sample.frame_id,
+                                target_valid: false,
+                                dx: 0,
+                                dy: 0,
+                                trigger_button: runtime.trigger_button,
+                                timestamp_ms: unix_ms(),
+                                recoil: runtime.recoil,
+                            });
+                        }
+                        sent_invalid = true;
+                    }
+
+                    let (lock, wake) = &*worker_shared;
+                    let Ok(state) = lock.lock() else {
+                        return;
+                    };
+                    if state.stopping {
+                        return;
+                    }
+                    let _ = wake.wait_timeout(state, Duration::from_millis(4));
+                }
+            })
+            .expect("movement ticker thread");
+        Self {
+            shared,
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    pub fn update(&self, sample: MovementTargetSample) {
+        let (lock, wake) = &*self.shared;
+        if let Ok(mut state) = lock.lock() {
+            if !state.stopping {
+                state.latest = Some((sample, Instant::now()));
+                wake.notify_one();
+            }
+        }
+    }
+
+    pub fn close(&self, timeout: Duration) -> bool {
+        let (lock, wake) = &*self.shared;
+        if let Ok(mut state) = lock.lock() {
+            state.stopping = true;
+            wake.notify_all();
+        }
+        let Ok(mut slot) = self.worker.lock() else {
+            return false;
+        };
+        let Some(worker) = slot.take() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !worker.is_finished() {
+            return false;
+        }
+        worker.join().is_ok()
+    }
+}
+
+fn monotonic_seconds() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 pub fn merge_movement_events(
     previous: Option<MovementEvent>,
     mut current: MovementEvent,

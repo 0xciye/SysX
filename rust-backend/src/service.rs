@@ -1,7 +1,9 @@
 use crate::config::{
     load_settings, save_settings, AppSettings, ModelDefinition, ModelRegistry, RecoilSettings,
 };
-use crate::movement::{MovementBatcher, MovementController, MovementEvent};
+use crate::movement::{
+    MovementBatcher, MovementRuntimeSettings, MovementTargetSample, MovementTicker,
+};
 use crate::pipeline::{LatestFramePipeline, PipelineConfig, ProcessedFrame};
 use crate::pixel_seek::PixelTargetColor;
 use crate::receiver::UdpDecodedFrameSource;
@@ -45,8 +47,8 @@ pub struct ReceiverService {
     registry: Arc<Mutex<ModelRegistry>>,
     pipeline: Arc<LatestFramePipeline>,
     store: Arc<DetectionDataStore>,
-    movement: Arc<Mutex<MovementController>>,
     movement_batcher: Arc<MovementBatcher>,
+    movement_ticker: Arc<MovementTicker>,
     source: Arc<Mutex<SourceState>>,
     source_times: Arc<Mutex<VecDeque<u64>>>,
     errors: Arc<Mutex<Vec<String>>>,
@@ -124,48 +126,43 @@ impl ReceiverService {
             model_backend: app.model_backend.clone(),
             compute_target: app.compute_target.clone(),
         };
-        let movement = Arc::new(Mutex::new(MovementController::new(
-            app.sens,
-            f64::from(app.dpi),
-        )));
         let movement_batcher = Arc::new(MovementBatcher::new(Arc::new(|event| {
             if let Ok(line) = serde_json::to_string(&event) {
                 println!("{line}");
             }
         })));
-        let callback_settings = Arc::clone(&settings);
-        let callback_movement = Arc::clone(&movement);
-        let callback_batcher = Arc::clone(&movement_batcher);
+        let ticker_settings = Arc::clone(&settings);
+        let ticker_batcher = Arc::clone(&movement_batcher);
+        let movement_ticker = Arc::new(MovementTicker::new(
+            app.sens,
+            f64::from(app.dpi),
+            Arc::new(move || {
+                let settings = ticker_settings.lock().ok()?.clone();
+                Some(MovementRuntimeSettings {
+                    sens: settings.sens,
+                    dpi: f64::from(settings.dpi),
+                    offset_x: settings.offset_x,
+                    offset_y: settings.offset_y,
+                    trigger_button: settings.trigger_button,
+                    recoil: settings.recoil,
+                })
+            }),
+            Arc::new(move |event| ticker_batcher.submit(event)),
+        ));
+        let callback_ticker = Arc::clone(&movement_ticker);
         let callback: Arc<dyn Fn(ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
-            let Ok(config) = callback_settings.lock() else {
-                return;
-            };
             let target = processed
                 .result
                 .smoothed_target_xy
                 .or(processed.result.target_xy);
-            let Ok(mut controller) = callback_movement.lock() else {
-                return;
-            };
-            let (dx, dy) = controller.delta(
-                target.map(|point| (f64::from(point[0]), f64::from(point[1]))),
-                (processed.crop_x, processed.crop_y),
-                (
+            callback_ticker.update(MovementTargetSample {
+                frame_id: processed.frame.frame_id,
+                target: target.map(|point| (f64::from(point[0]), f64::from(point[1]))),
+                crop_origin: (processed.crop_x, processed.crop_y),
+                processed_size: (
                     processed.result.processed_width,
                     processed.result.processed_height,
                 ),
-                (config.offset_x, config.offset_y),
-                monotonic_seconds(),
-            );
-            callback_batcher.submit(MovementEvent {
-                event: "movement_target".into(),
-                frame_id: processed.frame.frame_id,
-                target_valid: target.is_some(),
-                dx,
-                dy,
-                trigger_button: config.trigger_button.clone(),
-                timestamp_ms: unix_ms(),
-                recoil: config.recoil.clone(),
             });
         });
         let pipeline = Arc::new(LatestFramePipeline::new(
@@ -198,8 +195,8 @@ impl ReceiverService {
             registry,
             pipeline,
             store,
-            movement,
             movement_batcher,
+            movement_ticker,
             source: Arc::new(Mutex::new(source_state)),
             source_times: Arc::new(Mutex::new(VecDeque::with_capacity(720))),
             errors: Arc::new(Mutex::new(Vec::new())),
@@ -509,10 +506,6 @@ impl ReceiverService {
                 if !(0.01..=10.0).contains(&sens) || !(100..=100_000).contains(&dpi) {
                     return Err("sens must be 0.01..10 and DPI 100..100000".into());
                 }
-                self.movement
-                    .lock()
-                    .map_err(|_| "movement lock poisoned")?
-                    .set_calibration(sens, dpi as f64)?;
                 let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
                 settings.sens = sens;
                 settings.dpi = dpi as u32;
@@ -731,6 +724,7 @@ impl ReceiverService {
         if !self.pipeline.close(Duration::from_secs(3)) {
             self.record_error("frame pipeline did not stop within three seconds".into());
         }
+        let _ = self.movement_ticker.close(Duration::from_secs(1));
         let _ = self.movement_batcher.close(Duration::from_secs(1));
         let _ = self.store.close(Duration::from_secs(3));
     }
@@ -1046,9 +1040,6 @@ fn monotonic_ns() -> u64 {
         .elapsed()
         .as_nanos()
         .min(u64::MAX as u128) as u64
-}
-fn monotonic_seconds() -> f64 {
-    monotonic_ns() as f64 / 1_000_000_000.0
 }
 fn unix_ms() -> u64 {
     SystemTime::now()
