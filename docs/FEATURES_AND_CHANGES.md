@@ -83,6 +83,8 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
   - Target vẽ kiểu **"Hairline reticle"**: đường 1.25 px mờ dần từ tâm, vòng 8 px có 4 vạch, chấm nhỏ ở giữa, có viền tối để nổi trên nền sáng.
   - Mouse State: một thanh liền 30 px, 5 nút bằng nhau; giữ = nền xanh + chữ đậm + vạch dưới; chưa có thiết bị = mờ.
 - **Preview đủ FPS đầu vào:** backend báo socket ngay khi có frame mới (kênh `watch`, không dùng timer vì timer Windows ~15,6 ms từng giới hạn ~60 FPS), gửi thẳng JPEG gốc không nén lại, chia sẻ frame bằng `Arc`, `state()` không còn khoá chờ luồng UDP; trang giải mã bằng `createImageBitmap` ngoài main thread. Đo với nguồn 240 FPS: trang nhận 230,3 và vẽ 229,7 frame/s (trước đó ~60). Mắt chỉ thấy tối đa bằng tần số quét màn hình.
+- **Giảm lag (2026-10-16):** mỗi frame chỉ giải mã + vẽ đúng 1 lần (trước đó 3 tín hiệu cùng báo nên mỗi frame bị giải mã ~3 lần), tại một thời điểm chỉ có 1 lượt giải mã (frame mới đến thì vẽ frame mới nhất kế tiếp), canvas chỉ cấp phát lại khi đổi kích thước, state 100 ms chỉ cập nhật khi giá trị thay đổi. Đo headless: frame = decode = draw, 0 lần resize canvas/s.
+- **Trang config chỉ để lưu cấu hình:** backend không gửi frame preview cho trang config (chỉ cửa sổ monitor nhận), nên Chrome không còn phải nhận 240 JPEG/s; đã bỏ ô "Actual inference device".
 - Ảnh kiểm tra: `design-review/receiver-monitor-web-*.png`.
 
 ## 8. Host native và vòng đời (`src-tauri`)

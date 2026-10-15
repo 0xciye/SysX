@@ -20,7 +20,6 @@ pub fn ConfigApp() -> impl IntoView {
     let backend_connected = RwSignal::new(false);
     let backend_error = RwSignal::new(String::new());
     let apply_message = RwSignal::new(String::new());
-    let inference_device = RwSignal::new(String::new());
     let port_draft = RwSignal::new("4200".to_string());
     let crop_draft = RwSignal::new("640".to_string());
     let offset_x_draft = RwSignal::new("0".to_string());
@@ -73,9 +72,6 @@ pub fn ConfigApp() -> impl IntoView {
                 }
                 BackendEvent::Models(next, active) => {
                     models.set(next.clone());
-                    if settings.get_untracked().active_model_id != active {
-                        inference_device.set(String::new());
-                    }
                     settings.update(|value| value.active_model_id = active.clone());
                     if let Some(model) = next
                         .iter()
@@ -89,10 +85,8 @@ pub fn ConfigApp() -> impl IntoView {
                         });
                     }
                 }
-                BackendEvent::Frame(next, _, _) => {
-                    backend_connected.set(true);
-                    inference_device.set(next.detection.inference_device.unwrap_or_default());
-                }
+                // The backend sends no frames to the config page.
+                BackendEvent::Frame(..) => {}
                 BackendEvent::CommandResponse {
                     request_id,
                     command_type,
@@ -401,10 +395,7 @@ pub fn ConfigApp() -> impl IntoView {
                                                 }
                                             }/></label>
                                             <label class="field"><span class="field-label">"Backend"</span>
-                                                <select prop:value=move || settings.get().model_backend on:change=move |event| {
-                                                    settings.update(|value| value.model_backend = event_target_value(&event));
-                                                    inference_device.set(String::new());
-                                                }>
+                                                <select prop:value=move || settings.get().model_backend on:change=move |event| settings.update(|value| value.model_backend = event_target_value(&event))>
                                                     <option value="onnxruntime">"ONNX Runtime"</option><option value="tensorrt">"TensorRT"</option><option value="openvino">"OpenVINO"</option>
                                                 </select>
                                             </label>
@@ -414,19 +405,10 @@ pub fn ConfigApp() -> impl IntoView {
                                                 </select>
                                             </label>
                                             <label class="field settings-wide"><span class="field-label">"Compute"</span>
-                                                <select prop:value=move || settings.get().compute_target on:change=move |event| {
-                                                    settings.update(|value| value.compute_target = event_target_value(&event));
-                                                    inference_device.set(String::new());
-                                                }>
+                                                <select prop:value=move || settings.get().compute_target on:change=move |event| settings.update(|value| value.compute_target = event_target_value(&event))>
                                                     <option value="cpu">"CPU"</option><option value="gpu">"GPU"</option><option value="npu">"NPU"</option>
                                                 </select>
                                             </label>
-                                            <div class="field settings-wide">
-                                                <span class="field-label">"Actual inference device"</span>
-                                                <output class="readout model-path runtime-device" aria-live="polite">{move || {
-                                                    if inference_device.get().is_empty() { "Waiting for inference".to_string() } else { inference_device.get() }
-                                                }}</output>
-                                            </div>
                                         </>
                                     </Show>
                                     <Show when=move || active_model().is_some() && settings.get().strategy == "object_detection">

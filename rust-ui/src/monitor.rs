@@ -38,15 +38,20 @@ pub fn MonitorApp() -> impl IntoView {
                         frame.set(None);
                     }
                     BackendEvent::State(state) => {
-                        backend_connected.set(true);
-                        backend_error.set(state.last_error.clone().unwrap_or_default());
-                        fov.set(state.fov_degrees.clamp(1, 360));
-                        scale.set(if state.preview_scale == "Pixel perfect" {
-                            "Pixel perfect".into()
-                        } else {
-                            "Smooth".into()
-                        });
-                        detection_color.set(pixel_color_hex(&state.pixel_color).into());
+                        // State arrives every 100 ms; unchanged values must not
+                        // wake the preview redraw.
+                        set_changed(backend_connected, true);
+                        set_changed(backend_error, state.last_error.clone().unwrap_or_default());
+                        set_changed(fov, state.fov_degrees.clamp(1, 360));
+                        set_changed(
+                            scale,
+                            if state.preview_scale == "Pixel perfect" {
+                                "Pixel perfect".into()
+                            } else {
+                                "Smooth".into()
+                            },
+                        );
+                        set_changed(detection_color, pixel_color_hex(&state.pixel_color).into());
                         // "waiting" = no frame for a second: show the empty
                         // state instead of a frozen image.
                         if state.status == "waiting" {
@@ -75,18 +80,21 @@ pub fn MonitorApp() -> impl IntoView {
                             model_confidence.get_untracked(),
                             |object| object.confidence,
                         );
-                        target.set(
-                            next.detection
+                        // Detections and target ride along with the frame:
+                        // only `frame` notifies, so each frame is drawn once.
+                        target.update_untracked(|value| {
+                            *value = next
+                                .detection
                                 .smoothed_target_xy
-                                .or(next.detection.target_xy),
-                        );
-                        detections.set(visible);
+                                .or(next.detection.target_xy)
+                        });
+                        detections.update_untracked(|value| *value = visible);
                         frame.set(Some(PreviewFrame {
                             frame: next,
                             image,
                             preview_fps,
                         }));
-                        backend_error.set(String::new());
+                        set_changed(backend_error, String::new());
                     }
                     BackendEvent::Error(message) => backend_error.set(message),
                 });
@@ -235,6 +243,12 @@ fn monitor_status(has_error: bool, connected: bool, has_frame: bool) -> MonitorS
         (false, _, true) => MonitorStatus::Receiving,
         (false, true, false) => MonitorStatus::Waiting,
         (false, false, false) => MonitorStatus::Starting,
+    }
+}
+
+fn set_changed<T: PartialEq + Send + Sync + 'static>(signal: RwSignal<T>, value: T) {
+    if signal.with_untracked(|current| *current != value) {
+        signal.set(value);
     }
 }
 

@@ -4,6 +4,7 @@ use crate::layout::{
 };
 use crate::protocol::{DetectionObject, LiveFrame};
 use leptos::prelude::*;
+use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -26,55 +27,38 @@ pub fn PreviewCanvas(
     fov_degrees: RwSignal<u16>,
 ) -> impl IntoView {
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
+    // One decode at a time: frames arriving meanwhile only mark the canvas
+    // dirty, and the loop then draws the newest one. Every frame is drawn
+    // while decoding keeps up; none is decoded just to be thrown away.
+    let busy = Rc::new(Cell::new(false));
+    let dirty = Rc::new(Cell::new(false));
     let draw = Rc::new(move || {
-        let Some(canvas) = canvas_ref.get() else {
+        if busy.replace(true) {
+            dirty.set(true);
             return;
-        };
-        let frame_signal = frame;
-        let frame = frame_signal.get_untracked();
-        let scale = scale.get_untracked() == "Pixel perfect";
-        let detections = detections.get_untracked();
-        let target = target_point.get_untracked();
-        let color = detection_color.get_untracked();
-        let fov = fov_degrees.get_untracked();
-        let Some(current) = frame else {
-            draw_empty(&canvas);
-            return;
-        };
-        let frame_id = current.frame.frame_id;
-        let latest = frame_signal;
-        let blob = current.image.clone();
+        }
+        let busy = Rc::clone(&busy);
+        let dirty = Rc::clone(&dirty);
         spawn_local(async move {
-            // createImageBitmap decodes the JPEG off the main thread, so the
-            // page keeps up with the input frame rate.
-            let Some(promise) = web_sys::window()
-                .and_then(|window| window.create_image_bitmap_with_blob(&blob).ok())
-            else {
-                return;
-            };
-            let Ok(value) = JsFuture::from(promise).await else {
-                return;
-            };
-            let image: ImageBitmap = value.unchecked_into();
-            if latest
-                .get_untracked()
-                .as_ref()
-                .is_none_or(|value| value.frame.frame_id != frame_id)
-            {
-                image.close();
-                return;
+            loop {
+                dirty.set(false);
+                if let Some(canvas) = canvas_ref.get_untracked() {
+                    render(
+                        &canvas,
+                        frame.get_untracked(),
+                        scale.get_untracked() == "Pixel perfect",
+                        &detections.get_untracked(),
+                        target_point.get_untracked(),
+                        &detection_color.get_untracked(),
+                        fov_degrees.get_untracked(),
+                    )
+                    .await;
+                }
+                if !dirty.get() {
+                    break;
+                }
             }
-            draw_image(
-                &canvas,
-                &image,
-                &current.frame,
-                scale,
-                &detections,
-                target,
-                &color,
-                fov,
-            );
-            image.close();
+            busy.set(false);
         });
     });
 
@@ -100,6 +84,42 @@ pub fn PreviewCanvas(
     }
 }
 
+async fn render(
+    canvas: &HtmlCanvasElement,
+    frame: Option<PreviewFrame>,
+    pixel_perfect: bool,
+    detections: &[DetectionObject],
+    target: Option<[f32; 2]>,
+    color: &str,
+    fov: u16,
+) {
+    let Some(current) = frame else {
+        draw_empty(canvas);
+        return;
+    };
+    // createImageBitmap decodes the JPEG off the main thread.
+    let Some(promise) = web_sys::window()
+        .and_then(|window| window.create_image_bitmap_with_blob(&current.image).ok())
+    else {
+        return;
+    };
+    let Ok(value) = JsFuture::from(promise).await else {
+        return;
+    };
+    let image: ImageBitmap = value.unchecked_into();
+    draw_image(
+        canvas,
+        &image,
+        &current.frame,
+        pixel_perfect,
+        detections,
+        target,
+        color,
+        fov,
+    );
+    image.close();
+}
+
 fn context(canvas: &HtmlCanvasElement) -> Option<(CanvasRenderingContext2d, f64, f64, f64)> {
     let bounds = canvas.get_bounding_client_rect();
     let width = bounds.width();
@@ -109,8 +129,12 @@ fn context(canvas: &HtmlCanvasElement) -> Option<(CanvasRenderingContext2d, f64,
         .unwrap_or(1.0)
         .max(1.0);
     let (backing_width, backing_height) = canvas_backing_size(width, height, ratio)?;
-    canvas.set_width(backing_width);
-    canvas.set_height(backing_height);
+    // Assigning width/height reallocates the backing store even when the
+    // size is unchanged, so only do it on resize.
+    if canvas.width() != backing_width || canvas.height() != backing_height {
+        canvas.set_width(backing_width);
+        canvas.set_height(backing_height);
+    }
     let context = canvas
         .get_context("2d")
         .ok()??

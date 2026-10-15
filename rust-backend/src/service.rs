@@ -32,7 +32,6 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 const UDP_RETRY: Duration = Duration::from_secs(3);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-
 struct SourceState {
     active: Option<UdpDecodedFrameSource>,
     active_port: u16,
@@ -1011,7 +1010,9 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
                 attach_request_id(&mut event, request_id);
                 if send_text(&mut socket, event).await.is_err() { break; }
             }
-            changed = preview_rx.changed(), if role != ClientRole::Host => {
+            // Only the monitor shows Preview; the config page just edits and
+            // saves settings, so it gets state but never frames.
+            changed = preview_rx.changed(), if role == ClientRole::Monitor => {
                 if changed.is_err() { break; }
                 if let Some(processed) = service.pipeline.latest() {
                     // A client that connects after the sender stopped must not
