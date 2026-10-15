@@ -10,3 +10,5 @@ src-tauri/binaries/*
 src-tauri/gen/
 # Local OBS SDK/source/runtime used to build and test the plugin (~600 MB)
 work/
+dist-package/
+target*/

@@ -116,9 +116,29 @@ pub fn run() {
         return;
     };
     crate::single_instance::record_config_port(&data_dir, config_port);
-    open_monitor_window(config_port, &data_dir);
-    open_url(&format!("http://127.0.0.1:{config_port}/config.html"));
+    open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
 
+    // Preferred: the receiver as a native SysX window (WebView2). Closing it
+    // quits SysX. Without the WebView2 runtime, fall back to an Edge app window.
+    if wry::webview_version().is_ok() {
+        let (gone_tx, gone_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                if matches!(event, HostEvent::Disconnected) {
+                    break;
+                }
+            }
+            let _ = gone_tx.send(());
+        });
+        if let Err(gone_rx) = crate::monitor_window::run(config_port, &data_dir, gone_rx) {
+            open_monitor_window(config_port, &data_dir);
+            let _ = gone_rx.recv();
+        }
+        crate::single_instance::clear_config_port(&data_dir);
+        drop(runtime);
+        return;
+    }
+    open_monitor_window(config_port, &data_dir);
     let mut lifecycle = MonitorLifecycle::new(Instant::now());
     loop {
         let count = match event_rx.recv_timeout(Duration::from_millis(250)) {
@@ -715,6 +735,25 @@ fn open_monitor_window(port: u16, data_dir: &Path) {
     }
     let _ = data_dir;
     open_url(&url);
+}
+
+/// Web config opens in Google Chrome when it is installed, otherwise in the
+/// default browser.
+fn open_config_page(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let chrome = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(|root| PathBuf::from(root).join(r"Google\Chrome\Application\chrome.exe"))
+            .find(|path| path.is_file());
+        if let Some(chrome) = chrome {
+            if Command::new(chrome).arg(url).spawn().is_ok() {
+                return;
+            }
+        }
+    }
+    open_url(url);
 }
 
 fn open_url(url: &str) {

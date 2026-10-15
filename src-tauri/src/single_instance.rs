@@ -85,12 +85,12 @@ mod win {
         Some(InstanceGuard(handle))
     }
 
-    /// Focuses the Edge app window titled exactly "SysX" (the monitor).
-    /// Browser tabs carry a " - Microsoft Edge" suffix, so they never match.
+    /// Focuses the receiver window titled exactly "SysX" (the native app
+    /// window, or the Edge app-window fallback). Browser tabs carry a
+    /// " - Microsoft Edge" style suffix, so they never match.
     pub fn focus_monitor_window() -> bool {
-        let class = wide("Chrome_WidgetWin_1");
         let title = wide("SysX");
-        let window = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+        let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
         if window.is_null() {
             return false;
         }
