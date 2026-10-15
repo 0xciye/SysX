@@ -931,7 +931,16 @@ async fn websocket_route(
     let role = ClientRole::parse(query.role.as_deref());
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| socket_loop(socket, state.service, role))
+        .on_upgrade(move |socket| async move {
+            socket_loop(socket, state.service, role).await;
+            // The native host keeps one role=host connection for its whole
+            // life. If it closes, the host is gone (even if it was killed and
+            // never ran its cleanup), so exit instead of lingering as an
+            // orphan that keeps the UDP port and blocks the next launch.
+            if role == ClientRole::Host {
+                std::process::exit(0);
+            }
+        })
 }
 
 fn token_matches(expected: &str, supplied: &str) -> bool {

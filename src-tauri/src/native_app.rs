@@ -88,6 +88,16 @@ impl Drop for BackendRuntime {
 }
 
 pub fn run() {
+    let Some(_instance) = crate::single_instance::acquire() else {
+        // Another SysX owns the backend and UDP port: show its monitor, exit.
+        if !crate::single_instance::focus_monitor_window() {
+            let data_dir = app_data_dir();
+            if let Some(config_port) = crate::single_instance::running_config_port(&data_dir) {
+                open_monitor_window(config_port, &data_dir);
+            }
+        }
+        return;
+    };
     let movement_state = Arc::new(crate::movement::MovementState::default());
     let device_state = Arc::new(Mutex::new(DeviceStatus::missing()));
     let (runtime, port, token, data_dir, config_port) =
@@ -105,6 +115,7 @@ pub fn run() {
         eprintln!("SysX local web server did not start; no receiver window can be shown");
         return;
     };
+    crate::single_instance::record_config_port(&data_dir, config_port);
     open_monitor_window(config_port, &data_dir);
     open_url(&format!("http://127.0.0.1:{config_port}/config.html"));
 
@@ -119,6 +130,7 @@ pub fn run() {
             break;
         }
     }
+    crate::single_instance::clear_config_port(&data_dir);
     // Dropping the runtime stops the backend and removes the extracted files.
     drop(runtime);
 }

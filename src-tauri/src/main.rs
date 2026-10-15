@@ -2,6 +2,7 @@
 
 mod movement;
 mod native_app;
+mod single_instance;
 
 fn main() {
     native_app::run();
