@@ -42,6 +42,7 @@ class DetectionResult:
     postprocess_ms: float
     total_processing_ms: float
     inference_device: str | None = None
+    target_xy: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if self.frame_id < 0 or self.timestamp_ns < 0:
@@ -51,6 +52,8 @@ class DetectionResult:
         timings = (self.preprocess_ms, self.detection_ms, self.postprocess_ms, self.total_processing_ms)
         if not all(math.isfinite(value) and value >= 0 for value in timings):
             raise ValueError("processing timings must be finite and non-negative")
+        if self.target_xy is not None and (len(self.target_xy) != 2 or not all(math.isfinite(value) for value in self.target_xy)):
+            raise ValueError("target_xy must contain two finite frame coordinates")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

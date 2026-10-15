@@ -6,6 +6,9 @@ export type BackendState = {
   input: string;
   source: string;
   mode: "pixel_seek" | "object_detection";
+  fov_degrees?: number;
+  preview_scale?: "Smooth" | "Pixel perfect";
+  crop_resolution: number;
   pixel_color: PixelTargetColor;
   pixel_profile_configured: boolean;
   active_model_id: string | null;
@@ -34,6 +37,8 @@ export type LiveFrame = {
   source: string;
   source_width: number;
   source_height: number;
+  crop_x: number;
+  crop_y: number;
   mode: "pixel_seek" | "object_detection";
   model_id: string | null;
   processing_fps: number | null;
@@ -45,11 +50,12 @@ export type LiveFrame = {
     processed_height: number;
     inference_device: string | null;
     objects: DetectionObject[];
+    target_xy: [number, number] | null;
     total_processing_ms: number;
   };
 };
 
-type ConnectionInfo = { host: string; port: number; token: string };
+export type ConnectionInfo = { host: string; port: number; token: string };
 type Callbacks = {
   onFrame: (frame: LiveFrame, src: string, previewFps: number | null) => void;
   onState: (state: BackendState) => void;
@@ -80,7 +86,10 @@ export class ReceiverBackendClient {
   private lastObjectUrl: string | undefined;
   private readonly objectUrls = new Set<string>();
 
-  constructor(private readonly callbacks: Callbacks) {}
+  constructor(
+    private readonly callbacks: Callbacks,
+    private readonly connectionResolver?: () => Promise<ConnectionInfo>,
+  ) {}
 
   async connect() {
     while (!this.disposed) {
@@ -128,6 +137,7 @@ export class ReceiverBackendClient {
   }
 
   private async waitForBackend(): Promise<ConnectionInfo> {
+    if (this.connectionResolver) return this.connectionResolver();
     for (;;) {
       if (this.disposed) throw new Error("Backend client closed");
       try {

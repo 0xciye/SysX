@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "SysX",
-        "width": 1500,
-        "height": 920,
+        "width": 1000,
+        "height": 720,
         "minWidth": 980,
         "minHeight": 680,
         "resizable": true,
@@ -30,6 +30,11 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "../dist/config.html": "web-config/config.html",
+      "../dist/assets": "web-config/assets",
+      "../dist/receiver-mark.svg": "web-config/receiver-mark.svg"
+    },
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "category": "DeveloperTool",
     "shortDescription": "SysX realtime computer vision",

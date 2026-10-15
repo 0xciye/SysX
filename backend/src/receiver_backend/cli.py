@@ -69,11 +69,13 @@ def _serve(args: argparse.Namespace) -> int:
         print("serve requires a 32-character token via --token or RECEIVER_IPC_TOKEN", file=sys.stderr)
         return 2
 
-    def ready(port: int) -> None:
-        print(json.dumps({"event": "ready", "host": "127.0.0.1", "port": port}), flush=True)
+    def ready(port: int, config_port: int | None, config_error: str | None) -> None:
+        print(json.dumps({"event": "ready", "host": "127.0.0.1", "port": port,
+                          "config_port": config_port, "config_error": config_error}), flush=True)
 
     try:
-        asyncio.run(serve(token, args.data_dir, host="127.0.0.1", port=args.port, on_ready=ready))
+        asyncio.run(serve(token, args.data_dir, host="127.0.0.1", port=args.port, on_ready=ready,
+                          web_root=args.config_root, web_port=args.config_port))
     except KeyboardInterrupt:
         return 130
     except Exception as error:
@@ -100,6 +102,8 @@ def main() -> int:
     service.add_argument("--token", help="high-entropy IPC token; RECEIVER_IPC_TOKEN is also accepted")
     service.add_argument("--data-dir", default=str(os.path.expanduser("~/.local/share/Receiver")))
     service.add_argument("--port", type=int, default=0, help="loopback IPC port; 0 selects an available port")
+    service.add_argument("--config-root", help="built local browser configuration page directory")
+    service.add_argument("--config-port", type=int, default=4201, help="local browser configuration port")
     service.set_defaults(run=_serve)
     args = parser.parse_args()
     if getattr(args, "count", 1) < 0:

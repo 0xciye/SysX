@@ -28,7 +28,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .header-device-label { color: var(--dim); font-size: 10px; }
 .mouse-state { display: inline-flex; align-items: center; gap: 4px; padding: 0 2px; }
 .mouse-state-title { margin-right: 3px; color: var(--dim); font-size: 10px; }
-.mouse-state-key { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; border: 1px solid #30383b; border-radius: 4px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.mouse-state-key { width: 64px; min-height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 6px; border: 1px solid #30383b; border-radius: 4px; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .mouse-state-key i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #657074; }
 .mouse-state-key.pressed { border-color: #2d554d; background: #162421; color: #9be4d2; }
 .mouse-state-key.pressed i { background: #67d4b7; box-shadow: 0 0 0 2px rgb(103 212 183 / 12%); }
@@ -164,3 +164,23 @@ h1 { margin: 0; color: #edf1f2; font-size: 21px; font-weight: 500; letter-spacin
   .settings-panel { flex: none; min-height: 320px; max-height: 640px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+.monitor-window { min-height: 0; }
+.monitor-status-group { gap: 10px; }
+.monitor-content { min-height: 0; flex: 1; display: grid; place-items: center; padding: 8px 16px 12px; }
+.monitor-preview { width: min(100%, 640px); height: min(640px, calc(100vh - 100px)); min-height: 280px; }
+.monitor-preview .preview-canvas { min-height: 0; }
+.monitor-hud { min-height: 68px; display: grid; grid-template-columns: .7fr .9fr 1.4fr; align-items: center; gap: 16px; padding: 10px 14px; border-top: 1px solid #242b2e; }
+.monitor-hud span { min-width: 0; display: grid; gap: 5px; }
+.monitor-hud i { color: var(--dim); font-size: 9px; font-style: normal; }
+.monitor-hud b { overflow: hidden; color: var(--text); font: 12px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.config-general { grid-template-columns: minmax(0, 1fr) !important; }
+.config-general .general-settings { width: min(100%, 980px); }
+.model-upload { position: relative; display: inline-flex; align-items: center; cursor: pointer; }
+.model-upload input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+
+@media (max-width: 1120px) {
+  .monitor-content { padding-inline: 12px; }
+  .monitor-status-group { gap: 6px; }
+  .monitor-hud { gap: 10px; padding-inline: 10px; }
+}

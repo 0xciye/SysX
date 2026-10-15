@@ -6,10 +6,11 @@
 
 - Build an installed Windows desktop application, not a browser-hosted website.
 - Keep the English UI dark, minimal, and technically professional.
-- Make Settings the primary workspace, with General and FOV destinations inside the Settings navigation. Preview is an on/off display option on General; turning it off hides the Preview pane while receiver acquisition and processing continue.
-- Cap the Preview viewport at 480 × 480 CSS pixels. Smooth scaling should enlarge small sender frames while preserving aspect ratio; Pixel Perfect should use nearest-neighbor interpolation.
-- Keep a circle-only FOV overlay always enabled; let the user set it from 1–360° on the FOV settings page. Scale its diameter against the shorter side of the displayed image, so the same degree setting has the same proportion at every sender resolution and 360° stays inside the image/preview. Do not add an enable/disable control.
-- Let the Settings column scroll inside the window as additional options are added.
+- Keep the native receiver window focused on Preview, device/connection status, and five-button Mouse State. Launch configuration in a separate browser window at a loopback-only local address when SysX starts; persist settings under app data and restore them on launch.
+- Render the five Mouse State buttons at equal width so Left, Right, Middle, M4, and M5 read as one aligned group.
+- Cap the Preview viewport at 640 × 640 CSS pixels. Smooth scaling should enlarge small sender frames while preserving aspect ratio; Pixel Perfect should use nearest-neighbor interpolation.
+- Keep a circle-only FOV overlay always enabled; let the user set it from 1–360° in the local configuration page. Scale its diameter against the shorter side of the displayed image, so the same degree setting has the same proportion at every sender resolution and 360° stays inside the image/preview. Do not add an enable/disable control.
+- Let the local configuration page scroll as additional options are added. The desktop Preview is always visible and its HUD shows only processing FPS, latency, and processing resolution.
 - Provide one global **Apply Changes** action that persists the current user-editable settings and restores them on the next launch. Backend, Precision, and Compute remain saved UI preferences only until their runtime adapters are implemented.
 - Show “Changes applied successfully.” when Apply Changes succeeds, then hide the confirmation after three seconds.
 - Keep the Preview empty state visible above its canvas when no frame has arrived; label it “NO FRAME” and show the appropriate startup or sender-waiting status.
@@ -19,7 +20,7 @@
 - Receiver waits automatically for frames and begins preview on the first valid frame. Never add Start, Pause, or Stop controls.
 - Show “Waiting for sender” once the authenticated backend connection is ready; reserve “Starting receiver” for backend startup and show connection/runtime failures as errors.
 - Default UDP input port is `4200` across the app, backend, local verifier, and documentation.
-- Sender-provided, already-cropped MJPEG frames are the only production frame source. Do not add local sample, image, or video source controls to the desktop UI.
+- Full-frame MJPEG from the OBS sender is the only production frame source. The receiver applies the configured centered square crop before detection and displays that cropped image in Preview. Do not add local sample, image, or video source controls to the desktop UI.
 - Show model controls (including import) only in Object Detection mode; do not add a Data or export section to the desktop UI.
 - Backend, Precision, and Compute selectors currently exist as UI placeholders only; saved selections do not configure or persist inference. When implementing them, update model registry, runtime validation, UI state, and tests together. Current inference accepts user-supplied Ultralytics `.pt` models only.
 - Present Pixel Seek and Object Detection as radio cards in Detection Engine; keep them side by side at normal widths and stack them when compact so both names remain readable.
@@ -27,14 +28,20 @@
 - Keep the Pixel Seek card free of explanatory copy.
 - Render Pixel Seek detections as bounding boxes tinted to the selected target color; do not show AI class/confidence labels for Pixel Seek.
 - Object Detection always shows Min confidence as a 0–1 slider, including before a model is selected; do not render detections below it in Preview.
+- Object Detection Preview uses stable distinct class colors for boxes and shows a compact `[id] score% | ...` summary; keep the solid center-to-target line and ring.
 - Implement only `pixel_seek` and `object_detection` strategies.
-- Pixel Seek selects exactly one target color at a time: yellow, red, or purple. HSV thresholds are code-defined in `PIXEL_COLOR_PROFILES`; empty profiles must produce no detections, and the UI must not expose editable HSV ranges.
-- Pixel Seek ROI is code-defined per `PixelColorRule` as normalized source-frame coordinates `(left, top, right, bottom)`; `None` means the entire frame. Return boxes in original frame coordinates.
+- Keep Object Detection class-aware when using Ultralytics (`agnostic_nms=False`) and pass the model's configured confidence/IoU values. Do not duplicate Ultralytics raw-row decoding or NMS after it returns decoded boxes.
+- Pixel Seek selects exactly one target color at a time: yellow, red, or purple. HSV thresholds are code-defined in `PIXEL_COLOR_PROFILES` and applied after converting decoded BGR frames to RGB, then RGB to HSV. The code-defined ranges are red H 0–10/S 50–255/V 180–255, yellow H 20–40/S 157–255/V 252–255, and purple H 140–160/S 60–255/V 240–255 (OpenCV H range 0–179). The UI must not expose editable HSV ranges.
+- Crop Resolution is persisted in local web config; `256` means a centered 256 × 256 crop. Reject frames smaller than the configured crop rather than silently clamping or resizing. Pixel Seek ROI is code-defined per `PixelColorRule` as normalized original-frame coordinates `(left, top, right, bottom)`; `None` means the entire frame. Return boxes in original frame coordinates and map them onto cropped Preview using the crop origin.
 
 ## Architecture boundaries
 
 - Keep the Python vision backend independent from the React frontend.
 - Keep frame acquisition, processing, persistence, and rendering decoupled.
+- Keep target selection and mouse output as a post-detection stage. Pixel Seek consumes its mask; Object Detection applies score gates and the reconstructed center-ellipse, nearest-box, prior-box coverage, and class anchor rules. Do not invent unavailable class-group settings or LogicManager behavior.
+- Run detection on the whole processed image independently from FOV. Filter only candidates passed into later targeting logic by the centered FOV circle. Pixel Seek selects the topmost accepted mask pixel inside FOV, while retaining detections outside FOV for Preview.
+- Mouse motion must pass through LogicManager, a fractional residual accumulator, optional axis locks, and an explicit command or method transport. Device monitoring remains read-only until a separately implemented and validated movement path exists.
+- Keep the type-0 async serial queue consumer behind a writer interface; retain command bytes until completion. Do not wire it to a device or treat `request_ms` as an end-to-end deadline until a vendor writer and its completion ownership are implemented and validated. Leave nonzero command kinds outside this reconstruction.
 - Use bounded queues and discard obsolete frames when processing falls behind.
 - Render the latest useful preview at display cadence; do not claim the UI renders at the processing rate.
 - Keep source, inference, and display resolutions distinct. Preview scaling must not alter detection input.
@@ -42,7 +49,7 @@
 - Keep Preview confidence filtering in a pure helper with regression coverage for the threshold boundary, missing confidence, and Pixel Seek bypass.
 - Show source/inference resolutions and measured performance/drop counters in the compact Preview HUD; distinguish source, processing, and preview FPS. Source FPS is valid decoded frames observed by the receiver over a trailing one-second window; processing FPS is completed detections over a trailing one-second window. The processing completion-time deque holds 4096 samples and has a regression test above the requested 360 FPS range; update its capacity and test together if the supported rate rises beyond that window's capacity.
 - Show the device reported by the inference runtime, not only the configured device preference.
-- Keep desktop WebView controls keyboard-visible and provide at least 24 CSS px pointer targets for compact switches.
+- Keep desktop WebView controls keyboard-visible and provide at least 24 CSS px pointer targets for compact switches; configuration controls must remain keyboard accessible.
 - Apply boxes and labels in display coordinates after scaling the source image.
 
 ## Data and safety
@@ -80,7 +87,7 @@
 - Update `README.md`, `AGENTS.md`, and `DEVELOPMENT.md` at each completed project milestone, as requested.
 - Use the approved tokens in `design-system/MASTER.md` for all production UI work.
 - Use `public/receiver-mark.svg` as the canonical SysX mark; keep desktop bundle icons visually aligned with this SVG.
-- Device status in the desktop header checks Medius by its official CH343 VID/PID and version handshake, and Ferrum through a valid `km.version()` reply. The current Ferrum probe uses the documented Legacy API on CP210x at 115200 baud; the App-managed Software API remains the preferred path when its endpoint can be configured. Keep status green only after a valid API reply; missing devices and handshake failures are red. Show Left, Right, Middle, Mouse4, and Mouse5 states from the physical input stream when supported; show unknown until the first event rather than guessing. This telemetry must not inject input. Medius uses the decoded input-event stream; Ferrum bitmap callback support depends on the active endpoint/build and needs hardware verification.
+- Device status in the desktop header checks Medius by its official CH343 VID/PID and version handshake, and Ferrum through a valid `km.version()` reply. Medius uses the official crate's fixed 6,000,000 baud setting; Ferrum Legacy CP210x uses its documented 115,200 baud. Do not substitute Makcu baud values. The App-managed Ferrum Software API remains preferred when its endpoint can be configured. Keep status green only after a valid API reply; missing devices and handshake failures are red. Show Left, Right, Middle, Mouse4, and Mouse5 states from the physical input stream when supported; show unknown until the first event rather than guessing. This telemetry must not inject input. Medius uses the decoded input-event stream; Ferrum bitmap callback support depends on the active endpoint/build and needs hardware verification.
 
 ## Backend notes
 

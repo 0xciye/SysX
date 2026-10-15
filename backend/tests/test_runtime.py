@@ -55,6 +55,42 @@ def test_udp_decode_rejects_non_jpeg_and_truncated_jpeg_frames():
         decode_udp_frame(EncodedFrame(4, 23, 17, 11, jpeg.tobytes()[:-2]))
 
 
+def test_pipeline_crops_center_and_preserves_original_detection_coordinates():
+    from receiver_backend.strategies import PixelColorRule
+
+    rule = PixelColorRule(1, "Target", (((0, 200, 200), (10, 255, 255)),))
+    pipeline = LatestFramePipeline(crop_resolution=32, pixel_rules=(rule,))
+    image = np.zeros((48, 64, 3), dtype=np.uint8)
+    image[20:28, 24:32] = (0, 0, 255)
+    try:
+        pipeline.submit(SourceFrame(7, 10, image, "test"))
+        deadline = time.monotonic() + 2
+        while pipeline.latest is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        latest = pipeline.latest
+        assert latest is not None
+        assert (latest.crop_x, latest.crop_y) == (16, 8)
+        assert latest.frame.image.shape[:2] == (32, 32)
+        assert (latest.result.source_width, latest.result.source_height) == (64, 48)
+        assert (latest.result.processed_width, latest.result.processed_height) == (32, 32)
+        assert latest.result.objects[0].bbox_xyxy == (24.0, 20.0, 32.0, 28.0)
+    finally:
+        assert pipeline.close()
+
+
+def test_pipeline_rejects_crop_larger_than_source_frame():
+    pipeline = LatestFramePipeline(crop_resolution=65)
+    try:
+        pipeline.submit(SourceFrame(1, 1, np.zeros((48, 64, 3), dtype=np.uint8), "test"))
+        deadline = time.monotonic() + 2
+        while pipeline.stats().rejected_frames == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert pipeline.stats().resolution_mismatches == 1
+        assert "crop resolution 65x65 does not fit" in (pipeline.stats().last_error or "")
+    finally:
+        assert pipeline.close()
+
+
 def test_latest_frame_pipeline_processes_and_measures_without_fake_values():
     pipeline = LatestFramePipeline()
     try:
@@ -156,10 +192,10 @@ def test_pipeline_keeps_one_pending_frame_and_discards_obsolete_strategy_result(
     base = pipeline._strategy
 
     class SlowStrategy:
-        def process(self, image, frame_id, timestamp_ns):
+        def process(self, image, frame_id, timestamp_ns, **kwargs):
             entered.set()
             assert release.wait(2)
-            return base.process(image, frame_id, timestamp_ns)
+            return base.process(image, frame_id, timestamp_ns, **kwargs)
 
     pipeline._strategy = SlowStrategy()
     image = np.zeros((8, 8, 3), dtype=np.uint8)

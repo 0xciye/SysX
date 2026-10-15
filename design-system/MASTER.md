@@ -2,7 +2,7 @@
 
 ## Direction
 
-Installed Windows desktop receiver. Dark, minimal, precise, technical. Preview and Settings share one workspace. The image preview is prominent but constrained to 640 × 640 CSS pixels.
+Installed Windows desktop receiver. Dark, minimal, precise, technical. The native monitor window contains Preview and live status; settings open in a separate browser window served from loopback. The image preview is prominent but constrained to 640 × 640 CSS pixels.
 
 The only production preview source is the sender's already-cropped MJPEG frame stream; the desktop UI has no local image, video, or sample source controls.
 
@@ -37,9 +37,10 @@ The only production preview source is the sender's already-cropped MJPEG frame s
 ## Layout and components
 
 - Native desktop window with the operating system title bar.
-- Put Preview and Settings side by side in the single receiver screen.
+- Keep the native monitor window focused on Preview, device and connection state, and mouse buttons.
+- Put configuration controls in a separate local browser page; do not embed them in the native monitor window.
 - Cap the preview image viewport at 640 × 640 CSS pixels.
-- Keep the Settings column independently scrollable as options are added.
+- Keep the local configuration page independently scrollable as options are added.
 - Smooth scaling enlarges low-resolution frames with aspect ratio preserved; Pixel Perfect uses nearest-neighbor scaling.
 - Panels use 1 px borders, 6–8 px corner radii, and no decorative shadows or gradients.
 - Controls use clear selected, disabled, waiting, and error states.
@@ -49,7 +50,7 @@ The only production preview source is the sender's already-cropped MJPEG frame s
 
 - Preserve source aspect ratio; expose Smooth and Pixel Perfect scaling.
 - Render image pixels separately from vector detection overlays.
-- HUD shows measured source/inference/preview values and marks unavailable values as `—`.
+- Monitor HUD shows only measured processing FPS, latency, and processing resolution and marks unavailable values as `—`.
 - Center FOV is an always-visible circle outline with a 1–360° size control and no enable/disable option. Scale its diameter against the shorter side of the displayed image, making the setting resolution-independent; 360° is the largest inscribed circle.
 - Prototype data must be visibly marked as simulated. Production never reuses the prototype telemetry.
 - No Start/Pause/Stop controls. Connection is automatic; first valid frame changes the preview from waiting to active.

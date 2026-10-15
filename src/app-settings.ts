@@ -7,6 +7,7 @@ export type AppSettings = {
   fovDegrees: number;
   scale: PreviewScale;
   showPreview: boolean;
+  cropResolution: number;
   port: string;
   pixelColor: PixelTargetColor;
   activeModelId: string | null;
@@ -24,6 +25,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   fovDegrees: 36,
   scale: "Smooth",
   showPreview: true,
+  cropResolution: 640,
   port: "4200",
   pixelColor: "yellow",
   activeModelId: null,
@@ -50,6 +52,7 @@ export function loadAppSettings(storage: Pick<Storage, "getItem">): AppSettings 
       fovDegrees: Number.isInteger(value.fovDegrees) ? Math.min(360, Math.max(1, value.fovDegrees!)) : DEFAULT_APP_SETTINGS.fovDegrees,
       scale: value.scale === "Pixel perfect" ? "Pixel perfect" : "Smooth",
       showPreview: typeof value.showPreview === "boolean" ? value.showPreview : DEFAULT_APP_SETTINGS.showPreview,
+      cropResolution: Number.isInteger(value.cropResolution) && value.cropResolution! >= 1 && value.cropResolution! <= 8192 ? value.cropResolution! : DEFAULT_APP_SETTINGS.cropResolution,
       port: /^\d{1,5}$/.test(value.port ?? "") && Number(value.port) > 0 && Number(value.port) <= 65535 ? value.port! : DEFAULT_APP_SETTINGS.port,
       pixelColor: value.pixelColor === "red" || value.pixelColor === "purple" ? value.pixelColor : "yellow",
       activeModelId: typeof value.activeModelId === "string" ? value.activeModelId : null,

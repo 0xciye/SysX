@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from receiver_backend.config import ModelDefinition, ModelRegistry
+from receiver_backend.service import PIXEL_COLOR_PROFILES
 from receiver_backend.strategies import ObjectDetectionStrategy, PixelColorRule, PixelSeekStrategy, StrategyFactory, validate_inference_device
 
 
@@ -65,6 +66,57 @@ def test_pixel_seek_returns_box_and_deterministic_pixel_count():
     assert result.inference_device == "cpu"
 
 
+def test_pixel_seek_detects_full_frame_then_selects_topmost_valid_pixel_inside_fov():
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    frame[0:4, 0:4] = (0, 0, 255)       # Detected but outside the FOV.
+    frame[45:49, 50:54] = (0, 0, 255)   # Topmost detected pixels inside the FOV.
+    rule = PixelColorRule(1, "Target", (((0, 200, 200), (10, 255, 255)),))
+
+    result = PixelSeekStrategy((rule,)).process(
+        frame, frame_id=1, source_width=120, source_height=120,
+        crop_x=10, crop_y=10, fov_degrees=180,
+    )
+
+    assert len(result.objects) == 2
+    assert result.target_xy == (60.5, 55.5)
+
+
+def test_pixel_seek_keeps_detection_running_when_no_target_is_inside_fov():
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    frame[0:4, 0:4] = (0, 0, 255)
+    rule = PixelColorRule(1, "Target", (((0, 200, 200), (10, 255, 255)),))
+
+    result = PixelSeekStrategy((rule,)).process(frame, frame_id=1, fov_degrees=180)
+
+    assert len(result.objects) == 1
+    assert result.target_xy is None
+
+
+@pytest.mark.parametrize(
+    "color,bgr",
+    [("red", (0, 0, 255)), ("yellow", (0, 255, 255)), ("purple", (255, 0, 170))],
+)
+def test_pixel_seek_profiles_detect_rgb_colors_from_decoded_bgr_frames(color, bgr):
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    frame[8:24, 10:22] = bgr
+
+    result = PixelSeekStrategy(PIXEL_COLOR_PROFILES[color]).process(frame, frame_id=1)
+
+    assert len(result.objects) == 1
+    assert result.objects[0].class_name == color.capitalize()
+    assert result.objects[0].bbox_xyxy == (10.0, 8.0, 22.0, 24.0)
+
+
+def test_pixel_seek_profiles_use_requested_hsv_bounds():
+    expected = {
+        "red": (((0, 50, 180), (10, 255, 255)),),
+        "yellow": (((20, 157, 252), (40, 255, 255)),),
+        "purple": (((140, 60, 240), (160, 255, 255)),),
+    }
+
+    assert {color: tuple(rule.hsv_ranges[0] for rule in rules) for color, rules in PIXEL_COLOR_PROFILES.items()} == expected
+
+
 def test_pixel_seek_roi_filters_outside_regions_and_keeps_frame_coordinates():
     frame = np.zeros((80, 120, 3), dtype=np.uint8)
     frame[5:15, 5:15] = (0, 0, 255)
@@ -80,6 +132,23 @@ def test_pixel_seek_roi_filters_outside_regions_and_keeps_frame_coordinates():
 
     assert len(result.objects) == 1
     assert result.objects[0].bbox_xyxy == (35.0, 30.0, 45.0, 40.0)
+
+
+def test_pixel_seek_roi_stays_relative_to_original_frame_after_crop():
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    frame[4:12, 4:12] = (0, 0, 255)
+    rule = PixelColorRule(
+        class_id=1,
+        class_name="Target",
+        hsv_ranges=(((0, 200, 200), (10, 255, 255)),),
+        roi=(0.5, 0.25, 0.75, 0.75),
+    )
+
+    result = PixelSeekStrategy((rule,)).process(
+        frame, frame_id=1, source_width=64, source_height=48, crop_x=16, crop_y=8,
+    )
+
+    assert result.objects == ()
 
 
 @pytest.mark.parametrize("roi", [(-0.1, 0, 0.5, 1), (0, 0, 1, 1.1), (0.7, 0, 0.3, 1), (0, 0, 1, float("nan"))])
@@ -132,23 +201,33 @@ def test_object_detection_preserves_model_class_id_and_custom_name(tmp_path):
         names = {0: "unrelated"}
         boxes = Boxes()
 
+    predict_options = {}
+
     class FakeModel:
         predictor = SimpleNamespace(device="cuda:0")
 
         @staticmethod
         def predict(**kwargs):
-            assert kwargs["imgsz"] == (32, 64)
+            predict_options.update(kwargs)
             return [Prediction()]
 
     strategy = ObjectDetectionStrategy(model)
     strategy._model = FakeModel()
-    result = strategy.process(np.zeros((32, 64, 3), dtype=np.uint8), frame_id=9, timestamp_ns=11)
+    result = strategy.process(np.zeros((32, 64, 3), dtype=np.uint8), frame_id=9, timestamp_ns=11,
+                              source_width=100, source_height=80, crop_x=18, crop_y=24)
 
     assert result.objects[0].class_id == 91
     assert result.objects[0].class_name == "User label"
     assert result.objects[0].confidence == pytest.approx(0.875)
+    assert result.objects[0].bbox_xyxy == (19.0, 26.0, 30.0, 42.0)
     assert result.model_id == "custom"
+    assert (result.source_width, result.source_height) == (100, 80)
+    assert (result.processed_width, result.processed_height) == (64, 32)
     assert result.inference_device == "cuda:0"
+    assert predict_options["imgsz"] == (32, 64)
+    assert predict_options["conf"] == model.confidence
+    assert predict_options["iou"] == model.iou
+    assert predict_options["agnostic_nms"] is False
 
 
 def test_object_detection_rejects_udp_resolution_mismatch(tmp_path):
@@ -156,3 +235,24 @@ def test_object_detection_rejects_udp_resolution_mismatch(tmp_path):
     strategy = ObjectDetectionStrategy(model)
     with pytest.raises(ValueError, match="expects 64x32"):
         strategy.process(np.zeros((31, 64, 3), dtype=np.uint8), frame_id=1)
+
+
+def test_object_detection_strategy_publishes_selected_fov_target_with_crop_origin():
+    model = ModelDefinition("m", "Model", "/user/model.pt", 64, 64, confidence=0.5)
+
+    class Boxes:
+        xyxy = np.array([[28, 28, 36, 36]])
+        cls = np.array([2])
+        conf = np.array([0.8])
+
+    class Prediction:
+        names = {2: "target"}
+        boxes = Boxes()
+
+    strategy = ObjectDetectionStrategy(model)
+    strategy._model = SimpleNamespace(predict=lambda **_kwargs: [Prediction()], predictor=SimpleNamespace(device="cpu"))
+    result = strategy.process(np.zeros((64, 64, 3), dtype=np.uint8), frame_id=7,
+                              source_width=100, source_height=90, crop_x=18, crop_y=13, fov_degrees=90)
+
+    assert result.target_xy == pytest.approx((50, 41.4))
+    assert result.objects[0].bbox_xyxy == (46, 41, 54, 49)

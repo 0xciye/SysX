@@ -22,6 +22,7 @@ from .pipeline import LatestFramePipeline
 from .sources import FrameSource, UdpDecodedFrameSource
 from .storage import DetectionDataStore
 from .strategies import PixelColorRule, StrategyName
+from .web_config import ConfigWebServer, load_settings
 
 
 _BINARY_LENGTH = struct.Struct("!I")
@@ -38,12 +39,11 @@ def _next_display_deadline(deadline: float, interval: float, now: float) -> floa
     return next_deadline
 
 
-# Add each color's code-defined HSV ranges here. An empty tuple means that
-# color is intentionally unavailable for detection until its profile is set.
+# OpenCV HSV ranges (H: 0..179, S/V: 0..255), applied after BGR -> RGB -> HSV.
 PIXEL_COLOR_PROFILES: dict[str, tuple[PixelColorRule, ...]] = {
-    "yellow": (),
-    "red": (),
-    "purple": (),
+    "yellow": (PixelColorRule(1, "Yellow", (((20, 157, 252), (40, 255, 255)),)),),
+    "red": (PixelColorRule(2, "Red", (((0, 50, 180), (10, 255, 255)),)),),
+    "purple": (PixelColorRule(3, "Purple", (((140, 60, 240), (160, 255, 255)),)),),
 }
 
 
@@ -56,14 +56,24 @@ class ReceiverService:
         if not 1 <= display_fps <= 120:
             raise ValueError("display FPS must be between 1 and 120")
         self.token = token
+        self.allowed_origins = set(_ALLOWED_ORIGINS)
         self.data_dir = Path(data_dir).expanduser()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = self.data_dir / "app-settings.json"
+        app_settings = load_settings(settings_path)
         self.display_fps = display_fps
         self.registry = ModelRegistry(self.data_dir / "models.yaml")
-        self._pixel_color = "yellow"
-        self._mode = StrategyName.PIXEL_SEEK
+        self._pixel_color = app_settings["pixelColor"]
+        self._mode = StrategyName(app_settings["strategy"])
+        if self._mode is StrategyName.OBJECT_DETECTION and self._active_model() is None:
+            self._mode = StrategyName.PIXEL_SEEK
+        self._fov_degrees = app_settings["fovDegrees"]
+        self._preview_scale = app_settings["scale"]
+        self._crop_resolution = app_settings["cropResolution"]
         self._udp_host = udp_host
-        self._udp_port = udp_port
+        # Honor explicit ports supplied by local callers when there is no saved
+        # application config. The installed app's default remains 4200.
+        self._udp_port = int(app_settings["port"]) if settings_path.is_file() else udp_port
         self._pending_udp_port: int | None = None
         self._pending_udp_error: str | None = None
         self._next_udp_retry_at = 0.0
@@ -78,8 +88,10 @@ class ReceiverService:
         self._reader_thread: threading.Thread | None = None
         session_dir = self.data_dir / "sessions" / self._session_id
         self.store = DetectionDataStore(session_dir, on_error=self._record_error)
-        self.pipeline = LatestFramePipeline(store=self.store, on_error=self._record_error)
-        self._replace_source(UdpDecodedFrameSource(udp_host, udp_port), "udp", f"UDP · {udp_host}:{udp_port}")
+        self.pipeline = LatestFramePipeline(crop_resolution=self._crop_resolution, store=self.store,
+                                            fov_degrees=self._fov_degrees,
+                                            on_error=self._record_error, on_recovered=self._clear_error)
+        self._replace_source(UdpDecodedFrameSource(udp_host, self._udp_port), "udp", f"UDP · {udp_host}:{self._udp_port}")
 
     def _record_error(self, message: str) -> None:
         with self._status_lock:
@@ -127,6 +139,9 @@ class ReceiverService:
             "input": source_kind,
             "source": source_name,
             "mode": self._mode.value,
+            "fov_degrees": self._fov_degrees,
+            "preview_scale": self._preview_scale,
+            "crop_resolution": self._crop_resolution,
             "pixel_color": self._pixel_color,
             "pixel_profile_configured": bool(PIXEL_COLOR_PROFILES[self._pixel_color]),
             "active_model_id": self.registry.active_model_id,
@@ -155,7 +170,8 @@ class ReceiverService:
         if old_source is not None:
             old_source.close()
         model = self._active_model() if self._mode is StrategyName.OBJECT_DETECTION else None
-        self.pipeline.configure(strategy=self._mode, pixel_rules=PIXEL_COLOR_PROFILES[self._pixel_color], model=model)
+        self.pipeline.configure(strategy=self._mode, pixel_rules=PIXEL_COLOR_PROFILES[self._pixel_color], model=model,
+                                crop_resolution=self._crop_resolution, fov_degrees=self._fov_degrees)
         self._source = source
         self._source_kind = kind
         self._source_name = name
@@ -231,7 +247,8 @@ class ReceiverService:
         latest = self.pipeline.latest
         selected = strategy or self._mode
         model = self._active_model() if selected is StrategyName.OBJECT_DETECTION else None
-        self.pipeline.configure(strategy=selected, pixel_rules=PIXEL_COLOR_PROFILES[self._pixel_color], model=model)
+        self.pipeline.configure(strategy=selected, pixel_rules=PIXEL_COLOR_PROFILES[self._pixel_color], model=model,
+                                crop_resolution=self._crop_resolution, fov_degrees=self._fov_degrees)
 
     def _set_mode(self, value: object) -> None:
         mode = StrategyName(str(value))
@@ -281,6 +298,26 @@ class ReceiverService:
                 raise ValueError("pixel color must be yellow, red, or purple")
             self._pixel_color = color
             self._configure_pipeline()
+            return {"event": "ack", "type": kind, "state": self.state()}
+        if kind == "set_display_config":
+            degrees = command.get("fov_degrees", self._fov_degrees)
+            scale = command.get("preview_scale", self._preview_scale)
+            if not isinstance(degrees, int) or isinstance(degrees, bool) or not 1 <= degrees <= 360:
+                raise ValueError("FOV must be an integer from 1 to 360 degrees")
+            if scale not in {"Smooth", "Pixel perfect"}:
+                raise ValueError("preview scale must be Smooth or Pixel perfect")
+            self._fov_degrees = degrees
+            self._preview_scale = scale
+            self._configure_pipeline()
+            return {"event": "ack", "type": kind, "state": self.state()}
+        if kind == "set_crop_resolution":
+            resolution = command.get("resolution")
+            if not isinstance(resolution, int) or isinstance(resolution, bool) or not 1 <= resolution <= 8192:
+                raise ValueError("crop resolution must be an integer from 1 to 8192")
+            self._crop_resolution = resolution
+            self.pipeline.configure(strategy=self._mode, pixel_rules=PIXEL_COLOR_PROFILES[self._pixel_color],
+                                    model=self._active_model() if self._mode is StrategyName.OBJECT_DETECTION else None,
+                                    crop_resolution=resolution, fov_degrees=self._fov_degrees)
             return {"event": "ack", "type": kind, "state": self.state()}
         if kind == "export_csv":
             path = command.get("path")
@@ -346,7 +383,7 @@ class ReceiverService:
         request_path = urlsplit(websocket.request.path)
         query_token = parse_qs(request_path.query).get("token", [""])[0]
         origin = websocket.request.headers.get("Origin")
-        if request_path.path != "/receiver" or origin not in _ALLOWED_ORIGINS or not secrets.compare_digest(query_token, self.token):
+        if request_path.path != "/receiver" or origin not in self.allowed_origins or not secrets.compare_digest(query_token, self.token):
             await websocket.close(code=4401, reason="unauthorized")
             return
         await websocket.send(json.dumps(self.state(), separators=(",", ":")))
@@ -389,8 +426,10 @@ class ReceiverService:
                         "event": "frame",
                         "frame_id": processed.frame.frame_id,
                         "source": processed.frame.source,
-                        "source_width": processed.frame.width,
-                        "source_height": processed.frame.height,
+                        "source_width": processed.result.source_width,
+                        "source_height": processed.result.source_height,
+                        "crop_x": processed.crop_x,
+                        "crop_y": processed.crop_y,
                         "mode": processed.result.mode,
                         "model_id": processed.result.model_id,
                         "processing_fps": stats.processing_fps,
@@ -424,18 +463,34 @@ class ReceiverService:
 
 
 async def serve(token: str, data_dir: str | Path, host: str = "127.0.0.1", port: int = 0,
-                on_ready: Callable[[int], None] | None = None) -> None:
+                on_ready: Callable[[int, int | None, str | None], None] | None = None,
+                web_root: str | Path | None = None, web_port: int = 4201) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("desktop IPC server must bind to loopback only")
     service = ReceiverService(token, data_dir)
+    config_server: ConfigWebServer | None = None
     try:
-        server = await websockets.serve(service.handle, host, port, max_size=64 * 1024, ping_interval=20, ping_timeout=20)
+        config_origins = {f"http://127.0.0.1:{port}" for port in range(web_port, web_port + 10)}
+        server = await websockets.serve(
+            service.handle, host, port, max_size=64 * 1024, ping_interval=20, ping_timeout=20,
+            origins=[*_ALLOWED_ORIGINS, *config_origins],
+        )
         try:
             actual_port = server.sockets[0].getsockname()[1]
+            web_error = None
+            if web_root is not None:
+                try:
+                    config_server = ConfigWebServer(web_root, token, actual_port, data_dir, web_port)
+                    config_server.start()
+                    service.allowed_origins.add(f"http://127.0.0.1:{config_server.port}")
+                except Exception as error:
+                    web_error = f"Local configuration page could not start: {error}"
             if on_ready is not None:
-                on_ready(actual_port)
+                on_ready(actual_port, config_server.port if config_server else None, web_error)
             await server.wait_closed()
         finally:
             server.close()
+            if config_server is not None:
+                config_server.close()
     finally:
         await service.close()

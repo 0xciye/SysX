@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { filterPreviewDetections } from "../src/detection-display.ts";
+import { filterPreviewDetections, formatDetectionSummary } from "../src/detection-display.ts";
 import type { DetectionObject } from "../src/backend-client.ts";
 
 const detections: DetectionObject[] = [
@@ -26,4 +26,8 @@ test("an invalid confidence threshold falls back to zero but still excludes unsc
     filterPreviewDetections(detections, "object_detection", Number.NaN).map(({ class_name }) => class_name),
     ["below", "at threshold", "above"],
   );
+});
+
+test("Object Detection summary shows class IDs and rounded scores separated by vertical bars", () => {
+  assert.equal(formatDetectionSummary(detections), "[0] 49% | [1] 50% | [2] 90%");
 });

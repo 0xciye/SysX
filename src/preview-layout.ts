@@ -8,21 +8,42 @@ export type PreviewImageRect = {
 };
 
 export type DetectionBox = readonly [number, number, number, number];
+export type DetectionPoint = readonly [number, number];
+
+export function mapDetectionPoint(
+  point: DetectionPoint,
+  processedWidth: number,
+  processedHeight: number,
+  imageRect: PreviewImageRect,
+  cropX = 0,
+  cropY = 0,
+): { x: number; y: number } {
+  if (![processedWidth, processedHeight, cropX, cropY, ...point, imageRect.x, imageRect.y, imageRect.width, imageRect.height].every(Number.isFinite) ||
+      processedWidth <= 0 || processedHeight <= 0 || imageRect.width <= 0 || imageRect.height <= 0) {
+    throw new RangeError("Detection and preview dimensions must be finite and positive");
+  }
+  return {
+    x: imageRect.x + (point[0] - cropX) / processedWidth * imageRect.width,
+    y: imageRect.y + (point[1] - cropY) / processedHeight * imageRect.height,
+  };
+}
 
 export function mapDetectionBox(
   box: DetectionBox,
   processedWidth: number,
   processedHeight: number,
   imageRect: PreviewImageRect,
+  cropX = 0,
+  cropY = 0,
 ): PreviewImageRect {
-  if (![processedWidth, processedHeight, ...box, imageRect.x, imageRect.y, imageRect.width, imageRect.height].every(Number.isFinite) ||
+  if (![processedWidth, processedHeight, cropX, cropY, ...box, imageRect.x, imageRect.y, imageRect.width, imageRect.height].every(Number.isFinite) ||
       processedWidth <= 0 || processedHeight <= 0 || imageRect.width <= 0 || imageRect.height <= 0) {
     throw new RangeError("Detection and preview dimensions must be finite and positive");
   }
   const [left, top, right, bottom] = box;
   return {
-    x: imageRect.x + left / processedWidth * imageRect.width,
-    y: imageRect.y + top / processedHeight * imageRect.height,
+    x: imageRect.x + (left - cropX) / processedWidth * imageRect.width,
+    y: imageRect.y + (top - cropY) / processedHeight * imageRect.height,
     width: (right - left) / processedWidth * imageRect.width,
     height: (bottom - top) / processedHeight * imageRect.height,
   };

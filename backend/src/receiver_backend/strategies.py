@@ -4,7 +4,7 @@ import importlib
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -13,6 +13,12 @@ import numpy as np
 
 from .config import ModelDefinition
 from .results import DetectionObject, DetectionResult
+from .targeting import (
+    PriorTarget,
+    highest_pixel_in_fov,
+    object_detection_candidates,
+    object_detection_target,
+)
 
 
 class StrategyName(StrEnum):
@@ -21,7 +27,7 @@ class StrategyName(StrEnum):
 
 
 class FrameResolutionMismatch(ValueError):
-    """An incoming UDP frame does not match the selected model's configured input."""
+    """An incoming frame does not fit the configured crop or model input."""
 
 
 def validate_inference_device(device: str, *, torch_module=None, platform_name: str | None = None) -> None:
@@ -81,24 +87,34 @@ class PixelSeekStrategy:
         self.rules = rules
         self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morphology_size, morphology_size))
 
-    def process(self, frame: np.ndarray, frame_id: int, timestamp_ns: int | None = None) -> DetectionResult:
+    def process(self, frame: np.ndarray, frame_id: int, timestamp_ns: int | None = None, *,
+                source_width: int | None = None, source_height: int | None = None,
+                crop_x: int = 0, crop_y: int = 0, fov_degrees: int = 36) -> DetectionResult:
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.size == 0:
             raise ValueError("frame must be a non-empty BGR image")
         height, width = frame.shape[:2]
+        original_width = width + crop_x if source_width is None else source_width
+        original_height = height + crop_y if source_height is None else source_height
         start = time.perf_counter_ns()
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         preprocess_done = time.perf_counter_ns()
         found: list[DetectionObject] = []
+        target_mask = np.zeros((height, width), dtype=np.uint8)
         for rule in self.rules:
             if not rule.enabled:
                 continue
             if rule.roi is None:
                 left, top, right, bottom = 0, 0, width, height
             else:
-                left = math.floor(rule.roi[0] * width)
-                top = math.floor(rule.roi[1] * height)
-                right = math.ceil(rule.roi[2] * width)
-                bottom = math.ceil(rule.roi[3] * height)
+                roi_left = math.floor(rule.roi[0] * original_width)
+                roi_top = math.floor(rule.roi[1] * original_height)
+                roi_right = math.ceil(rule.roi[2] * original_width)
+                roi_bottom = math.ceil(rule.roi[3] * original_height)
+                left, top = max(roi_left, crop_x) - crop_x, max(roi_top, crop_y) - crop_y
+                right, bottom = min(roi_right, crop_x + width) - crop_x, min(roi_bottom, crop_y + height) - crop_y
+                if right <= left or bottom <= top:
+                    continue
             roi_hsv = hsv[top:bottom, left:right]
             mask = np.zeros(roi_hsv.shape[:2], dtype=np.uint8)
             for lower, upper in rule.hsv_ranges:
@@ -115,14 +131,17 @@ class PixelSeekStrategy:
                 pixel_count = int(cv2.countNonZero(cv2.bitwise_and(mask, component)))
                 if pixel_count < rule.min_pixels:
                     continue
+                target_mask[top:bottom, left:right] |= cv2.bitwise_and(mask, component)
                 x, y, box_width, box_height = cv2.boundingRect(contour)
                 found.append(DetectionObject(
                     class_id=rule.class_id,
                     class_name=rule.class_name or str(rule.class_id),
-                    bbox_xyxy=(float(x + left), float(y + top), float(x + left + box_width), float(y + top + box_height)),
+                    bbox_xyxy=(float(x + left + crop_x), float(y + top + crop_y), float(x + left + box_width + crop_x), float(y + top + box_height + crop_y)),
                     confidence=None,
                     pixel_count=pixel_count,
                 ))
+        pixel_target = highest_pixel_in_fov(target_mask, fov_degrees) if found else None
+        target_xy = None if pixel_target is None else (pixel_target[0] + crop_x, pixel_target[1] + crop_y)
         done = time.perf_counter_ns()
         preprocess_ms = (preprocess_done - start) / 1_000_000
         detection_ms = (done - preprocess_done) / 1_000_000
@@ -131,8 +150,8 @@ class PixelSeekStrategy:
             timestamp_ns=timestamp_ns if timestamp_ns is not None else time.time_ns(),
             mode=StrategyName.PIXEL_SEEK.value,
             model_id=None,
-            source_width=width,
-            source_height=height,
+            source_width=original_width,
+            source_height=original_height,
             processed_width=width,
             processed_height=height,
             objects=tuple(found),
@@ -141,6 +160,7 @@ class PixelSeekStrategy:
             postprocess_ms=0.0,
             total_processing_ms=preprocess_ms + detection_ms,
             inference_device="cpu",
+            target_xy=target_xy,
         )
 
 
@@ -150,6 +170,8 @@ class ObjectDetectionStrategy:
     def __init__(self, definition: ModelDefinition):
         self.definition = definition
         self._model = None
+        self._previous_target: PriorTarget | None = None
+        self._previous_frame_id: int | None = None
         validate_inference_device(definition.device)
 
     def _load(self):
@@ -163,7 +185,9 @@ class ObjectDetectionStrategy:
         self._model = ultralytics.YOLO(str(path))
         return self._model
 
-    def process(self, frame: np.ndarray, frame_id: int, timestamp_ns: int | None = None, allow_resize: bool = False) -> DetectionResult:
+    def process(self, frame: np.ndarray, frame_id: int, timestamp_ns: int | None = None, allow_resize: bool = False, *,
+                source_width: int | None = None, source_height: int | None = None,
+                crop_x: int = 0, crop_y: int = 0, fov_degrees: int = 36) -> DetectionResult:
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.size == 0:
             raise ValueError("frame must be a non-empty BGR image")
         height, width = frame.shape[:2]
@@ -172,7 +196,8 @@ class ObjectDetectionStrategy:
                 f"frame is {width}x{height}; active model expects "
                 f"{self.definition.input_width}x{self.definition.input_height}"
             )
-        source_width, source_height = width, height
+        source_width = width + crop_x if source_width is None else source_width
+        source_height = height + crop_y if source_height is None else source_height
         if allow_resize and (width, height) != (self.definition.input_width, self.definition.input_height):
             frame = cv2.resize(frame, (self.definition.input_width, self.definition.input_height), interpolation=cv2.INTER_AREA)
             height, width = frame.shape[:2]
@@ -184,6 +209,7 @@ class ObjectDetectionStrategy:
             imgsz=(self.definition.input_height, self.definition.input_width),
             conf=self.definition.confidence,
             iou=self.definition.iou,
+            agnostic_nms=False,
             device=device,
             verbose=False,
         )[0]
@@ -200,12 +226,12 @@ class ObjectDetectionStrategy:
                 objects.append(DetectionObject(
                     class_id=class_id,
                     class_name=str(label),
-                    bbox_xyxy=tuple(float(value) for value in xyxy),
+                    bbox_xyxy=(float(xyxy[0] + crop_x), float(xyxy[1] + crop_y), float(xyxy[2] + crop_x), float(xyxy[3] + crop_y)),
                     confidence=float(confidence),
                     pixel_count=None,
                 ))
         done = time.perf_counter_ns()
-        return DetectionResult(
+        result = DetectionResult(
             frame_id=frame_id,
             timestamp_ns=timestamp_ns if timestamp_ns is not None else time.time_ns(),
             mode=StrategyName.OBJECT_DETECTION.value,
@@ -220,6 +246,26 @@ class ObjectDetectionStrategy:
             postprocess_ms=(done - inferred) / 1_000_000,
             total_processing_ms=(done - started) / 1_000_000,
             inference_device=inference_device,
+        )
+        candidates = object_detection_candidates(result, minimum_score=self.definition.confidence)
+        selected = object_detection_target(
+            candidates,
+            frame_width=width,
+            frame_height=height,
+            fov_degrees=fov_degrees,
+            crop_x=crop_x,
+            crop_y=crop_y,
+            previous=self._previous_target,
+            previous_is_fresh=self._previous_frame_id is not None and frame_id == self._previous_frame_id + 1,
+        )
+        done = time.perf_counter_ns()
+        self._previous_target = None if selected is None else PriorTarget(selected.bbox_xyxy, selected.class_id)
+        self._previous_frame_id = frame_id if selected is not None else None
+        return replace(
+            result,
+            postprocess_ms=(done - inferred) / 1_000_000,
+            total_processing_ms=(done - started) / 1_000_000,
+            target_xy=None if selected is None else (selected.coordinate.x, selected.coordinate.y),
         )
 
 

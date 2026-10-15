@@ -4,7 +4,7 @@ This document specifies how a future OBS plugin should send frames to the curren
 
 ## 1. Connection model
 
-The OBS plugin captures the configured region, crops it at the sender, and sends successive JPEG-encoded frames (MJPEG) over UDP to the Receiver computer. Each datagram sequence is one cropped frame using the Receiver's versioned UDP packet format; this is not an HTTP multipart MJPEG endpoint. The plugin does not connect to the desktop UI, Python WebSocket, or Tauri IPC. V1 has no sender/session identifier, so the current Receiver is designed for **one active sender at a time**; simultaneous senders can collide on frame IDs and are not supported.
+The OBS plugin sends successive full-frame JPEG-encoded images (MJPEG) over UDP to the Receiver computer at the configured sender FPS. The Receiver applies its configured centered square crop after decoding and sends that image to the detection engine; Preview displays the crop. Each datagram sequence is one full frame using the Receiver's versioned UDP packet format; this is not an HTTP multipart MJPEG endpoint. The plugin does not connect to the desktop UI, Python WebSocket, or Tauri IPC. V1 has no sender/session identifier, so the current Receiver is designed for **one active sender at a time**; simultaneous senders can collide on frame IDs and are not supported.
 
 | Setting | Value |
 |---|---|
@@ -48,7 +48,7 @@ Python reference layout: `struct.Struct("!4sBBQHHHHQ")`. The current packetizer 
 - Every chunk of one frame must repeat identical `frame_id`, `total_chunks`, dimensions, and timestamp.
 - `total_chunks` must equal `ceil(jpeg_length / 1170)`. The JPEG must be no larger than 64 MiB.
 - A frame must have dimensions from 1 through 8,192 pixels per side, with at most 33,554,432 pixels total.
-- The dimensions in the header must exactly match the dimensions decoded from the JPEG. Do not crop or resize after setting the header.
+- The dimensions in the header must exactly match the full-frame dimensions decoded from the JPEG. Do not crop or resize the sender image after setting the header; Receiver-side cropping is controlled separately in the local web config.
 
 Use a monotonically increasing `frame_id` per sender session and avoid reusing IDs while frames may still be in flight. The current Receiver uses the ID to associate chunks; it does not enforce monotonic ordering between completed frames.
 
@@ -78,8 +78,8 @@ There are no retransmissions or per-frame acknowledgements. Send each frame once
 
 The future plugin should:
 
-1. Capture the OBS output at the exact intended source resolution. Object Detection requires a source size equal to the selected model's configured width and height; UDP frames with a mismatch are rejected. Pixel Seek accepts valid arbitrary resolutions.
-2. Convert the captured output to an 8-bit sRGB image and JPEG-encode it without changing width or height. The Receiver decodes JPEG to OpenCV BGR and converts that image to HSV for Pixel Seek.
+1. Capture the full OBS output without cropping or resizing it for SysX. Each source dimension must be at least the configured Crop Resolution. The receiver takes the centered `N × N` crop before detection and Preview. Object Detection also requires that crop to match the selected model input dimensions; mismatches are rejected, not resized.
+2. Convert the captured output to an 8-bit sRGB image and JPEG-encode it without changing width or height. The Receiver decodes JPEG to BGR, applies its center crop, then converts the crop BGR → RGB → HSV for Pixel Seek.
 3. Assign a frame ID and capture timestamp, split the JPEG into 1,170-byte payloads, write the v1 header in big-endian order, and send all chunks to the Receiver IP and port.
 4. Run capture conversion, compression, and socket sends outside OBS's render callback. Use a bounded queue with latest-frame behavior; discard obsolete unsent frames if encoding or the network falls behind.
 5. Send chunks in order for efficiency, while still tolerating receiver-side reordering. Do not use IP fragmentation or datagrams larger than the 1,200-byte protocol limit.
@@ -89,14 +89,14 @@ Respect the cadence of the source OBS output. The requested 180–360 FPS is a s
 
 ### Pixel Seek color path
 
-Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The Receiver converts decoded sRGB JPEG channel values to HSV using OpenCV (`BGR` input to `HSV`). The code-defined HSV ranges are stored in `PIXEL_COLOR_PROFILES` in `backend/src/receiver_backend/service.py`. All profiles are currently empty; the Receiver intentionally reports no color detections until a real profile is added. A configured `PixelColorRule` may also specify a normalized source-frame ROI `(left, top, right, bottom)`; omitting it means the full frame. Output box coordinates remain relative to the original frame. The OBS plugin does not choose thresholds or ROI and should send the same frame regardless of the selected color.
+Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The Receiver crops the decoded frame, converts BGR to RGB, then RGB to HSV using OpenCV. The code-defined HSV ranges are stored in `PIXEL_COLOR_PROFILES` in `backend/src/receiver_backend/service.py`. HSV thresholds are defined in code and are not configurable in the UI. A configured `PixelColorRule` may also specify a normalized source-frame ROI `(left, top, right, bottom)`; omitting it means the full frame. Output box coordinates remain relative to the original frame. The OBS plugin does not choose thresholds or ROI and should send the same frame regardless of the selected color.
 
 ## 5. Receiver operator workflow
 
-1. Install and launch the Receiver desktop application on the secondary computer.
-2. Confirm the UDP port in **Settings → Input** (default `4200`) and allow that port through the private-network firewall if needed.
+1. Install and launch the SysX desktop application on the secondary computer.
+2. In the local web config, set the UDP port (default `4200`) and Crop Resolution to a square that fits the OBS source; allow that port through the private-network firewall if needed.
 3. Configure the future OBS plugin with the Receiver computer's reachable LAN address and the same UDP port.
-4. Match the OBS output dimensions to the active model dimensions when Object Detection is selected. Pixel Seek has no model-resolution requirement.
+4. For Object Detection, make the Crop Resolution match the active model input (square models are required by the square crop). Pixel Seek has no model-resolution requirement.
 5. Start the stream from OBS. The Receiver automatically changes to its live preview when valid frames arrive. Use its source resolution, processing FPS, preview FPS, processing latency, drop counters, and status to diagnose behavior.
 6. To verify the wire protocol during development, use the local `udp-send-image` / `udp-listen` protocol verifier. Those CLI commands are development verifiers, not the production OBS sender.
 

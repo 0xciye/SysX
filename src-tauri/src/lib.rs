@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{Manager, State};
 
+const FERRUM_LEGACY_BAUD_RATE: u32 = 115_200;
+
 struct BackendState {
     token: String,
     port: Mutex<Option<u16>>,
@@ -133,7 +135,7 @@ fn parse_ferrum_button_mask(bytes: &[u8]) -> Option<u8> {
 fn monitor_ferrum(app: &tauri::AppHandle, port_name: &str) -> bool {
     use std::io::{Read, Write};
 
-    let Ok(mut connection) = serialport::new(port_name, 115200)
+    let Ok(mut connection) = serialport::new(port_name, FERRUM_LEGACY_BAUD_RATE)
         .timeout(Duration::from_millis(150))
         .open()
     else {
@@ -354,6 +356,19 @@ fn backend_executable() -> Result<PathBuf, String> {
     find_sidecar(&executable_dir)
 }
 
+fn open_config_browser(port: u16) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/config.html");
+    #[cfg(target_os = "windows")]
+    let result = Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url.as_str()])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "linux")]
+    let result = Command::new("xdg-open").arg(&url).spawn();
+    result.map(|_| ()).map_err(|error| format!("Could not open SysX local configuration in the browser: {error}"))
+}
+
 fn find_sidecar(directory: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let candidate = directory.join("receiver-backend-x86_64-pc-windows-msvc.exe");
@@ -437,10 +452,22 @@ fn launch_backend(app: &tauri::AppHandle) {
             return;
         }
     };
+    #[cfg(debug_assertions)]
+    let config_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
+    #[cfg(not(debug_assertions))]
+    let config_root = match app.path().resource_dir() {
+        Ok(path) => path.join("web-config"),
+        Err(error) => {
+            set_startup_error(app, format!("Cannot find local config resources: {error}"));
+            return;
+        }
+    };
     let mut backend_command = Command::new(executable);
     backend_command
         .args(["serve", "--port", "0", "--data-dir"])
         .arg(&data_dir)
+        .args(["--config-port", "4201", "--config-root"])
+        .arg(&config_root)
         .env("RECEIVER_IPC_TOKEN", token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -486,6 +513,20 @@ fn launch_backend(app: &tauri::AppHandle) {
                                     if let Some(state) = app_handle.try_state::<BackendState>() {
                                         if let Ok(mut current) = state.port.lock() {
                                             *current = Some(port);
+                                        }
+                                        if let Some(config_port) = value
+                                            .get("config_port")
+                                            .and_then(|value| value.as_u64())
+                                            .and_then(|value| u16::try_from(value).ok())
+                                        {
+                                            if let Err(error) = open_config_browser(config_port) {
+                                                set_startup_error(&app_handle, error);
+                                            }
+                                        } else if let Some(error) = value
+                                            .get("config_error")
+                                            .and_then(|value| value.as_str())
+                                        {
+                                            set_startup_error(&app_handle, error.to_string());
                                         }
                                     }
                                 }

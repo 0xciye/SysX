@@ -106,6 +106,7 @@ def test_changed_udp_port_receives_and_processes_frames(tmp_path):
     service = ReceiverService("i" * 48, tmp_path, udp_host="127.0.0.1", udp_port=original_port)
     new_port = free_udp_port()
     try:
+        service._dispatch({"version": 1, "type": "set_crop_resolution", "resolution": 32})
         result = service._dispatch({"version": 1, "type": "set_udp_port", "port": new_port})
         assert result["state"]["source"].endswith(f":{new_port}")
         wait_for_udp_bind(service)
@@ -123,6 +124,36 @@ def test_changed_udp_port_receives_and_processes_frames(tmp_path):
             time.sleep(0.005)
         assert service.pipeline.latest is not None
         assert service.pipeline.latest.frame.frame_id == 88
+    finally:
+        asyncio.run(service.close())
+
+
+def test_crop_resolution_error_clears_after_valid_crop_is_applied(tmp_path):
+    port = free_udp_port()
+    service = ReceiverService("i" * 48, tmp_path, udp_host="127.0.0.1", udp_port=port)
+    try:
+        wait_for_udp_bind(service)
+        image = np.full((48, 64, 3), 120, dtype=np.uint8)
+        ok, jpeg = cv2.imencode(".jpg", image)
+        assert ok
+        packet = encode_jpeg_frame(1, 64, 48, 1, jpeg.tobytes())[0]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(packet, ("127.0.0.1", port))
+
+        deadline = time.monotonic() + 2
+        while service.state()["last_error"] is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert "crop resolution 640x640 does not fit" in service.state()["last_error"]
+
+        service._dispatch({"version": 1, "type": "set_crop_resolution", "resolution": 32})
+        packet = encode_jpeg_frame(2, 64, 48, 2, jpeg.tobytes())[0]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(packet, ("127.0.0.1", port))
+        deadline = time.monotonic() + 2
+        while service.pipeline.latest is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert service.pipeline.latest is not None
+        assert service.state()["last_error"] is None
     finally:
         asyncio.run(service.close())
 
@@ -149,6 +180,9 @@ def test_authenticated_loopback_service_streams_binary_preview_from_udp(tmp_path
                 await client.send(json.dumps({"version": 1, "type": "set_strategy", "mode": "pixel_seek"}))
                 ack = json.loads(await client.recv())
                 assert ack["event"] == "ack"
+                await client.send(json.dumps({"version": 1, "type": "set_crop_resolution", "resolution": 32}))
+                ack = json.loads(await client.recv())
+                assert ack["state"]["crop_resolution"] == 32
                 await asyncio.to_thread(wait_for_udp_bind, service)
 
                 image = np.full((48, 64, 3), 120, dtype=np.uint8)
@@ -168,7 +202,10 @@ def test_authenticated_loopback_service_streams_binary_preview_from_udp(tmp_path
                 assert metadata["detection"]["source_width"] == 64
                 assert metadata["detection"]["inference_device"] == "cpu"
                 assert "source_fps" in metadata
-                assert preview.shape[:2] == (48, 64)
+                assert metadata["crop_x"] == 16
+                assert metadata["crop_y"] == 8
+                assert metadata["detection"]["processed_width"] == 32
+                assert preview.shape[:2] == (32, 32)
         finally:
             server.close()
             await server.wait_closed()
@@ -199,14 +236,14 @@ def test_pixel_color_selects_only_its_code_profile(tmp_path, monkeypatch):
     monkeypatch.setitem(PIXEL_COLOR_PROFILES, "red", (red_rule,))
     service = ReceiverService("d" * 48, tmp_path, udp_host="127.0.0.1", udp_port=free_udp_port())
     try:
-        assert service.state()["pixel_profile_configured"] is False
+        assert service.state()["pixel_profile_configured"] is True
         response = service._dispatch({"version": 1, "type": "set_pixel_color", "color": "red"})
         assert response["state"]["pixel_color"] == "red"
         assert response["state"]["pixel_profile_configured"] is True
         assert service.pipeline._pixel_rules == (red_rule,)
 
         service._dispatch({"version": 1, "type": "set_pixel_color", "color": "purple"})
-        assert service.pipeline._pixel_rules == ()
+        assert service.pipeline._pixel_rules == PIXEL_COLOR_PROFILES["purple"]
     finally:
         asyncio.run(service.close())
 
@@ -216,6 +253,19 @@ def test_pixel_color_rejects_unknown_values(tmp_path):
     try:
         with pytest.raises(ValueError, match="yellow, red, or purple"):
             service._dispatch({"version": 1, "type": "set_pixel_color", "color": ["red"]})
+    finally:
+        asyncio.run(service.close())
+
+
+def test_display_config_updates_fov_and_preview_scale(tmp_path):
+    service = ReceiverService("f" * 48, tmp_path, udp_host="127.0.0.1", udp_port=free_udp_port())
+    try:
+        response = service._dispatch({"version": 1, "type": "set_display_config", "fov_degrees": 120, "preview_scale": "Pixel perfect"})
+        assert response["state"]["fov_degrees"] == 120
+        assert service.pipeline._fov_degrees == 120
+        assert response["state"]["preview_scale"] == "Pixel perfect"
+        with pytest.raises(ValueError, match="1 to 360"):
+            service._dispatch({"version": 1, "type": "set_display_config", "fov_degrees": 361, "preview_scale": "Smooth"})
     finally:
         asyncio.run(service.close())
 

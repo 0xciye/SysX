@@ -11,3 +11,10 @@ export function filterPreviewDetections(
   const threshold = Number.isFinite(minimumConfidence) ? minimumConfidence : 0;
   return detections.filter((detection) => detection.confidence !== null && detection.confidence >= threshold);
 }
+
+export function formatDetectionSummary(detections: DetectionObject[]): string {
+  return detections
+    .filter((detection) => detection.confidence !== null)
+    .map((detection) => `[${detection.class_id}] ${Math.round((detection.confidence ?? 0) * 100)}%`)
+    .join(" | ");
+}
