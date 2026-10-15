@@ -388,6 +388,11 @@ impl ReceiverService {
         source.active_port = port;
         source.pending_port = None;
         source.last_error = None;
+        // state() may read the snapshot instead of the source; refresh it now
+        // so the reply to this command already reports the new port.
+        if let Ok(mut view) = self.source_view.lock() {
+            *view = SourceView::of(&source);
+        }
         if let Ok(mut settings) = self.settings.lock() {
             settings.port = port.to_string();
         }

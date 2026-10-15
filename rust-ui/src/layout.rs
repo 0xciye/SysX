@@ -163,33 +163,34 @@ pub fn detection_summary(detections: &[crate::protocol::DetectionObject]) -> Str
 }
 
 /// HUD FPS tone: how much of the input rate detection keeps up with.
-/// "live" ≥ 95 %, "wait" ≥ 80 %, "error" below; `None` without measurements.
+/// "live" ≥ 80 %, "wait" ≥ 50 %, "error" below; `None` without measurements.
 pub fn fps_tone(processing_fps: Option<f64>, source_fps: Option<f64>) -> Option<&'static str> {
     let (processing, source) = (processing_fps?, source_fps?);
     if !(source > 0.0) || !processing.is_finite() {
         return None;
     }
     let ratio = processing / source;
-    Some(if ratio >= 0.95 {
+    Some(if ratio >= 0.8 {
         "live"
-    } else if ratio >= 0.8 {
+    } else if ratio >= 0.5 {
         "wait"
     } else {
         "error"
     })
 }
 
-/// HUD latency tone against one input frame interval: "live" within half a
-/// frame, "wait" within one frame, "error" when detection outlasts a frame.
-pub fn latency_tone(latency_ms: f64, source_fps: Option<f64>) -> Option<&'static str> {
-    let source = source_fps?;
-    if !(source > 0.0) || !latency_ms.is_finite() {
+/// Latency above this is flagged "(HIGH)" in the HUD.
+pub const LATENCY_HIGH_MS: f64 = 10.0;
+
+/// HUD latency tone on a fixed 0–10 ms scale, the same at every input rate:
+/// "live" < 4 ms, "wait" < 7 ms, "error" from 7 ms (above 10 ms also HIGH).
+pub fn latency_tone(latency_ms: f64) -> Option<&'static str> {
+    if !latency_ms.is_finite() || latency_ms < 0.0 {
         return None;
     }
-    let budget_ms = 1000.0 / source;
-    Some(if latency_ms <= budget_ms * 0.5 {
+    Some(if latency_ms < 4.0 {
         "live"
-    } else if latency_ms <= budget_ms {
+    } else if latency_ms < 7.0 {
         "wait"
     } else {
         "error"
@@ -204,21 +205,23 @@ mod tests {
     #[test]
     fn hud_tones_follow_the_input_rate() {
         assert_eq!(fps_tone(Some(239.0), Some(240.0)), Some("live"));
-        assert_eq!(fps_tone(Some(228.0), Some(240.0)), Some("live"));
-        assert_eq!(fps_tone(Some(200.0), Some(240.0)), Some("wait"));
-        assert_eq!(fps_tone(Some(100.0), Some(240.0)), Some("error"));
+        assert_eq!(fps_tone(Some(192.0), Some(240.0)), Some("live")); // exactly 80 %
+        assert_eq!(fps_tone(Some(191.0), Some(240.0)), Some("wait"));
+        assert_eq!(fps_tone(Some(120.0), Some(240.0)), Some("wait")); // exactly 50 %
+        assert_eq!(fps_tone(Some(119.0), Some(240.0)), Some("error"));
         // A 60 FPS sender fully kept up with is healthy, not slow.
         assert_eq!(fps_tone(Some(60.0), Some(60.0)), Some("live"));
         assert_eq!(fps_tone(None, Some(240.0)), None);
         assert_eq!(fps_tone(Some(10.0), Some(0.0)), None);
 
-        // 240 FPS: one frame is 4.17 ms.
-        assert_eq!(latency_tone(1.5, Some(240.0)), Some("live"));
-        assert_eq!(latency_tone(3.0, Some(240.0)), Some("wait"));
-        assert_eq!(latency_tone(5.0, Some(240.0)), Some("error"));
-        // The same 5 ms is fine at 60 FPS (16.7 ms per frame).
-        assert_eq!(latency_tone(5.0, Some(60.0)), Some("live"));
-        assert_eq!(latency_tone(1.0, None), None);
+        assert_eq!(latency_tone(0.1), Some("live"));
+        assert_eq!(latency_tone(3.99), Some("live"));
+        assert_eq!(latency_tone(4.0), Some("wait"));
+        assert_eq!(latency_tone(6.99), Some("wait"));
+        assert_eq!(latency_tone(7.0), Some("error"));
+        assert_eq!(latency_tone(25.0), Some("error"));
+        assert!(25.0 > LATENCY_HIGH_MS && 10.0 <= LATENCY_HIGH_MS);
+        assert_eq!(latency_tone(f64::NAN), None);
     }
 
     #[test]

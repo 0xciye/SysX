@@ -223,6 +223,7 @@ body:has(.config-window) { overflow: auto; }
 .feed-hud [data-level="live"] b { color: var(--m-live); }
 .feed-hud [data-level="wait"] b { color: var(--m-wait); }
 .feed-hud [data-level="error"] b { color: var(--m-error); }
+.feed-hud .hud-high { font: 600 10px "Cascadia Mono", Consolas, ui-monospace, monospace; font-style: normal; letter-spacing: .04em; color: var(--m-error); }
 
 .feed-empty { position: absolute; inset: 0; display: grid; align-content: center; justify-items: center; gap: 10px; padding: 24px; text-align: center; }
 .feed-empty-tag { color: var(--m-muted); font: 11px "Cascadia Mono", Consolas, ui-monospace, monospace; letter-spacing: .08em; }
