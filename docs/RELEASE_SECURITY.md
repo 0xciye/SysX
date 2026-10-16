@@ -2,14 +2,13 @@
 
 SysX is a native desktop application, so a determined user who controls the
 machine can always patch, dump, or instrument it. The release hardening below
-raises the cost of casual debugging and keeps source/debug artifacts out of the
-distribution. It is not a replacement for licensing or a server-side trust
+raises the cost of casual debugging and keeps source/PDB artifacts outside the
+portable runtime; matching native PDBs are available in separate archives. It is not a replacement for licensing or a server-side trust
 decision.
 
 ## What the source now does
 
-- Release profiles use fat LTO, one codegen unit, no debug information, stripped
-  symbols, and `panic = "abort"` for the Rust host, backend, and UI.
+- Native release profiles use fat LTO, one codegen unit, full PDB debug information (`debug = 2`, `strip = "none"`), disabled debug assertions and `panic = "abort"`. PDBs are stored separately. The WASM UI still strips its debug metadata. Retaining symbols does not disable the release-only anti-debug guard.
 - The Windows MSVC target enables Rust/LLVM Control Flow Guard through
   `.cargo/config.toml`, and explicitly requests ASLR, high-entropy ASLR, and
   NX/DEP linker flags. These are platform mitigations against invalid indirect
@@ -93,3 +92,7 @@ When authentication is added, keep the authority server-side. The client may
 cache a short-lived entitlement, but must not contain a reusable API secret.
 Authentication should fail closed for the protected product path without
 changing the vision or movement algorithms.
+
+## Crash diagnostics
+
+Native diagnostics are installed before the release guard. Text logs and panic backtraces go to `%LOCALAPPDATA%\SysX\logs`; a best-effort minidump on Rust panic or an unhandled Windows exception goes to `%LOCALAPPDATA%\SysX\crashes`. Backend protocol stdout remains piped to the host; only stderr is redirected to a log file. Settings/logs/dumps/PDBs stay outside immutable runtime verification. No routine frame/target/device callback writes diagnostic files. Dump generation may fail after hard termination or severe corruption; the handler does not replace a full external crash-reporting service. Dumps may contain process stack data and should be handled privately.

@@ -11,10 +11,10 @@ The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <r
 
 ## Configuration
 
-Configuration is compile-time (no ini file). Edit the constants at the top of `sysx_canvas_sender.cpp` and rebuild:
+Configuration is compile-time (no ini file). Set the receiver IP with `scripts/build-obs-plugin.ps1 -ReceiverIp 192.168.88.59` or CMake `-DSYSX_RECEIVER_IP=192.168.88.59`. The manual GitHub DLL workflow provides a receiver-IP field. JPEG/port/crop constants remain in `sysx_canvas_sender.cpp`:
 
 ```cpp
-constexpr char kReceiverHost[] = "192.168.88.59";  // SysX receiver IPv4 address or hostname
+// kReceiverHost comes from the SYSX_RECEIVER_IP CMake build option.
 constexpr uint16_t kReceiverPort = 4200;        // receiver UDP port
 constexpr int kJpegQuality = 80;                // 1-100
 constexpr uint32_t kMaxFps = 0;                 // 0 = every OBS render frame
@@ -66,3 +66,5 @@ cd work/obs-runtime/bin/64bit
 ```
 
 Result on Windows 10 + RTX 4060 (2026-10-15, static-CRT build): plugin loaded and `udp-listen` received 300/300 frames (640×640, frame IDs 1–300) at OBS's 60 FPS render rate; shutdown/unload was clean. HDR check (Rec.2100 PQ canvas, RGBA16F main texture): the plugin loaded, sent nothing, and unloaded cleanly. After logging was removed the silent build was rechecked: no plugin lines in the libobs log, 239 frames in 4 s at 60 FPS, HDR still skipped. Throughput (640×640, 4:4:4, quality 80, loopback, 5 s including startup): 1,171 frames at a 240 FPS render rate (234.2 FPS) and 1,784 frames at 360 FPS (356.8 FPS). The harness takes optional `<fps>` and `hdr` arguments after the seconds. Not yet validated: the OBS Studio app UI itself, real game/scene content at high FPS, and LAN/firewall delivery between two computers.
+
+The DLL build also emits `dist-symbols/obs/sysx-canvas-sender.pdb`; keep it separate from the installed DLL. The manual workflow verifies its GUID/age against the DLL and saves an OBS symbols ZIP in the draft release. OBS crash reports are managed by OBS under `%APPDATA%\obs-studio\crashes` (ordinary OBS logs: `%APPDATA%\obs-studio\logs`).

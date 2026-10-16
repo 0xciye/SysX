@@ -173,6 +173,7 @@ impl VerifiedRuntime {
     pub fn watch_backend(self, owned_child: Arc<Mutex<Child>>) -> io::Result<IntegrityGuard> {
         self.watch(move |error| {
             eprintln!("Runtime integrity check failed: {error}");
+            crate::diagnostics::record(&format!("Runtime integrity check failed: {error}"));
             let mut child = owned_child
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());

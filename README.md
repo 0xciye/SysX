@@ -93,7 +93,7 @@ The Rust sidecar has adapters for ONNX Runtime CPU, OpenVINO, and optional Tenso
 
 The receiver window hosts the web monitor in Wry/WebView2, with an Edge app fallback; `index.html` carries a static `NO FRAME` fallback that is visible until the WASM UI mounts. The settings page remains a separate browser page served only on loopback.
 
-Release hardening is documented in [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md). The normal build produces a portable `SysX.exe` with stripped symbols, LTO, stripped Wasm metadata, Windows CFG/ASLR/NX, loader mitigations, release-only debugger guards, and SHA-256 verification of the extracted backend and UI. Windows read locks and paced background integrity sweeps remain enabled; debug/test enforcement stays disabled. Build and packaging neither run nor require VMProtect. No reusable authentication credential is stored in the client.
+Release hardening is documented in [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md). The normal build produces a portable `SysX.exe` with native PDB debug symbols stored separately, LTO, stripped Wasm metadata, Windows CFG/ASLR/NX, loader mitigations, release-only debugger guards, and SHA-256 verification of the extracted backend and UI. Windows read locks and paced background integrity sweeps remain enabled; debug/test enforcement stays disabled. Build and packaging neither run nor require VMProtect. No reusable authentication credential is stored in the client.
 
 The [continuity report](docs/SECURITY_CONTINUITY_REPORT.md) records a Linux synthetic release A/B test near 240 FPS with and without the file-integrity worker, including CPU/startup cost and the remaining Windows, physical-device and VMProtect limits. It is not a game/hardware benchmark or proof of zero overhead.
 
@@ -103,4 +103,16 @@ The current LAN sender DLL targets `192.168.88.59:4200` and is built separately 
 
 ## Windows portable build validation (2026-10-16)
 
+These results describe the earlier build recorded below. The native PDB/crash-diagnostics changes have not been rebuilt at the user's request; run the manual workflows to validate that output.
+
 [Windows run](https://github.com/0xciye/SysX/actions/runs/38888803711) built the release EXE and passed 89 backend tests (4 ignored simulation reports), 11 UI tests, 39 native-host tests, UDP reassembly on 4200, and application launch/monitor-close/backend-shutdown smoke. The x64 PE has CFG, ASLR/high-entropy ASLR and NX enabled. The separate OBS DLL targets `192.168.88.59:4200`, passed its three-frame loopback/crop-reply check, and imports only Windows system DLLs. [Hashes and validation](docs/validation/windows-portable-2026-10-16.json). VMProtect was not applied. Visible rendering, physical Medius, real OBS graphics and LAN throughput remain unvalidated by these checks.
+
+## Manual builds and crash diagnostics
+
+Open **Actions** and choose **Build SysX EXE (manual)** or **Build OBS DLL (manual, receiver IP)**, then **Run workflow** on `main`. The DLL workflow has a `receiver_ip` field (default `192.168.88.59`, UDP 4200). Neither workflow runs automatically on push/PR. Successful outputs are saved under **Releases → draft release** instead of Actions artifacts.
+
+Native release builds retain full PDB information (`debug = 2`, `strip = "none"`) with LTO and the release security guards still enabled. The EXE workflow creates separate app and symbols ZIPs; the DLL workflow includes a separate OBS PDB ZIP. Keep the matching PDB archive for each exact build. PDBs are not required on a computer that only runs the app. The manual workflow summary reports actual EXE/ZIP sizes; no new size is known until a build runs. WASM UI metadata stripping remains enabled.
+
+SysX writes diagnostic text to `%LOCALAPPDATA%\SysX\logs\` (`host-*.log`, `backend-*.log`, `backend-stderr-*.log`). Rust panic reports include a backtrace; unhandled Windows exceptions include a code/address. Best-effort Windows minidumps are saved in `%LOCALAPPDATA%\SysX\crashes\*.dmp`. Startup errors and integrity/security termination reasons are logged. Logging is confined to startup, shutdown and error/crash paths, not per-frame or per-move loops. Open a dump with WinDbg and the PDBs from that exact build. Forced termination, power loss, severe corruption, or a replaced exception handler may prevent a dump.
+
+OBS owns crashes inside its process: check `%APPDATA%\obs-studio\crashes\` and `%APPDATA%\obs-studio\logs\`, using the OBS PDB archive from the matching DLL build.

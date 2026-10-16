@@ -103,7 +103,7 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 - Do not say a Windows build or hardware throughput target passed unless it was actually run on Windows or the target hardware.
 - Current native builds embed the Rust sidecar and configuration assets; an isolated service smoke processed one 192×192 JPEG on UDP `4202`. This does not validate the native window, Windows, OBS, performance targets, or hardware. App shutdown must stop the backend process and remove its extracted runtime directory.
 - A current native 980 × 680 review confirmed stacked Detection Engine choices and a scrollable Settings panel; the `design-review/` screenshots remain historical and must not be presented as that review.
-- Manual Windows build workflows are available; automatic pushes are restricted to the temporary build branch, not main. Windows validation scripts remain available for manual execution; they verify UDP `4200` and 192×192 frame reassembly, then launch the standalone `SysX.exe`, confirm its embedded backend binds UDP `4200`, and check normal shutdown. They do not verify visual rendering.
+- Both Windows build workflows are manual-only (`workflow_dispatch`); never auto-run a build on push/PR without a new request. Windows validation scripts remain available for manual execution; they verify UDP `4200` and 192×192 frame reassembly, then launch the standalone `SysX.exe`, confirm its embedded backend binds UDP `4200`, and check normal shutdown. They do not verify visual rendering.
 - The app smoke launches `SysX.exe --smoke-test`, suppressing the automatic Config tab so it owns the client lifecycle. Detect the host-owned Wry/WebView2 HWND or dedicated Edge fallback and close only that monitor with WM_CLOSE. Refuse to interfere with an existing monitor or UDP 4200 owner. Parser/C# checks on Linux do not validate the Windows lifecycle.
 - In Windows PowerShell build scripts, check `$LASTEXITCODE` after every native command. `$ErrorActionPreference = "Stop"` alone does not reliably turn native nonzero exit codes into terminating errors.
 - Use `pnpm native:dev` for the native monitor and `pnpm build:desktop` for the portable executable; do not add Tauri CLI dependencies or WebView runtime assumptions.
@@ -115,7 +115,7 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 
 ### Release hardening
 
-- Keep release hardening separate from vision, targeting, movement, and queue logic. The release profiles strip symbols/debug information and use LTO; Windows also enables Control Flow Guard; debug/test builds must remain debuggable.
+- Keep release hardening separate from vision, targeting, movement, and queue logic. The native release profiles retain full PDB debug information (`debug = 2`, `strip = "none"`) at the user's request and use LTO; Windows also enables Control Flow Guard; debug/test builds must remain debuggable.
 - The Windows release-only debugger guard lives in `rust-backend/src/security.rs` and `src-tauri/src/security.rs`. Do not add debugger checks to debug/test builds or alter runtime behavior in those builds.
 - Keep the Windows release packaging fail-fast: `src-tauri/build.rs` must reject a missing backend sidecar or missing Trunk bundle instead of producing a non-runnable host.
 - `src-tauri/build.rs` embeds the backend and UI into one host executable. When VMProtect is used, protect the backend before embedding it, then protect the final `SysX.exe`; protecting only the outer host leaves the extracted backend exposed at runtime. See `docs/RELEASE_SECURITY.md`; no VMProtect preparation script or mandatory protection gate belongs in the normal build.
@@ -142,3 +142,10 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 ### Windows portable validation (2026-10-16)
 
 The Windows runner passed backend 89/4 ignored, UI 11 and host 39 tests, UDP fixture smoke, and app startup/monitor close/backend shutdown. `docs/validation/windows-portable-2026-10-16.json` records build commit and hashes. Keep UDP exclusive binding on Windows and the native-close/config-only grace regressions. This is not visible-rendering, physical Medius, real OBS graphics, LAN-throughput or VMProtect validation.
+
+### Manual diagnostics builds
+
+- Native host/backend release PDBs live in `dist-symbols/host` and `dist-symbols/backend`; OBS DLL PDBs live in `dist-symbols/obs`. Ship separate symbol archives and verify PE/PDB GUID+age with `scripts/check-windows-symbols.py`. Keep PDBs outside the portable runtime and integrity manifest. WASM metadata stripping remains unchanged.
+- Diagnostics are shared in `native-shared/diagnostics.rs`: `%LOCALAPPDATA%\SysX\logs` for text/backtrace/backend stderr and `%LOCALAPPDATA%\SysX\crashes` for best-effort Windows minidumps. Do not add logging/dump generation to hot loops or log IPC tokens/arguments/settings wholesale. OBS keeps its own crash reports under `%APPDATA%\obs-studio\crashes`.
+- The DLL workflow accepts a validated canonical IPv4 build input, mapped to CMake `SYSX_RECEIVER_IP`; runtime INI/config controls remain absent.
+- The user explicitly requested no rebuild for this change. YAML/TOML/PowerShell/Python checks are separate from Windows compilation/runtime validation; the next manual workflow run performs the actual build, tests, symbol checks and smoke checks.
