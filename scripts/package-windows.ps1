@@ -82,7 +82,7 @@ Yeu cau (nguoi dung tu cai):
 Chay SysX:
   - Chay SysX.exe. Cua so receiver/preview mo ra, trang config tu mo
     (bang Chrome neu co, neu khong thi trinh duyet mac dinh).
-  - Dong cua so receiver = thoat SysX. Chi chay duoc 1 SysX cung luc.
+  - Dong ca receiver va cac trang Config de thoat SysX. Chi chay duoc 1 SysX cung luc.
   - Cai dat duoc luu o %LOCALAPPDATA%\SysX.
   - SysX nhan frame tu OBS plugin (sysx-canvas-sender.dll, build rieng) qua UDP 4200.
 
