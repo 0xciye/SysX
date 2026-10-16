@@ -33,8 +33,7 @@ target_compile_features(sysx-canvas-sender PRIVATE cxx_std_17)
 # C4201: nameless unions in libobs headers. C4324/C4611: jmp_buf alignment and
 # setjmp in the libjpeg error path, which holds no C++ objects.
 target_compile_options(sysx-canvas-sender PRIVATE /W4 /EHsc /wd4201 /wd4324 /wd4611)
-target_compile_options(sysx-canvas-sender PRIVATE /Zi)
-target_link_options(sysx-canvas-sender PRIVATE /DEBUG:FULL /OPT:REF /OPT:ICF)
+target_link_options(sysx-canvas-sender PRIVATE /DEBUG:NONE /OPT:REF /OPT:ICF)
 target_compile_definitions(sysx-canvas-sender PRIVATE SYSX_RECEIVER_HOST="${SYSX_RECEIVER_IP}")
 target_include_directories(sysx-canvas-sender PRIVATE ${OBS_INCLUDE_DIR} "${JPEG_INCLUDE_DIR}")
 target_link_libraries(sysx-canvas-sender PRIVATE "${JPEG_LIBRARY}" ws2_32)

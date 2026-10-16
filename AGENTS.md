@@ -145,7 +145,7 @@ The Windows runner passed backend 89/4 ignored, UI 11 and host 39 tests, UDP fix
 
 ### Manual diagnostics builds
 
-- Native host/backend release PDBs live in `dist-symbols/host` and `dist-symbols/backend`; OBS DLL PDBs live in `dist-symbols/obs`. Ship separate symbol archives and verify PE/PDB GUID+age with `scripts/check-windows-symbols.py`. Keep PDBs outside the portable runtime and integrity manifest. WASM metadata stripping remains unchanged.
+- Native host/backend release PDBs live in `dist-symbols/host` and `dist-symbols/backend`; the OBS DLL must not generate or ship a PDB. Ship separate host/backend symbol archives and verify PE/PDB GUID+age with `scripts/check-windows-symbols.py`. Keep PDBs outside the portable runtime and integrity manifest. WASM metadata stripping remains unchanged.
 - Diagnostics are shared in `native-shared/diagnostics.rs`: `%LOCALAPPDATA%\SysX\logs` for text/backtrace/backend stderr and `%LOCALAPPDATA%\SysX\crashes` for best-effort Windows minidumps. Do not add logging/dump generation to hot loops or log IPC tokens/arguments/settings wholesale. OBS keeps its own crash reports under `%APPDATA%\obs-studio\crashes`.
-- The DLL workflow accepts a validated canonical IPv4 build input, mapped to CMake `SYSX_RECEIVER_IP`; runtime INI/config controls remain absent.
+- The DLL workflow accepts a validated canonical IPv4 build input, mapped to CMake `SYSX_RECEIVER_IP`, and uploads only the DLL. Keep the sender limited to image transmission: no PDB, custom diagnostics, log writes or security layer. Runtime INI/config controls remain absent.
 - The user explicitly requested no rebuild for this change. YAML/TOML/PowerShell/Python checks are separate from Windows compilation/runtime validation; the next manual workflow run performs the actual build, tests, symbol checks and smoke checks.

@@ -48,10 +48,5 @@ $outDir = Join-Path $root "dist-package\OBS-plugin"
 New-Item -ItemType Directory -Force $outDir | Out-Null
 Copy-Item $dll (Join-Path $outDir "sysx-canvas-sender.dll") -Force
 Copy-Item $dll (Join-Path $source "sysx-canvas-sender.dll") -Force
-$pdb = Join-Path $build 'sysx-canvas-sender.pdb'
-if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw "OBS PDB missing: $pdb" }
-$symbolDir = Join-Path $root 'dist-symbols\obs'
-New-Item -ItemType Directory -Force $symbolDir | Out-Null
-Copy-Item -LiteralPath $pdb -Destination $symbolDir -Force
 Write-Host "OBS plugin: $(Join-Path $outDir 'sysx-canvas-sender.dll')"
 Write-Host "Install: close OBS, copy it to C:\Program Files\obs-studio\obs-plugins\64bit\, start OBS."
