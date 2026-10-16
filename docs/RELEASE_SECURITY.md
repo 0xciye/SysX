@@ -23,11 +23,24 @@ decision.
   `IsDebuggerPresent`/`CheckRemoteDebuggerPresent` or the native process debug
   port/object/flags checks; a small release-only watchdog checks again every
   two seconds and terminates the process tree if it trips. Debug and test
-  builds do not enable this guard.
-- After extraction, the release host hashes the backend against the exact
-  embedded bytes before launch and rechecks that file about every two seconds;
-  a modified or replaced backend terminates the host. Debug builds skip this
-  integrity check.
+  builds, including release-profile tests, do not enable this guard.
+- The build embeds a SHA-256/length manifest for the final backend and every UI
+  asset (HTML/JS/Wasm/CSS/icons). The release host verifies the extracted files
+  **before** launching the sidecar or opening the UI. The expected hashes come
+  from trusted build inputs, not an editable runtime manifest or a new baseline
+  learned from the extracted files. Missing, patched, resized, linked/reparse
+  or unexpected runtime files fail verification. Settings, calibrations, model
+  imports and session output remain mutable outside the immutable runtime.
+- On Windows the verifier keeps read handles without write/delete sharing,
+  preventing ordinary in-place writes, deletion and replacement while running.
+  A separate worker checks the manifest/layout again after a two-second wait
+  between complete sweeps. Hashing uses 256 KiB chunks with interruptible 2 ms
+  waits, attempts Windows background CPU/I/O priority for that worker only, and
+  takes no frame/target/device locks. Sweep duration depends on file sizes,
+  storage and timer/scheduler granularity; two seconds is not a guaranteed
+  maximum detection delay. A failed sweep kills the owned backend through its
+  process handle; backend disconnect then closes the host and releases runtime
+  files. Debug/test launches do not automatically enable integrity enforcement.
 - The release UI post-process removes the Wasm `name`, `.debug_*`, and source
   map custom sections before embedding the bundle, reducing symbol/source-map
   metadata in the UI artifact. WASM remains a client artifact rather than a
@@ -82,12 +95,21 @@ backend easy to inspect while SysX is running.
    dist-vmprotect\SysX-vmprotected.exe
    ```
 
-For both VMProtect projects, enable anti-debug and anti-dump protections and
-keep import protection enabled. Apply virtualization/mutation selectively to
-the host startup and backend processing/movement functions; leave the normal
-Windows/serial/WebView2 initialization paths unvirtualized if a protection
-option changes runtime behavior. The protected backend must still accept the
-`serve` command used by the host.
+For both VMProtect projects, enable the required anti-tamper/memory-protection
+options and keep import protection compatible with the Windows loader and CFG.
+Apply virtualization/mutation selectively to cold startup/security/licensing
+code. **Exclude frame receive/decode, Pixel Seek/targeting, the movement ticker,
+serial queue, UI event loop and SHA-256 implementation from virtualization**;
+those paths need predictable throughput. Do not add anti-debug queries, file
+hashes or timing probes to per-frame/per-move callbacks. Leave ordinary
+Windows/serial/WebView2 initialization compatible with the vendor runtimes.
+The protected backend must still accept the `serve` command used by the host.
+
+VMProtect is an external packaging step; this repository does not establish
+which options were applied to a final binary. Compare raw and protected output
+at the same frame rate and run the Windows lifecycle/device smoke on that exact
+final executable. CFG, loader policies and VMProtect can affect compatibility;
+Linux tests cannot validate those Windows-specific interactions.
 
 5. Package the protected host without rebuilding the raw executable:
 

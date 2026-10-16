@@ -286,6 +286,8 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 
 140. [x] Fixed all eight source-audit findings: preserve surviving profile snapshots on delete; retain Auto Cooldown across target loss/rearming; report HTTP/network settings-save failures; publish revisioned Auto controls independently of video and reject callbacks from older Auto configurations; enforce latest-frame ordering with sender restart handling; drop/count corrupt JPEG frames without closing UDP; clear recovered source errors from live state; and align the app smoke with native WebView2/Edge HWNDs and Config-aware shutdown. Added regression coverage and headless save/error/recovery probes. See [source audit fixes](docs/SOURCE_AUDIT_FIXES.md) for checks and Windows/device limits.
 
+141. [x] Extended release integrity from the extracted backend to a build-time SHA-256/length manifest for the entire immutable runtime. Verify before backend/UI launch; reject changed/missing/extra/linked files; hold Windows read locks and use paced background sweeps outside frame/movement/device locks. Owned process-handle cleanup replaces PID/program-name termination for backend integrity failures. Debug/test enforcement stays disabled, including release-profile tests. Eight integrity tests, build-manifest fixtures, cross-target Windows checks and headless configuration/recovery with an active guard passed. Optimized Linux A/B trials sustained about 240 FPS with zero reported input/transport drops; this does not validate Windows APIs, hardware or VMProtect. See [the continuity report](docs/SECURITY_CONTINUITY_REPORT.md).
+
 ## Limitations to preserve
 
 - There are no sender binaries, user models, or target-Hardware measurements in the repository.
