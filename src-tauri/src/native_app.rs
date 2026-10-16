@@ -103,11 +103,17 @@ pub fn run() {
                 return;
             }
         };
-    start_device_monitor(
+    if let Err(error) = start_device_monitor(
         Arc::clone(&movement_state),
         Arc::clone(&auto_target),
         Arc::clone(&device_state),
-    );
+    ) {
+        set_device_status_with_reason(
+            &device_state,
+            DeviceStatus::error(),
+            Some(&format!("could not start Medius discovery thread: {error}")),
+        );
+    }
     let (event_tx, event_rx) = mpsc::channel();
     start_host_client(port, token.clone(), Arc::clone(&device_state), event_tx);
     if let Some(config_port) = config_port {
@@ -350,12 +356,23 @@ fn client_counts(text: &str) -> Option<(usize, usize)> {
 }
 
 fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
+    set_device_status_with_reason(state, status, None);
+}
+
+fn set_device_status_with_reason(
+    state: &Arc<Mutex<DeviceStatus>>,
+    status: DeviceStatus,
+    reason: Option<&str>,
+) {
     if let Ok(mut current) = state.lock() {
         if current.state != status.state || current.name != status.name {
             crate::diagnostics::record(&format!(
-                "Medius mouse status: {:?}, name={}",
+                "Medius mouse status: {:?}, name={}{}",
                 status.state,
-                status.name.as_deref().unwrap_or("none")
+                status.name.as_deref().unwrap_or("none"),
+                reason
+                    .map(|reason| format!(", reason={reason}"))
+                    .unwrap_or_default()
             ));
         }
         *current = status;
@@ -370,16 +387,41 @@ fn start_device_monitor(
     movement_state: Arc<crate::movement::MovementState>,
     auto_target: Arc<Mutex<AutoTargetEvent>>,
     device_state: Arc<Mutex<DeviceStatus>>,
-) {
-    let _ = thread::Builder::new()
+) -> Result<(), String> {
+    thread::Builder::new()
         .name("sysx-device-monitor".into())
         .spawn(move || loop {
             if inspect_devices(&movement_state, &auto_target, &device_state) {
                 thread::sleep(Duration::from_millis(250));
             } else {
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_millis(500));
             }
-        });
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn find_medius_ports() -> Result<Vec<medius::PortInfo>, String> {
+    serialport::available_ports()
+        .map(|ports| {
+            ports
+                .into_iter()
+                .filter_map(|port| match port.port_type {
+                    serialport::SerialPortType::UsbPort(usb)
+                        if usb.vid == 0x1A86 && usb.pid == 0x55D3 =>
+                    {
+                        Some(medius::PortInfo {
+                            path: port.port_name,
+                            vid: usb.vid,
+                            pid: usb.pid,
+                            serial: usb.serial_number,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .map_err(|error| format!("serial-port scan failed: {error}"))
 }
 
 fn inspect_devices(
@@ -387,48 +429,64 @@ fn inspect_devices(
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
 ) -> bool {
-    // Discovery must start from the box's control USB identity, not from the
-    // cloned mouse. Immediately after plug-in the control COM port appears
-    // first, while clone information can arrive later.
-    let ports = medius::find_medius();
+    static NO_PORT_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    // Scan errors must remain distinguishable from an empty port list.
+    let ports = match find_medius_ports() {
+        Ok(ports) => ports,
+        Err(error) => {
+            set_device_status_with_reason(device_state, DeviceStatus::error(), Some(&error));
+            return true;
+        }
+    };
     if ports.is_empty() {
+        if !NO_PORT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::diagnostics::record("Medius scan found no CH343 control ports");
+        }
         set_device_status(device_state, DeviceStatus::missing());
         return false;
     }
+    NO_PORT_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let mut failures = Vec::new();
     for port in ports {
-        if let Ok(device) = medius::Device::open(&port.path) {
-            return monitor_medius(movement_state, auto_target, device_state, device);
+        match medius::Device::open(&port.path) {
+            Ok(device) => match monitor_medius(movement_state, auto_target, device_state, device) {
+                Ok(retry_scan) => return retry_scan,
+                Err(error) => failures.push(format!("{}: {error}", port.path)),
+            },
+            Err(error) => failures.push(format!("{}: open failed: {error}", port.path)),
         }
     }
-    set_device_status(device_state, DeviceStatus::error());
+    set_device_status_with_reason(
+        device_state,
+        DeviceStatus::error(),
+        Some(&failures.join("; ")),
+    );
     true
 }
 
 fn injection_ready(health: medius::Health) -> bool {
-    health.link_up && health.mouse_attached
+    health.link_up && health.mouse_attached && health.clone_configured
 }
 
 /// A box may report before its link and physical mouse are ready. Wait briefly
 /// for the conditions SysX needs before subscribing to its input.
-fn wait_for_injection_ready(device: &medius::Device) -> bool {
+fn wait_for_injection_ready(device: &medius::Device) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        match device.query_health() {
-            Ok(health) if injection_ready(health) => return true,
-            Ok(health) if Instant::now() >= deadline => {
-                crate::diagnostics::record(&format!(
-                    "Medius mouse not ready after 3s: link_up={} mouse_attached={} clone_configured={}",
+        let result = device.query_health();
+        if result.as_ref().is_ok_and(|health| injection_ready(*health)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(match result {
+                Ok(health) => format!(
+                    "mouse not ready after 3s (link_up={}, mouse_attached={}, clone_configured={})",
                     health.link_up, health.mouse_attached, health.clone_configured
-                ));
-                return false;
-            }
-            Err(error) if Instant::now() >= deadline => {
-                crate::diagnostics::record(&format!(
-                    "Medius mouse health check failed after 3s: {error}"
-                ));
-                return false;
-            }
-            _ => {}
+                ),
+                Err(error) => format!("health query failed for 3s ({error})"),
+            });
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -439,17 +497,13 @@ fn monitor_medius(
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
     device: medius::Device,
-) -> bool {
+) -> Result<bool, String> {
     use medius::{Button, CatchFilter, Class, Input};
 
-    let Ok(version) = device.query_version() else {
-        set_device_status(device_state, DeviceStatus::error());
-        return true;
-    };
-    if !wait_for_injection_ready(&device) {
-        set_device_status(device_state, DeviceStatus::error());
-        return true;
-    };
+    let version = device
+        .query_version()
+        .map_err(|error| format!("version query failed: {error}"))?;
+    wait_for_injection_ready(&device)?;
     let filters = [
         Button::LEFT,
         Button::RIGHT,
@@ -459,9 +513,9 @@ fn monitor_medius(
     ]
     .into_iter()
     .map(CatchFilter::watch);
-    let Ok(events) = device.input_events(filters) else {
-        return false;
-    };
+    let events = device
+        .input_events(filters)
+        .map_err(|error| format!("mouse input subscription failed: {error}"))?;
     let name = if version.name.trim().is_empty() {
         "Medius".to_string()
     } else {
@@ -479,14 +533,13 @@ fn monitor_medius(
     // Moves run on the queue's writer thread through a clone of the device handle
     // (the crate shares one link), so a slow move never delays button events.
     let move_device = device.clone();
-    let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
+    let writer = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
         crate::medius_device::dispatch(&move_device, bytes)
-    }) else {
-        return false;
-    };
+    })
+    .map_err(|error| format!("mouse output worker failed: {error}"))?;
     let mut serial = crate::serial_queue::SerialCommandQueue::new(writer);
     let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
-    let mut movement_error = false;
+    let mut movement_error = None;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
     let mut auto_state = crate::auto::AutoState::new();
     let mut next_health_check = Instant::now() + Duration::from_millis(250);
@@ -518,16 +571,13 @@ fn monitor_medius(
             next_health_check = Instant::now() + Duration::from_millis(250);
             let health = device.query_health();
             if !health.as_ref().is_ok_and(|health| injection_ready(*health)) {
-                match health {
-                    Ok(health) => crate::diagnostics::record(&format!(
-                        "Medius mouse disconnected: link_up={} mouse_attached={} clone_configured={}",
+                movement_error = Some(match health {
+                    Ok(health) => format!(
+                        "mouse health lost (link_up={}, mouse_attached={}, clone_configured={})",
                         health.link_up, health.mouse_attached, health.clone_configured
-                    )),
-                    Err(error) => crate::diagnostics::record(&format!(
-                        "Medius mouse health check failed: {error}"
-                    )),
-                }
-                movement_error = true;
+                    ),
+                    Err(error) => format!("mouse health query failed: {error}"),
+                });
                 break;
             }
         }
@@ -536,8 +586,12 @@ fn monitor_medius(
             match completion.try_recv() {
                 Ok(Ok(())) => move_completion = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    movement_error = true;
+                Ok(Err(error)) => {
+                    movement_error = Some(format!("mouse output failed: {error}"));
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    movement_error = Some("mouse output worker disconnected".into());
                     break;
                 }
             }
@@ -566,8 +620,8 @@ fn monitor_medius(
                     serial.pump();
                     continue;
                 }
-                Err(_) => {
-                    movement_error = true;
+                Err(error) => {
+                    movement_error = Some(format!("left click queue failed: {error}"));
                     break;
                 }
             }
@@ -595,8 +649,8 @@ fn monitor_medius(
                             move_completion = Some(completion);
                             serial.pump();
                         }
-                        Err(_) => {
-                            movement_error = true;
+                        Err(error) => {
+                            movement_error = Some(format!("mouse movement queue failed: {error}"));
                             break;
                         }
                     }
@@ -604,15 +658,12 @@ fn monitor_medius(
             }
         }
     }
-    set_device_status(
-        device_state,
-        if movement_error {
-            DeviceStatus::error()
-        } else {
-            DeviceStatus::missing()
-        },
-    );
-    true
+    if let Some(error) = movement_error {
+        set_device_status_with_reason(device_state, DeviceStatus::error(), Some(&error));
+    } else {
+        set_device_status(device_state, DeviceStatus::missing());
+    }
+    Ok(true)
 }
 
 fn prepare_runtime(
@@ -758,16 +809,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn medius_health_requires_a_live_link_and_attached_mouse() {
+    fn medius_health_requires_link_mouse_and_clone_configuration() {
         assert!(!injection_ready(medius::Health::from_flags(0)));
         assert!(!injection_ready(medius::Health::from_flags(0x01)));
-        assert!(injection_ready(medius::Health::from_flags(0x03)));
+        assert!(!injection_ready(medius::Health::from_flags(0x03)));
         assert!(injection_ready(medius::Health::from_flags(0x07)));
     }
 
     #[test]
-    fn linked_attached_mouse_is_accepted_without_clone_status() {
-        assert!(injection_ready(medius::Health::from_flags(0x03)));
+    fn linked_mouse_without_clone_configuration_is_rejected() {
+        assert!(!injection_ready(medius::Health::from_flags(0x03)));
         assert!(injection_ready(medius::Health::from_flags(0x07)));
     }
 

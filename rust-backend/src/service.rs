@@ -235,6 +235,7 @@ impl ReceiverService {
                     .is_some_and(|device| trigger_held(&device, &settings.trigger_button));
                 Some(MovementRuntimeSettings {
                     motion_enabled: settings.motion_enabled,
+                    motion_always_on: settings.motion_always_on,
                     trigger_held,
                     sens: settings.sens,
                     offset_x: settings.offset_x,
@@ -270,7 +271,7 @@ impl ReceiverService {
                 received_s: 0.0,
             });
             if let (Ok(settings), Ok(device)) = (callback_settings.lock(), callback_device.lock()) {
-                let auto_active = auto_trigger_active(&settings.auto, &device);
+                let auto_active = !settings.motion_always_on && auto_trigger_active(&settings.auto, &device);
                 if let Ok(mut events) = callback_auto.lock() {
                     events.configure(&settings.auto);
                     events.target(
@@ -401,7 +402,7 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
-            "motion_enabled":settings.motion_enabled, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
+            "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "auto":settings.auto,
@@ -744,6 +745,9 @@ impl ReceiverService {
                 settings.sens = sens;
                 if let Some(enabled) = command.get("motion_enabled").and_then(Value::as_bool) {
                     settings.motion_enabled = enabled;
+                }
+                if let Some(enabled) = command.get("motion_always_on").and_then(Value::as_bool) {
+                    settings.motion_always_on = enabled;
                 }
                 drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
@@ -1295,7 +1299,7 @@ fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bo
 }
 
 fn effective_detection_settings(settings: &AppSettings, device: &Value) -> (u16, String, bool) {
-    let auto_active = auto_trigger_active(&settings.auto, device);
+    let auto_active = !settings.motion_always_on && auto_trigger_active(&settings.auto, device);
     if auto_active {
         (
             settings.auto.fov_degrees,

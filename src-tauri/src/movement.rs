@@ -22,6 +22,7 @@ pub struct MovementTarget {
     pub dx: i64,
     pub dy: i64,
     pub motion_enabled: bool,
+    pub motion_always_on: bool,
     pub trigger_button: String,
     pub timestamp_ms: u64,
     #[serde(alias = "nativeMotion", alias = "native_motion")]
@@ -56,7 +57,7 @@ pub fn trigger_button_index(button: &str) -> Option<u16> {
 }
 
 pub fn should_apply_target(target: &MovementTarget, trigger_held: bool) -> bool {
-    target.motion_enabled && trigger_held && target.target_valid
+    target.motion_enabled && (target.motion_always_on || trigger_held) && target.target_valid
 }
 
 impl MovementTarget {
@@ -168,6 +169,24 @@ mod tests {
                 ..target
             },
             true
+        ));
+    }
+
+    #[test]
+    fn always_on_motion_bypasses_only_the_trigger_gate() {
+        let target = MovementTarget {
+            target_valid: true,
+            motion_enabled: true,
+            motion_always_on: true,
+            ..MovementTarget::default()
+        };
+        assert!(should_apply_target(&target, false));
+        assert!(!should_apply_target(
+            &MovementTarget {
+                target_valid: false,
+                ..target
+            },
+            false
         ));
     }
 

@@ -126,6 +126,7 @@ pub struct AppSettings {
     /// Up to three independent setting snapshots.
     pub profiles: Vec<ProfileSlot>,
     pub motion_enabled: bool,
+    pub motion_always_on: bool,
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
@@ -162,6 +163,7 @@ impl Default for AppSettings {
             active_profile: 0,
             profiles: Vec::new(),
             motion_enabled: false,
+            motion_always_on: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,

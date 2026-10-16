@@ -973,6 +973,8 @@ pub struct MovementEvent {
     pub dy: i64,
     #[serde(default)]
     pub motion_enabled: bool,
+    #[serde(default)]
+    pub motion_always_on: bool,
     pub trigger_button: String,
     pub timestamp_ms: u64,
     pub recoil: RecoilSettings,
@@ -981,6 +983,7 @@ pub struct MovementEvent {
 #[derive(Clone, Debug)]
 pub struct MovementRuntimeSettings {
     pub motion_enabled: bool,
+    pub motion_always_on: bool,
     pub sens: f64,
     pub offset_x: f64,
     pub offset_y: f64,
@@ -1161,6 +1164,7 @@ impl MovementTicker {
                                     dx: 0,
                                     dy: 0,
                                     motion_enabled: false,
+                                    motion_always_on: false,
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
@@ -1180,6 +1184,7 @@ impl MovementTicker {
                                     dx: 0,
                                     dy: 0,
                                     motion_enabled: runtime.motion_enabled,
+                                    motion_always_on: runtime.motion_always_on,
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
@@ -1219,6 +1224,7 @@ impl MovementTicker {
                             dx,
                             dy,
                             motion_enabled: runtime.motion_enabled,
+                            motion_always_on: runtime.motion_always_on,
                             trigger_button: runtime.trigger_button,
                             timestamp_ms: unix_ms(),
                             recoil: runtime.recoil,
@@ -1234,6 +1240,7 @@ impl MovementTicker {
                                 dx: 0,
                                 dy: 0,
                                 motion_enabled: runtime.motion_enabled,
+                                motion_always_on: runtime.motion_always_on,
                                 trigger_button: runtime.trigger_button,
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,

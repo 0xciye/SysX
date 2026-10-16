@@ -9,9 +9,9 @@ The runtime already used this Rust library before this migration. The former ver
 
 `src-tauri/src/native_app.rs` uses:
 
-1. `medius::find_medius()` to discover Medius' CH343 control ports, then `Device::open(path)` for the SDK-managed protocol-9 handshake. This recognizes a box even while its cloned mouse is still enumerating after a USB reconnect.
+1. Enumerate Windows serial ports using the SDK's WCH CH343 identity (`VID 0x1A86`, `PID 0x55D3`) while preserving enumeration errors, then call `Device::open(path)` for the SDK-managed handshake. This recognizes the box independently of cloned-mouse enumeration and distinguishes scan failure from no matching port.
 2. `device.query_version()` to obtain the library-validated firmware identity and name.
-3. `device.query_health()` before subscribing or injecting. SysX requires `link_up`, `mouse_attached`, and `clone_configured`; otherwise it reports the device as unavailable and retries instead of sending input to an incomplete chain.
+3. `device.query_health()` before subscribing or injecting. SysX requires `link_up`, `mouse_attached`, and `clone_configured`; otherwise it reports the device as unavailable, tries the next discovered control port, and retries discovery.
 4. `device.input_events(filters)` with `CatchFilter::watch` for `Button::LEFT`, `RIGHT`, `MIDDLE`, `SIDE1`, and `SIDE2`.
 5. `recv_timeout` and `held(Class::Button)` to update physical held states. Watch filters observe input without taking it away from passthrough.
 6. `events.is_connected()` and SDK errors to clear status and reconnect after disconnect.

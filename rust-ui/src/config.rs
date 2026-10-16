@@ -481,9 +481,9 @@ pub fn ConfigApp() -> impl IntoView {
                                         </label>
                                         <label class="module-toggle">
                                             <span class="module-toggle-name">"Auto"</span>
-                                            <span class="module-toggle-state">{move || if settings.get().auto.enabled { "On" } else { "Off" }}</span>
-                                            <input aria-label="Enable auto" type="checkbox" prop:checked=move || settings.get().auto.enabled on:change=move |_| settings.update(|value| value.auto.enabled = !value.auto.enabled)/>
-                                            <span class=move || format!("switch{}", if settings.get().auto.enabled { " is-on" } else { "" }) aria-hidden="true"><span/></span>
+                                            <span class="module-toggle-state">{move || if settings.get().motion_always_on { "Unavailable" } else if settings.get().auto.enabled { "On" } else { "Off" }}</span>
+                                            <input aria-label="Enable auto" type="checkbox" prop:checked=move || settings.get().auto.enabled on:change=move |_| settings.update(|value| if !value.motion_always_on { value.auto.enabled = !value.auto.enabled }) disabled=move || settings.get().motion_always_on/>
+                                            <span class=move || format!("switch{}", if settings.get().auto.enabled && !settings.get().motion_always_on { " is-on" } else { "" }) aria-hidden="true"><span/></span>
                                         </label>
                                         <label class="module-toggle">
                                             <span class="module-toggle-name">"Recoil"</span>
@@ -518,6 +518,10 @@ pub fn ConfigApp() -> impl IntoView {
                                         <output class="offset-readout">{move || format!("{:+}, {:+}", parse_integer(&offset_x_draft.get()).unwrap_or(0), parse_integer(&offset_y_draft.get()).unwrap_or(0))}</output>
                                     </div>
                                 </div>
+                            </div>
+                            <div class="settings-row">
+                                <div class="setting-description"><h2>"Always on"</h2><p>"Move toward detected targets without holding the trigger. Auto is unavailable while enabled."</p></div>
+                                <div class="settings-fields"><label class="field"><input type="checkbox" prop:checked=move || settings.get().motion_always_on on:change=move |_| settings.update(|value| value.motion_always_on = !value.motion_always_on) aria-label="Motion always on"/><span class="field-label">"Always on"</span></label></div>
                             </div>
                             <div class="settings-row smoothing-settings-row">
                                 <div class="setting-description"><h2>"Exponential Smoothing"</h2></div>
@@ -616,6 +620,7 @@ fn copy_state_to_settings(
     settings.update(|value| {
         value.active_profile = state.profile_index;
         value.motion_enabled = state.motion_enabled;
+        value.motion_always_on = state.motion_always_on;
         value.strategy = state.mode.clone();
         value.fov_degrees = state.fov_degrees.clamp(1, 360);
         value.offset_x = state.target_offset_x;
@@ -690,7 +695,7 @@ fn send_settings_commands(
         ),
         command(
             "set_movement_calibration",
-            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled}),
+            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled,"motion_always_on":settings.motion_always_on}),
         ),
         command(
             "set_recoil",

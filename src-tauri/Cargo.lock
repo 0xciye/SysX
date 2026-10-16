@@ -3854,6 +3854,7 @@ dependencies = [
  "medius",
  "serde",
  "serde_json",
+ "serialport",
  "sha2 0.11.1",
  "slint",
  "sysx-ui",

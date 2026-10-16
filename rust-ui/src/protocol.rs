@@ -19,6 +19,8 @@ pub struct BackendState {
     #[serde(default)]
     pub motion_enabled: bool,
     #[serde(default)]
+    pub motion_always_on: bool,
+    #[serde(default)]
     pub fov_degrees: u16,
     #[serde(default)]
     pub target_offset_x: f64,
