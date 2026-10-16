@@ -276,6 +276,8 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 134. [x] Separated Auto timing semantics: Delay starts on the first valid target observation, Cooldown starts when the click command is emitted, and Sleep becomes a polling deadline instead of extending the firing interval. Added regression coverage for the independent Cooldown and Sleep behavior.
 135. [x] Changed Auto target validity from any colored pixel in the FOV to a center-crossing gate. The shared HSV mask must occupy the screen-center cell (the four center cells for an even-sized frame); colored pixels elsewhere do not activate Auto. Added backend regression coverage for center and off-center pixels.
 
+136. [x] Auto now latches the first center crossing through Delay even when the target leaves the center. Further crossings while waiting preserve the first deadline and do not queue extra clicks. Trigger release, disabling Auto, or changing timing still cancels the pending click; target loss rearms the cycle after a click. Added regressions for a 90 ms delay after a brief crossing, repeated crossings, trigger cancellation, and disabling Auto. Validated the isolated Rust Auto state and center-mask gate on Linux; Windows/device behavior remains unvalidated.
+
 ## Limitations to preserve
 
 - There are no sender binaries, user models, or target-Hardware measurements in the repository.
