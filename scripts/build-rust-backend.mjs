@@ -49,15 +49,6 @@ mkdirSync(sidecarDir, { recursive: true });
 copyFileSync(binary, sidecar);
 if (binaryExtension === "") chmodSync(sidecar, 0o755);
 
-if (process.platform === "darwin") {
-  const signature = spawnSync("codesign", ["--force", "--deep", "--sign", "-", sidecar], {
-    cwd: root,
-    stdio: "inherit",
-  });
-  if (signature.error) throw signature.error;
-  if (signature.status !== 0) process.exit(signature.status ?? 1);
-}
-
 const help = spawnSync(sidecar, ["--help"], { cwd: root, stdio: "inherit" });
 if (help.error) throw help.error;
 if (help.status !== 0) process.exit(help.status ?? 1);

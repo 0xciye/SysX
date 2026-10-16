@@ -4,8 +4,6 @@ SysX is a portable Windows desktop application distributed as one `SysX.exe`; no
 
 The application source is Rust: a small native host (`src-tauri`) embeds and supervises the Rust backend sidecar and owns Medius/Ferrum device I/O; both the receiver monitor and the configuration page are the Leptos/WebAssembly UI served by the backend on loopback. Trunk builds that bundle. The former `eframe/egui` native window has been removed. The legacy React/TypeScript frontend and Python backend have been removed. Object Detection has ONNX Runtime, OpenVINO, and optional TensorRT adapters; no user model is included, so inference has not been exercised with a real model or target hardware.
 
-An earlier macOS bundle used the Python backend. Its 192 × 192 synthetic MJPEG smoke at a requested 180 FPS showed 180.0 source FPS, 179.5 processing FPS, 60.1 preview FPS, 5 input drops, and 0 transport drops. This is historical evidence from the retired implementation, not an OBS, Windows, or target-hardware acceptance test. The current source builds `SysX.app` with the Rust backend.
-
 ## Current status (2026-10-15)
 
 The active source and runtime are Rust across the native host, the Leptos/WASM monitor and config UI, and the receiver sidecar. The monitor (`/monitor.html`) is intentionally a single dark Preview page: a thin status bar showing the device state, a centered square feed of up to 640 × 640 px with an in-feed `resolution · FPS · ms` HUD plate, and a Mouse State row matching the feed width. The native host forwards device and button state to the page through the backend (`device_status` command → `state.device`). The loopback configuration page mounts the same Rust UI in the default browser and persists settings through `app-settings.json`. The OBS sender plugin in `obs-plugin/sysx-canvas-sender` is implemented; its destination IP/port are compile-time constants in `sysx_canvas_sender.cpp`; see its README. The design source of truth is [design-system/sysx-native-receiver/MASTER.md](design-system/sysx-native-receiver/MASTER.md). Windows executable and physical Medius/Ferrum behavior still require target-environment validation.
@@ -34,7 +32,7 @@ The Rust sidecar owns UDP reassembly, JPEG decoding, centered crop, Pixel Seek, 
 
 ## Requirements
 
-- macOS for development; Windows 10/11 x64 for building and running the portable executable.
+- Windows 10/11 x64 for development, testing, building, and running the portable executable.
 - Node.js 20+, pnpm, Rust stable, and Trunk. Node and pnpm build the config assets; application runtime and logic are Rust.
 - Windows builds must be produced and validated on Windows (or a Windows CI runner).
 - A Windows release is built with `scripts/build-windows.ps1` (no Node needed) or `pnpm build:desktop`, and yields `src-tauri/target/release/SysX.exe`. Microsoft Edge (preinstalled on Windows 10/11) hosts the receiver window; the default browser is used if Edge is missing. Selected inference runtimes remain machine prerequisites.
@@ -79,9 +77,9 @@ This utility verifies the frame protocol; the production sender is the OBS plugi
 
 ## Sample frame
 
-This 192 × 192 JPEG is the sample used by the UDP smoke test. The packaged macOS app has also received 192 × 192 sender frames and enlarged them in Preview while preserving their aspect ratio:
+This 192 × 192 JPEG is the sample used by the UDP smoke test:
 
-![192 by 192 red cube JPEG sender frame](/Users/ciye/Documents/pixelobject/src/assets/red-cube-192.jpg)
+![192 by 192 red cube JPEG sender frame](src/assets/red-cube-192.jpg)
 
 Pixel Seek offers one target color at a time (yellow, red, or purple). Its code-defined HSV ranges are in `rust-backend/src/pixel_seek.rs`: red H 0–10/S 50–255/V 180–255, yellow H 20–40/S 157–255/V 252–255, and purple H 140–160/S 60–255/V 240–255. The UDP receiver decodes JPEG frames to RGB before thresholding; hue uses 0–179, while saturation and value use 0–255.
 

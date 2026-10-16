@@ -25,7 +25,7 @@ A receiver-only desktop tool that waits for a sender and automatically crops inc
 Used on a secondary computer while another computer continuously sends frames. The operator monitors preview, active strategy/model, and processing diagnostics. Target stream rates may exceed 180–360 FPS; this is a requirement to evaluate, not a measured performance claim.
 
 ## Capabilities and Constraints
-- Develop on macOS; target a portable Windows 10/11 x64 `.exe` distribution with no installer.
+- Develop and test on Windows 10/11 x64; ship a portable `.exe` distribution with no installer.
 - Work locally without a cloud service or public internet connection. The browser configuration page is served only from loopback.
 - Keep frame acquisition, processing, persistence, and rendering decoupled across the Rust backend and desktop frontend. A sender streams full-frame MJPEG continuously over the implemented UDP protocol; the receiver validates, reassembles, decodes, crops, processes, and previews it.
 - Support exactly two primary strategies: Pixel Seek and Object Detection.

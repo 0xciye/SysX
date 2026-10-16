@@ -831,10 +831,6 @@ fn open_url(url: &str) {
             .args(["url.dll,FileProtocolHandler", url])
             .spawn();
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("open").arg(url).spawn();
-    }
     #[cfg(target_os = "linux")]
     {
         let _ = Command::new("xdg-open").arg(url).spawn();
