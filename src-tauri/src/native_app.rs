@@ -152,13 +152,25 @@ pub fn run() {
             }
             let _ = gone_tx.send(());
         });
-        if let Err(gone_rx) = crate::monitor_window::run(config_port, &data_dir, gone_rx) {
-            open_monitor_window(config_port, &data_dir);
-            let _ = gone_rx.recv();
-        }
+        let native_closed = match crate::monitor_window::run(config_port, &data_dir, gone_rx) {
+            Ok(()) => true,
+            Err(_gone_rx) => {
+                open_monitor_window(config_port, &data_dir);
+                false
+            }
+        };
         if !backend_disconnected.load(Ordering::Acquire) {
-            let mut lifecycle = MonitorLifecycle::new(Instant::now());
-            loop {
+            // A native window that was explicitly closed must not restart the
+            // 60-second first-client wait. A failed WebView creation still
+            // allows the Edge fallback time to connect, without blocking on
+            // backend exit (which itself depends on this host shutting down).
+            let now = Instant::now();
+            let mut lifecycle = if native_closed {
+                MonitorLifecycle::after_monitor_closed(now)
+            } else {
+                MonitorLifecycle::new(now)
+            };
+            while !backend_disconnected.load(Ordering::Acquire) {
                 let counts = ui_counts.lock().map(|value| *value).ok();
                 if lifecycle.should_exit(counts, Instant::now()) {
                     break;
@@ -209,15 +221,20 @@ impl MonitorLifecycle {
         }
     }
 
+    fn after_monitor_closed(now: Instant) -> Self {
+        Self {
+            seen: true,
+            zero_since: Some(now),
+            ..Self::new(now)
+        }
+    }
+
     fn should_exit(&mut self, counts: Option<(usize, usize)>, now: Instant) -> bool {
         if let Some((count, config_count)) = counts {
             self.count = count;
             self.config_count = config_count;
         }
-        if self.config_count > 0 {
-            return false;
-        }
-        if self.count > 0 {
+        if self.config_count > 0 || self.count > 0 {
             self.seen = true;
             self.zero_since = None;
             return false;
@@ -810,7 +827,26 @@ mod tests {
         let mut lifecycle = MonitorLifecycle::new(start);
         assert!(!lifecycle.should_exit(Some((1, 1)), start + Duration::from_secs(1)));
         assert!(!lifecycle.should_exit(Some((0, 1)), start + Duration::from_secs(120)));
-        assert!(lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(124)));
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(124)));
+        assert!(lifecycle.should_exit(None, start + Duration::from_secs(127)));
+    }
+
+    #[test]
+    fn native_window_close_uses_close_grace_without_waiting_for_a_first_client() {
+        let start = Instant::now();
+        let mut lifecycle = MonitorLifecycle::after_monitor_closed(start);
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(2)));
+        assert!(lifecycle.should_exit(None, start + MONITOR_CLOSE_GRACE));
+    }
+
+    #[test]
+    fn config_only_client_gets_a_reload_grace_after_its_last_disconnect() {
+        let start = Instant::now();
+        let mut lifecycle = MonitorLifecycle::after_monitor_closed(start);
+        assert!(!lifecycle.should_exit(Some((0, 1)), start + Duration::from_secs(10)));
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(120)));
+        assert!(!lifecycle.should_exit(None, start + Duration::from_secs(122)));
+        assert!(lifecycle.should_exit(None, start + Duration::from_secs(123)));
     }
 
     #[test]

@@ -40,6 +40,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Port recovery regression failed' }
           cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic wildcard_listener_cannot_share_a_bound_loopback_port
           if ($LASTEXITCODE -ne 0) { throw 'Exclusive UDP binding regression failed' }
+      - name: Windows host lifecycle regressions
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml native_app::tests
+          if ($LASTEXITCODE -ne 0) { throw 'Host lifecycle regression failed' }
       - name: Build, unit test and Windows UDP smoke
         shell: pwsh
         run: ./scripts/build-windows.ps1

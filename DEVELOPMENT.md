@@ -8,6 +8,8 @@ Windows portable packaging: `scripts/build-windows.ps1` builds and tests the bac
 
 The Windows build exposed different wildcard/specific-interface UDP binding behavior. The receiver now sets `SO_EXCLUSIVEADDRUSE` before binding on Windows so an occupied port is rejected, the existing listener survives a failed port change, and recovery can retry after the port is released. Regression checks exercise both bind directions.
 
+Windows application smoke also exposed a native-window shutdown delay: lifecycle tracking restarted after the monitor was already closed and could wait another 60 seconds. Native close now starts the three-second close grace, config-only reloads retain that grace, and WebView creation failure uses the Edge fallback without waiting indefinitely for backend exit.
+
 The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The receiver window is the Rust WASM monitor page (`/monitor.html`) served by the backend and hosted in the native Wry/WebView2 window with a chromeless Edge app fallback; the separate config page is the same bundle at `/config.html` in the default browser. The `eframe/egui` window was removed. Windows visual review and physical-device validation remain outstanding.
 
 ## Architecture
