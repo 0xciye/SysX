@@ -614,26 +614,6 @@ impl ReceiverService {
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
-            "set_model_backend" => {
-                let backend = command
-                    .get("backend")
-                    .and_then(Value::as_str)
-                    .ok_or("inference backend is required")?;
-                if !["onnxruntime", "tensorrt", "openvino"].contains(&backend) {
-                    return Err("backend must be onnxruntime, tensorrt, or openvino".into());
-                }
-                let mut next = self
-                    .settings
-                    .lock()
-                    .map_err(|_| "settings lock poisoned")?
-                    .clone();
-                next.model_backend = backend.into();
-                next.validate().map_err(|error| error.to_string())?;
-                let config = self.pipeline_config(&next)?;
-                self.pipeline.configure(config).map_err(str::to_owned)?;
-                *self.settings.lock().map_err(|_| "settings lock poisoned")? = next;
-                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
-            }
             "set_inference_config" => {
                 let backend = command
                     .get("backend")
@@ -708,15 +688,6 @@ impl ReceiverService {
                 drop(registry);
                 self.reconfigure()?;
                 Ok(self.models_event())
-            }
-            "export_csv" => {
-                let path = command
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or("CSV destination path is required")?;
-                self.store.export_csv(path, Duration::from_secs(5))?;
-                Ok(json!({"event":"exported","path":path}))
             }
             _ => Err(format!("unsupported command type: {kind}")),
         }

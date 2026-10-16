@@ -73,7 +73,7 @@ pub fn MonitorApp() -> impl IntoView {
                             model_confidence.set(model.confidence);
                         }
                     }
-                    BackendEvent::Frame(next, image, preview_fps) => {
+                    BackendEvent::Frame(next, image) => {
                         let visible = preview_detections(
                             &next.detection.objects,
                             &next.mode,
@@ -89,11 +89,7 @@ pub fn MonitorApp() -> impl IntoView {
                                 .or(next.detection.target_xy)
                         });
                         detections.update_untracked(|value| *value = visible);
-                        frame.set(Some(PreviewFrame {
-                            frame: next,
-                            image,
-                            preview_fps,
-                        }));
+                        frame.set(Some(PreviewFrame { frame: next, image }));
                         set_changed(backend_error, String::new());
                     }
                     BackendEvent::Error(message) => backend_error.set(message),

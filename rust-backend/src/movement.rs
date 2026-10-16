@@ -63,23 +63,6 @@ pub fn crop_target_error(
     )
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct FrameTimingAverage {
-    samples_ms: std::collections::VecDeque<f64>,
-    sum_ms: f64,
-}
-
-impl FrameTimingAverage {
-    pub fn add_frame_duration(&mut self, elapsed_ms: f64) -> f64 {
-        self.samples_ms.push_back(elapsed_ms);
-        self.sum_ms += elapsed_ms;
-        if self.samples_ms.len() > 30 {
-            self.sum_ms -= self.samples_ms.pop_front().unwrap_or_default();
-        }
-        self.sum_ms / self.samples_ms.len() as f64
-    }
-}
-
 pub fn ncaf_factor(
     distance: f64,
     snap_radius: f64,
@@ -697,16 +680,5 @@ mod tests {
             crop_target_error((-1.9, -1.9), (0, 0), (0, 0), (0.0, 0.0)),
             (-1.0, -1.0)
         );
-    }
-
-    #[test]
-    fn frame_timing_average_keeps_the_latest_thirty_samples() {
-        let mut average = FrameTimingAverage::default();
-        for duration in 1..=31 {
-            let result = average.add_frame_duration(duration as f64);
-            if duration == 31 {
-                assert!((result - 16.5).abs() < f64::EPSILON);
-            }
-        }
     }
 }

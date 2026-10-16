@@ -14,7 +14,6 @@ use web_sys::{Blob, CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap};
 pub struct PreviewFrame {
     pub frame: LiveFrame,
     pub image: Blob,
-    pub preview_fps: Option<f64>,
 }
 
 #[component]

@@ -20,16 +20,6 @@ pub struct PriorTarget {
     pub class_id: Option<u32>,
 }
 
-pub fn coordinate_in_fov(x: f32, y: f32, width: u32, height: u32, degrees: u16) -> bool {
-    if width == 0 || height == 0 || !(1..=360).contains(&degrees) {
-        return false;
-    }
-    let radius = (width.min(height) as f32 - 1.0) * degrees as f32 / 720.0;
-    let dx = x - width as f32 / 2.0;
-    let dy = y - height as f32 / 2.0;
-    dx * dx + dy * dy <= radius * radius
-}
-
 pub fn highest_pixel_in_fov(
     mask: &[u8],
     width: u32,
