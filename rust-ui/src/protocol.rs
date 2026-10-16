@@ -189,8 +189,5 @@ pub enum BackendEvent {
         error: Option<String>,
     },
     Models(Vec<BackendModel>, Option<String>),
-    /// Frame metadata and the sender's JPEG as a Blob (decoded off the main
-    /// thread with createImageBitmap).
-    Frame(LiveFrame, web_sys::Blob),
     Error(String),
 }

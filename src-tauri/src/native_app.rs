@@ -1,14 +1,10 @@
-//! Native SysX host. It owns everything that must stay native â€” the embedded
-//! backend process, Medius device I/O and movement output â€” and shows
-//! the receiver UI as the web monitor page (`/monitor.html`) in a chromeless
-//! browser app window. The host exits once the monitor and configuration
-//! clients have both closed.
+//! Native SysX host: embedded backend, Medius I/O, movement and a Slint monitor.
+//! Only the separate configuration page runs in a browser.
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +18,7 @@ const MONITOR_CLOSE_GRACE: Duration = Duration::from_secs(3);
 /// How long to wait for the monitor window to connect at all.
 const MONITOR_FIRST_CONNECT: Duration = Duration::from_secs(60);
 
-enum HostEvent {
+pub(crate) enum HostEvent {
     ClientCounts { monitor: usize, config: usize },
     Disconnected,
 }
@@ -91,10 +87,7 @@ pub fn run() {
     let Some(_instance) = crate::single_instance::acquire() else {
         // Another SysX owns the backend and UDP port: show its monitor, exit.
         if !crate::single_instance::focus_monitor_window() {
-            let data_dir = app_data_dir();
-            if let Some(config_port) = crate::single_instance::running_config_port(&data_dir) {
-                open_monitor_window(config_port, &data_dir);
-            }
+            crate::single_instance::request_monitor();
         }
         return;
     };
@@ -116,95 +109,28 @@ pub fn run() {
         Arc::clone(&device_state),
     );
     let (event_tx, event_rx) = mpsc::channel();
-    start_host_client(port, token, Arc::clone(&device_state), event_tx);
-    let Some(config_port) = config_port else {
-        crate::diagnostics::record("local web server did not start");
-        eprintln!("SysX local web server did not start; no receiver window can be shown");
-        return;
-    };
-    crate::single_instance::record_config_port(&data_dir, config_port);
-    // The opt-in Windows smoke owns only the monitor window. Do not open a
-    // config tab in the user's browser that would keep the host alive.
-    if !std::env::args().any(|arg| arg == "--smoke-test") {
-        open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
-    }
-
-    // Preferred: the receiver as a native SysX window (WebView2). Closing it
-    // leaves the backend alive while the browser config page is open. Without
-    // the WebView2 runtime, fall back to an Edge app window.
-    if wry::webview_version().is_ok() {
-        let ui_counts = Arc::new(Mutex::new((0_usize, 0_usize)));
-        let backend_disconnected = Arc::new(AtomicBool::new(false));
-        let counts_for_events = Arc::clone(&ui_counts);
-        let disconnected_for_events = Arc::clone(&backend_disconnected);
-        let (gone_tx, gone_rx) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                match event {
-                    HostEvent::ClientCounts { monitor, config } => {
-                        if let Ok(mut counts) = counts_for_events.lock() {
-                            *counts = (monitor, config);
-                        }
-                    }
-                    HostEvent::Disconnected => {
-                        disconnected_for_events.store(true, Ordering::Release);
-                        break;
-                    }
-                }
-            }
-            let _ = gone_tx.send(());
-        });
-        let native_closed = match crate::monitor_window::run(config_port, &data_dir, gone_rx) {
-            Ok(()) => true,
-            Err(_gone_rx) => {
-                open_monitor_window(config_port, &data_dir);
-                false
-            }
-        };
-        if !backend_disconnected.load(Ordering::Acquire) {
-            // A native window that was explicitly closed must not restart the
-            // 60-second first-client wait. A failed WebView creation still
-            // allows the Edge fallback time to connect, without blocking on
-            // backend exit (which itself depends on this host shutting down).
-            let now = Instant::now();
-            let mut lifecycle = if native_closed {
-                MonitorLifecycle::after_monitor_closed(now)
-            } else {
-                MonitorLifecycle::new(now)
-            };
-            while !backend_disconnected.load(Ordering::Acquire) {
-                let counts = ui_counts.lock().map(|value| *value).ok();
-                if lifecycle.should_exit(counts, Instant::now()) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
+    start_host_client(port, token.clone(), Arc::clone(&device_state), event_tx);
+    if let Some(config_port) = config_port {
+        crate::single_instance::record_config_port(&data_dir, config_port);
+        if !std::env::args().any(|arg| arg == "--smoke-test") {
+            open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
         }
-        crate::single_instance::clear_config_port(&data_dir);
-        drop(runtime);
-        return;
+    } else {
+        crate::diagnostics::record(
+            "Configuration server unavailable; native receiver will still run",
+        );
     }
-    open_monitor_window(config_port, &data_dir);
-    let mut lifecycle = MonitorLifecycle::new(Instant::now());
-    loop {
-        let count = match event_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(HostEvent::ClientCounts { monitor, config }) => Some((monitor, config)),
-            Ok(HostEvent::Disconnected) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => None,
-        };
-        if lifecycle.should_exit(count, Instant::now()) {
-            break;
-        }
+    if let Err(error) = crate::monitor_window::run(port, token, event_rx) {
+        crate::diagnostics::record(&format!("Native receiver failed: {error}"));
     }
     crate::single_instance::clear_config_port(&data_dir);
-    // Dropping the runtime stops the backend and removes the extracted files.
     drop(runtime);
 }
 
 /// Decides when the UI clients are gone: the host keeps running while at least
 /// one monitor or configuration page is connected, tolerates a short reload
 /// gap, and gives up if neither client ever connects.
-struct MonitorLifecycle {
+pub(crate) struct MonitorLifecycle {
     started: Instant,
     seen: bool,
     count: usize,
@@ -223,7 +149,7 @@ impl MonitorLifecycle {
         }
     }
 
-    fn after_monitor_closed(now: Instant) -> Self {
+    pub(crate) fn after_monitor_closed(now: Instant) -> Self {
         Self {
             seen: true,
             zero_since: Some(now),
@@ -231,7 +157,7 @@ impl MonitorLifecycle {
         }
     }
 
-    fn should_exit(&mut self, counts: Option<(usize, usize)>, now: Instant) -> bool {
+    pub(crate) fn should_exit(&mut self, counts: Option<(usize, usize)>, now: Instant) -> bool {
         if let Some((count, config_count)) = counts {
             self.count = count;
             self.config_count = config_count;
@@ -269,8 +195,12 @@ fn start_backend(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     match crate::diagnostics::backend_stderr() {
-        Ok(file) => { command.stderr(file); }
-        Err(error) => crate::diagnostics::record(&format!("could not capture backend stderr: {error}")),
+        Ok(file) => {
+            command.stderr(file);
+        }
+        Err(error) => {
+            crate::diagnostics::record(&format!("could not capture backend stderr: {error}"))
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -731,40 +661,6 @@ fn make_token() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Opens the receiver monitor as a chromeless Edge app window with its own
-/// profile under app data (window size/position persist there). Falls back
-/// to the default browser.
-fn open_monitor_window(port: u16, data_dir: &Path) {
-    let url = format!("http://127.0.0.1:{port}/monitor.html");
-    #[cfg(target_os = "windows")]
-    {
-        let edge = ["ProgramFiles(x86)", "ProgramFiles"]
-            .iter()
-            .filter_map(std::env::var_os)
-            .map(|root| PathBuf::from(root).join(r"Microsoft\Edge\Application\msedge.exe"))
-            .find(|path| path.is_file());
-        if let Some(edge) = edge {
-            let profile = data_dir.join("monitor-window");
-            if Command::new(edge)
-                .arg(format!("--app={url}"))
-                .arg(format!("--user-data-dir={}", profile.display()))
-                .args([
-                    // Compact default; Edge remembers later resizes in this profile.
-                    "--window-size=550,620",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ])
-                .spawn()
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-    let _ = data_dir;
-    open_url(&url);
 }
 
 /// Web config opens in Google Chrome when it is installed, otherwise in the

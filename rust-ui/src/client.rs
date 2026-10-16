@@ -1,14 +1,13 @@
-use crate::protocol::{BackendEvent, BackendModel, BackendState, ConnectionInfo, LiveFrame};
+use crate::protocol::{BackendEvent, BackendModel, BackendState, ConnectionInfo};
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::{select, FutureExt, SinkExt, StreamExt};
 use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, Uint8Array};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::VecDeque;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Blob, UrlSearchParams};
+use web_sys::UrlSearchParams;
 
 const SETTINGS_CACHE_KEY: &str = "sysx.settings.v1";
 
@@ -98,11 +97,7 @@ async fn run_backend_client(
             select! {
                 message = incoming => match message {
                     Some(Ok(Message::Text(text))) => parse_text_event(&text, &*on_event),
-                    Some(Ok(Message::Bytes(bytes))) => {
-                        if let Some((frame, image)) = decode_frame(&bytes) {
-                            on_event(BackendEvent::Frame(frame, image));
-                        }
-                    }
+                    Some(Ok(Message::Bytes(_))) => {} // Config never renders preview frames.
                     Some(Err(error)) => {
                         on_event(BackendEvent::Error(error.to_string()));
                         connected = false;
@@ -235,14 +230,7 @@ fn write_cached_settings(payload: &str) -> Result<(), String> {
         .map_err(|_| "browser storage rejected the settings".to_string())
 }
 
-/// The native host opens the receiver window at `/monitor.html`; every other
-/// path is the configuration page.
-pub fn is_monitor_page() -> bool {
-    web_sys::window()
-        .and_then(|window| window.location().pathname().ok())
-        .is_some_and(|path| path.ends_with("/monitor.html"))
-}
-
+/// Configuration consumes backend state and acknowledgements only.
 fn parse_text_event(text: &str, on_event: &dyn Fn(BackendEvent)) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         on_event(BackendEvent::Error("Backend sent invalid JSON".into()));
@@ -296,22 +284,4 @@ fn parse_text_event(text: &str, on_event: &dyn Fn(BackendEvent)) {
         }
         _ => {}
     }
-}
-
-fn decode_frame(bytes: &[u8]) -> Option<(LiveFrame, Blob)> {
-    if bytes.len() < 5 {
-        return None;
-    }
-    let metadata_len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-    let metadata_end = 4_usize.checked_add(metadata_len)?;
-    if metadata_end >= bytes.len() {
-        return None;
-    }
-    // Binary messages only carry frames; parse the metadata once, directly.
-    let frame: LiveFrame = serde_json::from_slice(bytes.get(4..metadata_end)?).ok()?;
-    let image = Uint8Array::from(bytes.get(metadata_end..)?);
-    let parts = Array::new();
-    parts.push(image.as_ref());
-    let blob = Blob::new_with_u8_array_sequence(&parts).ok()?;
-    Some((frame, blob))
 }
