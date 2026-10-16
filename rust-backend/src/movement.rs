@@ -6,6 +6,23 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BEZIER_STRENGTH: f64 = 0.35;
+/// Stop moving inside this error radius (crop pixels)...
+const STOP_RADIUS_PX: f64 = 2.0;
+/// ...and resume only once the error grows past this one (hysteresis).
+const RESUME_RADIUS_PX: f64 = 4.0;
+/// Smallest step outside the dead zone, in device counts per tick. It is a
+/// vector length, so with the residual accumulator a small diagonal error
+/// is walked as a diagonal instead of a forced ±1 staircase on one axis.
+const MIN_STEP_COUNTS: f64 = 0.4;
+/// A target this much farther than the stroke's start distance starts a new stroke.
+const RESTROKE_GROWTH: f64 = 1.5;
+/// Time-correlated (Ornstein-Uhlenbeck) drift: lateral offset as a fraction
+/// of the step, and a speed scale. Both relax back to 0.
+const LATERAL_SIGMA: f64 = 0.08;
+const LATERAL_TAU_S: f64 = 0.08;
+const SPEED_SIGMA: f64 = 0.06;
+const SPEED_TAU_S: f64 = 0.15;
+const DEFAULT_TICK_S: f64 = 0.004;
 
 #[derive(Clone, Debug)]
 pub struct MovementConfig {
@@ -22,7 +39,6 @@ pub struct MovementConfig {
     pub sens: f64,
     pub dpi: f64,
     pub clip_speed: f64,
-    pub micro_corrections: i64,
 }
 
 impl Default for MovementConfig {
@@ -41,7 +57,6 @@ impl Default for MovementConfig {
             sens: 0.235,
             dpi: 800.0,
             clip_speed: 1000.0,
-            micro_corrections: 1,
         }
     }
 }
@@ -92,14 +107,16 @@ pub fn ncaf_factor(
     }
 }
 
-fn bezier_response(value: f64, scale: f64, strength: f64) -> f64 {
+/// Cubic Bézier speed response applied to the step length (not per axis, so it
+/// never bends the direction). `(y1, y2)` are chosen once per stroke.
+fn bezier_response(value: f64, scale: f64, strength: f64, (y1, y2): (f64, f64)) -> f64 {
     if value == 0.0 || scale <= 0.0 || strength <= 0.0 {
         return value;
     }
     let sign = value.signum();
     let linear = (value.abs() / scale).min(1.0);
-    let (x1, y1, x2, y2): (f64, f64, f64, f64) = (0.25, 0.12, 0.75, 0.88);
-    let (mut low, mut high) = (0.0, 1.0);
+    let (x1, x2): (f64, f64) = (0.25, 0.75);
+    let (mut low, mut high): (f64, f64) = (0.0, 1.0);
     for _ in 0..16 {
         let t = (low + high) * 0.5;
         let u = 1.0 - t;
@@ -116,12 +133,71 @@ fn bezier_response(value: f64, scale: f64, strength: f64) -> f64 {
     sign * (linear * (1.0 - strength) + curved * strength) * scale
 }
 
+fn smoothstep(value: f64) -> f64 {
+    let t = value.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Shape of one movement stroke (from acquiring or re-acquiring a target until
+/// it settles), drawn once per stroke so strokes differ while each stays smooth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Stroke {
+    started_at: f64,
+    start_distance: f64,
+    /// Initial heading bend (radians); fades to 0 as the stroke closes in.
+    curve_rad: f64,
+    /// Time to reach full speed.
+    ramp_s: f64,
+    /// Scales the NCAF near-zone exponent: >1 brakes harder near the target.
+    decel: f64,
+    bezier: (f64, f64),
+    min_step: f64,
+}
+
+impl Stroke {
+    fn random(rng: &mut StdRng, start_distance: f64, now: f64) -> Self {
+        let bend = rng.random_range(0.04..=0.26);
+        Self {
+            started_at: now,
+            start_distance,
+            curve_rad: if rng.random::<bool>() { bend } else { -bend },
+            ramp_s: rng.random_range(0.035..=0.11),
+            decel: rng.random_range(0.8..=1.25),
+            bezier: (rng.random_range(0.06..=0.2), rng.random_range(0.8..=0.94)),
+            min_step: MIN_STEP_COUNTS * rng.random_range(0.75..=1.25),
+        }
+    }
+}
+
+/// Mean-reverting noise: changes smoothly between ticks and decays toward 0.
+#[derive(Clone, Copy, Debug, Default)]
+struct Drift(f64);
+
+impl Drift {
+    fn advance(&mut self, rng: &mut StdRng, dt: f64, sigma: f64, tau: f64) -> f64 {
+        let decay = (-dt.max(0.0) / tau).exp();
+        self.0 = self.0 * decay + sigma * (1.0 - decay * decay).sqrt() * gaussian(rng);
+        self.0
+    }
+}
+
+fn gaussian(rng: &mut StdRng) -> f64 {
+    let u1: f64 = rng.random_range(f64::EPSILON..1.0);
+    let u2: f64 = rng.random();
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
 pub struct MovementController {
     pub config: MovementConfig,
     last_error: Option<(f64, f64)>,
     last_seconds: Option<f64>,
     velocity: (f64, f64),
     residual: (f64, f64),
+    last_step: (f64, f64),
+    settled: bool,
+    stroke: Option<Stroke>,
+    lateral: Drift,
+    speed: Drift,
     rng: StdRng,
 }
 
@@ -134,20 +210,39 @@ impl MovementController {
         })
     }
     pub fn with_config(config: MovementConfig) -> Self {
+        Self::with_rng(config, StdRng::from_os_rng())
+    }
+    fn with_rng(config: MovementConfig, rng: StdRng) -> Self {
         Self {
             config,
             last_error: None,
             last_seconds: None,
             velocity: (0.0, 0.0),
             residual: (0.0, 0.0),
-            rng: StdRng::from_os_rng(),
+            last_step: (0.0, 0.0),
+            settled: false,
+            stroke: None,
+            lateral: Drift::default(),
+            speed: Drift::default(),
+            rng,
         }
     }
     pub fn reset(&mut self) {
         self.last_error = None;
         self.last_seconds = None;
         self.velocity = (0.0, 0.0);
+        self.settle();
+        self.settled = false;
+    }
+    /// Inside the dead zone: drop the stroke, the fractional residual and the
+    /// drift so nothing creeps out after the target is reached.
+    fn settle(&mut self) {
+        self.settled = true;
+        self.stroke = None;
         self.residual = (0.0, 0.0);
+        self.last_step = (0.0, 0.0);
+        self.lateral = Drift::default();
+        self.speed = Drift::default();
     }
     pub fn set_calibration(&mut self, sens: f64, dpi: f64) -> Result<(), &'static str> {
         if !(0.01..=10.0).contains(&sens) || !(100.0..=100_000.0).contains(&dpi) {
@@ -188,13 +283,35 @@ impl MovementController {
                     alpha * ((dy - previous.1) / elapsed) + (1.0 - alpha) * self.velocity.1;
             }
         }
+        let dt = self
+            .last_seconds
+            .map(|previous| now - previous)
+            .filter(|elapsed| *elapsed > 0.0)
+            .unwrap_or(DEFAULT_TICK_S);
         self.last_error = Some((dx, dy));
         self.last_seconds = Some(now);
         let (px, py) = (dx + pred_x, dy + pred_y);
         let distance = px.hypot(py);
-        if distance <= 1e-6 {
+        let threshold = if self.settled {
+            RESUME_RADIUS_PX
+        } else {
+            STOP_RADIUS_PX
+        };
+        if !distance.is_finite() || distance < threshold {
+            self.settle();
             return (0, 0);
         }
+        self.settled = false;
+        let stroke = match self.stroke {
+            Some(stroke) if distance <= stroke.start_distance * RESTROKE_GROWTH => stroke,
+            _ => {
+                let stroke = Stroke::random(&mut self.rng, distance, now);
+                self.stroke = Some(stroke);
+                stroke
+            }
+        };
+
+        let c = &self.config;
         let (mut mx, mut my) = image_to_mouse_scale(px, py, c.sens, c.dpi);
         mx *= c.x_speed;
         my *= c.y_speed;
@@ -202,39 +319,61 @@ impl MovementController {
             distance,
             c.snap_radius,
             c.near_radius,
-            c.alpha,
+            c.alpha * stroke.decel,
             c.snap_boost,
         )
         .clamp(c.min_speed_multiplier, c.max_speed_multiplier);
         mx *= factor;
         my *= factor;
         let magnitude = mx.hypot(my);
-        if c.max_step > 0.0 && magnitude > c.max_step {
-            mx *= c.max_step / magnitude;
-            my *= c.max_step / magnitude;
+        if magnitude <= 1e-12 {
+            return (0, 0);
         }
-        mx = mx.clamp(-c.clip_speed.abs(), c.clip_speed.abs());
-        my = my.clamp(-c.clip_speed.abs(), c.clip_speed.abs());
-        mx = bezier_response(mx, 50.0, BEZIER_STRENGTH);
-        my = bezier_response(my, 50.0, BEZIER_STRENGTH);
-        let (sum_x, sum_y) = (mx + self.residual.0, my + self.residual.1);
-        let (mut out_x, mut out_y) = (round_ties_away(sum_x), round_ties_away(sum_y));
+        let (ux, uy) = (mx / magnitude, my / magnitude);
+
+        // Variation (curve, drift) fades out approaching the target, so the
+        // final approach stays precise and does not jitter around it.
+        let spread = smoothstep((distance - RESUME_RADIUS_PX) / (c.near_radius - RESUME_RADIUS_PX));
+        let ramp = 0.2 + 0.8 * smoothstep((now - stroke.started_at) / stroke.ramp_s);
+        let speed_noise = 1.0
+            + spread
+                * self
+                    .speed
+                    .advance(&mut self.rng, dt, SPEED_SIGMA, SPEED_TAU_S);
+        let lateral = spread
+            * self
+                .lateral
+                .advance(&mut self.rng, dt, LATERAL_SIGMA, LATERAL_TAU_S);
+
+        let mut step = magnitude;
+        if c.max_step > 0.0 {
+            step = step.min(c.max_step);
+            step = bezier_response(step, c.max_step, BEZIER_STRENGTH, stroke.bezier);
+        }
+        step = (step * ramp * speed_noise).max(stroke.min_step);
+
+        // Bend the heading by the stroke's curve, fading as the gap closes, then
+        // add the correlated lateral drift along the perpendicular.
+        let progress = (1.0 - distance / stroke.start_distance).clamp(0.0, 1.0);
+        let (sin, cos) = (stroke.curve_rad * (1.0 - progress) * spread).sin_cos();
+        let (hx, hy) = (ux * cos - uy * sin, ux * sin + uy * cos);
+        let clip = c.clip_speed.abs();
+        let vx = (step * (hx - hy * lateral)).clamp(-clip, clip);
+        let vy = (step * (hy + hx * lateral)).clamp(-clip, clip);
+
+        // When an axis reverses direction its leftover fraction belongs to the
+        // old direction; drop it. (A negative residual after rounding up is
+        // normal and must be kept, or the average step would drift upward.)
+        if vx * self.last_step.0 < 0.0 {
+            self.residual.0 = 0.0;
+        }
+        if vy * self.last_step.1 < 0.0 {
+            self.residual.1 = 0.0;
+        }
+        self.last_step = (vx, vy);
+        let (sum_x, sum_y) = (vx + self.residual.0, vy + self.residual.1);
+        let (out_x, out_y) = (round_ties_away(sum_x), round_ties_away(sum_y));
         self.residual = (sum_x - out_x as f64, sum_y - out_y as f64);
-        if out_x == 0 && out_y == 0 && distance >= 3.0 {
-            if px.abs() >= py.abs() {
-                out_x = if px > 0.0 { 1 } else { -1 };
-            } else {
-                out_y = if py > 0.0 { 1 } else { -1 };
-            }
-        }
-        if c.micro_corrections > 0 && (out_x != 0 || out_y != 0) && self.rng.random::<f64>() < 0.1 {
-            out_x += self
-                .rng
-                .random_range(-c.micro_corrections..=c.micro_corrections);
-            out_y += self
-                .rng
-                .random_range(-c.micro_corrections..=c.micro_corrections);
-        }
         (out_x, out_y)
     }
 }
@@ -680,5 +819,128 @@ mod tests {
             crop_target_error((-1.9, -1.9), (0, 0), (0, 0), (0.0, 0.0)),
             (-1.0, -1.0)
         );
+    }
+
+    fn seeded(seed: u64) -> MovementController {
+        MovementController::with_rng(MovementConfig::default(), StdRng::seed_from_u64(seed))
+    }
+
+    /// Feeds a constant crop error every 4 ms and returns each tick's output.
+    fn run(
+        controller: &mut MovementController,
+        error: (f64, f64),
+        ticks: usize,
+    ) -> Vec<(i64, i64)> {
+        (0..ticks)
+            .map(|tick| controller.step(error.0, error.1, tick as f64 * DEFAULT_TICK_S))
+            .collect()
+    }
+
+    #[test]
+    fn dead_zone_stops_inside_and_resumes_only_past_the_hysteresis_radius() {
+        let mut controller = seeded(1);
+        // Seconds apart, so velocity prediction stays negligible.
+        controller.step(3.0, 0.0, 0.0);
+        assert!(!controller.settled, "3 px is outside the 2 px stop radius");
+        assert_eq!(controller.step(1.0, 0.0, 1.0), (0, 0));
+        assert!(controller.settled);
+        assert_eq!(controller.residual, (0.0, 0.0));
+        assert_eq!(
+            controller.step(3.0, 0.0, 2.0),
+            (0, 0),
+            "below the 4 px resume radius"
+        );
+        assert!(controller.settled);
+        controller.step(5.0, 0.0, 3.0);
+        assert!(!controller.settled);
+    }
+
+    #[test]
+    fn small_errors_accumulate_a_diagonal_instead_of_a_forced_axis_staircase() {
+        let mut controller = seeded(2);
+        let outputs = run(&mut controller, (4.4, 2.2), 400);
+        // Not one count every tick: the sub-count step accumulates in the residual.
+        assert!(outputs.contains(&(0, 0)));
+        assert!(outputs.iter().all(|(x, y)| x.abs() <= 1 && y.abs() <= 1));
+        // Both axes move in the error's 2:1 proportion (the old code moved X only).
+        let (sum_x, sum_y) = outputs
+            .iter()
+            .fold((0, 0), |(sx, sy), (x, y)| (sx + x, sy + y));
+        assert!(sum_y > 0, "{sum_x} {sum_y}");
+        let ratio = sum_x as f64 / sum_y as f64;
+        assert!((1.8..=2.2).contains(&ratio), "{sum_x} {sum_y}");
+    }
+
+    #[test]
+    fn stroke_shape_is_drawn_once_per_stroke_and_differs_between_strokes() {
+        let mut controller = seeded(3);
+        controller.step(300.0, 0.0, 0.0);
+        let first = controller.stroke.expect("stroke");
+        for tick in 1..20 {
+            controller.step(300.0 - tick as f64 * 5.0, 0.0, tick as f64 * DEFAULT_TICK_S);
+            assert_eq!(controller.stroke, Some(first), "kept for the whole stroke");
+        }
+        controller.reset();
+        controller.step(300.0, 0.0, 1.0);
+        assert_ne!(
+            controller.stroke,
+            Some(first),
+            "a new stroke gets a new shape"
+        );
+
+        // Same error sequence, different seeds: different paths; same seed: identical.
+        let a = run(&mut seeded(10), (300.0, 0.0), 60);
+        let b = run(&mut seeded(11), (300.0, 0.0), 60);
+        let a_again = run(&mut seeded(10), (300.0, 0.0), 60);
+        assert_ne!(a, b);
+        assert_eq!(a, a_again);
+    }
+
+    #[test]
+    fn a_far_target_curves_but_variation_fades_near_the_target() {
+        // Far away, the curve and lateral drift add a perpendicular (Y) component.
+        let curved = (0..8).any(|seed| {
+            run(&mut seeded(seed), (300.0, 0.0), 40)
+                .iter()
+                .any(|(_, y)| *y != 0)
+        });
+        assert!(curved);
+        // Just outside the dead zone the step goes straight at the target.
+        for seed in 0..8 {
+            assert!(run(&mut seeded(seed), (4.5, 0.0), 300)
+                .iter()
+                .all(|(x, y)| *y == 0 && *x >= 0));
+        }
+    }
+
+    #[test]
+    fn each_stroke_accelerates_from_rest() {
+        let outputs = run(&mut seeded(4), (300.0, 0.0), 60);
+        let first = outputs[0].0.abs();
+        let settled_speed = outputs[50].0.abs();
+        assert!(first <= 1, "{outputs:?}");
+        assert!(settled_speed >= 3, "{outputs:?}");
+    }
+
+    #[test]
+    fn drift_is_time_correlated_and_mean_reverting() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut drift = Drift::default();
+        let samples: Vec<f64> = (0..5000)
+            .map(|_| drift.advance(&mut rng, DEFAULT_TICK_S, 1.0, 0.08))
+            .collect();
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        assert!(mean.abs() < 0.2, "{mean}");
+        // Neighbouring ticks are close (smooth), unlike independent noise.
+        let tick_change = samples
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .sum::<f64>()
+            / (samples.len() - 1) as f64;
+        assert!(tick_change < 0.4, "{tick_change}");
+        // Without new noise it relaxes back to 0.
+        let mut quiet = Drift(1.0);
+        quiet.advance(&mut rng, 1.0, 0.0, 0.08);
+        assert!(quiet.0.abs() < 1e-3);
     }
 }
