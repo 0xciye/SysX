@@ -12,3 +12,4 @@ src-tauri/gen/
 work/
 dist-package/
 target*/
+/scripts/__pycache__/
