@@ -77,7 +77,7 @@ pub struct ReceiverService {
     session_id: String,
     /// Latest Medius/Ferrum status reported by the native host
     /// (`device_status` command); forwarded to the monitor page in `state`.
-    device: Mutex<Value>,
+    device: Arc<Mutex<Value>>,
     /// Open `role=monitor` WebSocket clients. The native host exits when the
     /// monitor window has been closed.
     monitor_clients: AtomicUsize,
@@ -162,14 +162,21 @@ impl ReceiverService {
                 println!("{line}");
             }
         })));
+        let device = Arc::new(Mutex::new(missing_device()));
         let ticker_settings = Arc::clone(&settings);
+        let ticker_device = Arc::clone(&device);
         let ticker_batcher = Arc::clone(&movement_batcher);
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
             f64::from(app.dpi),
             Arc::new(move || {
                 let settings = ticker_settings.lock().ok()?.clone();
+                let trigger_held = ticker_device
+                    .lock()
+                    .ok()
+                    .is_some_and(|device| trigger_held(&device, &settings.trigger_button));
                 Some(MovementRuntimeSettings {
+                    trigger_held,
                     sens: settings.sens,
                     dpi: f64::from(settings.dpi),
                     offset_x: settings.offset_x,
@@ -190,14 +197,17 @@ impl ReceiverService {
                 .result
                 .smoothed_target_xy
                 .or(processed.result.target_xy);
+            let point = |point: [f32; 2]| (f64::from(point[0]), f64::from(point[1]));
             callback_ticker.update(MovementTargetSample {
                 frame_id: processed.frame.frame_id,
-                target: target.map(|point| (f64::from(point[0]), f64::from(point[1]))),
+                target: target.map(point),
+                raw_target: processed.result.target_xy.map(point),
                 crop_origin: (processed.crop_x, processed.crop_y),
                 processed_size: (
                     processed.result.processed_width,
                     processed.result.processed_height,
                 ),
+                received_s: 0.0,
             });
         });
         let pipeline = Arc::new(LatestFramePipeline::new(
@@ -240,7 +250,7 @@ impl ReceiverService {
             stop: Arc::new(AtomicBool::new(false)),
             reader: Mutex::new(None),
             session_id,
-            device: Mutex::new(missing_device()),
+            device,
             monitor_clients: AtomicUsize::new(0),
             preview_rx,
         });
@@ -1019,6 +1029,18 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
 /// Same one-second window that `state()` uses for `streaming` vs `waiting`.
 fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(published_ns) < 1_000_000_000
+}
+
+/// Whether the device status reports the configured trigger button as held.
+fn trigger_held(device: &Value, trigger_button: &str) -> bool {
+    let index = match trigger_button {
+        "right" => 1,
+        "middle" => 2,
+        "m4" => 3,
+        "m5" => 4,
+        _ => return false,
+    };
+    device["state"] == "connected" && device["buttons"][index] == true
 }
 
 fn missing_device() -> Value {
