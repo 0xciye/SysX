@@ -1,0 +1,33 @@
+{
+  "windows_run": "https://github.com/0xciye/SysX/actions/runs/38888803711",
+  "build_commit": "77e55d30c583ac2fea0257d73340fd526a9926b1",
+  "tests": {
+    "backend_passed": 89,
+    "backend_ignored": 4,
+    "ui_passed": 11,
+    "host_passed": 39
+  },
+  "windows_udp_smoke": "PASS",
+  "windows_application_lifecycle_smoke": "PASS",
+  "host_pe_dll_characteristics": "0xc160",
+  "host_pe_protections": {
+    "high_entropy_aslr": true,
+    "aslr": true,
+    "nx_dep": true,
+    "control_flow_guard": true
+  },
+  "vmprotect_applied": false,
+  "obs_destination": "192.168.88.59:4200",
+  "physical_medius_and_real_lan_validated": false,
+  "sha256": {
+    "SysX/SysX.exe": "ef9e29adbf2a6ab28527705aefd75f74c8af75206ed61d43ae852d55d860404b",
+    "SysX/HUONG-DAN.txt": "04c4d0fff6492dce0b582cde9ad93a1b9b705868c4c53d3a9dd3e5a5ef8008ae",
+    "SysX/Mo-cong-UDP-4200.bat": "8d2e83d6b0b549522469ee90e7bd2eaef9cc265d5336d7e23422897491f831bd",
+    "SysX/BUILD-INFO.txt": "503ab8534827d7dcb181c1dcf2d5d5e8413fc89ed252d24e42614c28937539d5",
+    "OBS-plugin/sysx-canvas-sender.dll": "d5a8fa6386af5a1ad259d43bdc0b0ec89b9aa7a619c3d542ae05ec31ac7becc4",
+    "HUONG-DAN-LAN.txt": "08531b7f6f8065402eb52a5af435a8b34533ba063a04cbec000a4a1e14112b80"
+  },
+  "zip_sha256": "dee282662322959d0e570c1decffa0405add2514667b869419f8425d95b8e33d",
+  "zip_size_bytes": 2345753,
+  "exe_size_bytes": 4616192
+}
