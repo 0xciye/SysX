@@ -1,0 +1,63 @@
+name: Build OBS sender for 192.168.88.59
+on:
+  push:
+    branches: [build/windows-portable-eec8692]
+    paths:
+      - 'obs-plugin/**'
+      - 'scripts/build-obs-plugin.ps1'
+      - 'scripts/check-obs-sender.py'
+      - '.github/workflows/obs-lan-build.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Prepare OBS headers and static JPEG SDK
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force work/obs-source, work/obs-config, work/downloads | Out-Null
+          gh release download 32.2.2 --repo obsproject/obs-studio --pattern OBS-Studio-32.2.2-Sources.tar.gz --dir work/downloads
+          if ($LASTEXITCODE -ne 0) { throw 'OBS source download failed' }
+          tar -xzf work/downloads/OBS-Studio-32.2.2-Sources.tar.gz -C work/obs-source
+          if ($LASTEXITCODE -ne 0) { throw 'OBS source extraction failed' }
+          "#pragma once`n#define OBS_RELEASE_CANDIDATE 0`n#define OBS_BETA 0" | Set-Content work/obs-config/obsconfig.h -Encoding ascii
+          gh release download 3.2.0 --repo libjpeg-turbo/libjpeg-turbo --pattern libjpeg-turbo-3.2.0-vc-x64.exe --dir work/downloads
+          if ($LASTEXITCODE -ne 0) { throw 'JPEG SDK download failed' }
+          $installer = Start-Process (Resolve-Path work/downloads/libjpeg-turbo-3.2.0-vc-x64.exe) -ArgumentList '/S' -Wait -PassThru
+          if ($installer.ExitCode -ne 0) { throw 'JPEG SDK install failed' }
+      - name: Compile DLL and self-test with static dependencies
+        shell: pwsh
+        run: |
+          $headers = (Get-ChildItem work/obs-source -Recurse -Filter obs-module.h | Select-Object -First 1).DirectoryName
+          ./scripts/build-obs-plugin.ps1 -ObsInclude "$headers;$PWD/work/obs-config"
+          cmake --build work/obs-build-release --target sysx-sender-selftest
+          if ($LASTEXITCODE -ne 0) { throw 'Sender self-test build failed' }
+      - name: Check exports, packets, crop reply and Windows DLL imports
+        shell: pwsh
+        run: |
+          python scripts/check-obs-sender.py dist-package/OBS-plugin/sysx-canvas-sender.dll work/obs-build-release/sysx-sender-selftest.exe | Tee-Object dist-package/OBS-plugin/validation.json
+          if ($LASTEXITCODE -ne 0) { throw 'Sender smoke failed' }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0) { throw 'Visual Studio lookup failed' }
+          $dumpbin = Get-ChildItem "$vs/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" | Select-Object -Last 1
+          $imports = & $dumpbin.FullName /DEPENDENTS dist-package/OBS-plugin/sysx-canvas-sender.dll
+          if ($LASTEXITCODE -ne 0) { throw 'DLL import audit failed' }
+          $imports | Set-Content dist-package/OBS-plugin/imports.txt
+          $dependencies = @($imports | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() })
+          if (-not $dependencies.Count) { throw 'No DLL imports found' }
+          $unexpected = @($dependencies | Where-Object { $_ -notin @('KERNEL32.dll', 'WS2_32.dll') })
+          if ($unexpected.Count) { throw "Unexpected dependency: $unexpected" }
+      - name: Save DLL in a draft release
+        shell: pwsh
+        run: |
+          $dll = Get-Item dist-package/OBS-plugin/sysx-canvas-sender.dll
+          "$((Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant())  $($dll.Name)" | Set-Content "$($dll.FullName).sha256" -Encoding ascii
+          gh release create "obs-lan-$env:GITHUB_RUN_ID" 'dist-package/OBS-plugin/sysx-canvas-sender.dll' 'dist-package/OBS-plugin/sysx-canvas-sender.dll.sha256' 'dist-package/OBS-plugin/validation.json' 'dist-package/OBS-plugin/imports.txt' --draft --prerelease --target $env:GITHUB_SHA --title 'SysX OBS sender 192.168.88.59:4200' --notes 'Windows x64. OBS 32.2.2 headers. Static JPEG and CRT. Headless loopback validation only; real OBS graphics and LAN delivery are not validated.'
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }

@@ -1,9 +1,8 @@
 param(
     # Launches SysX.exe (opens the monitor and config windows). Off by default.
     [switch] $AppSmoke,
-    # Reuse a backend that has already been protected with VMProtect. The
-    # protected backend is embedded into the final SysX.exe and is not copied
-    # beside it in the release package.
+    # Optionally embed an existing backend. No third-party protection tool
+    # is run or required by this build.
     [switch] $UseExistingBackend,
     [string] $BackendPath
 )
@@ -55,16 +54,16 @@ try {
     # 2. Backend sidecar, embedded into SysX.exe.
     if ($UseExistingBackend) {
         if ($BackendPath) {
-            $protected = (Resolve-Path -LiteralPath $BackendPath -ErrorAction Stop).Path
+            $existing = (Resolve-Path -LiteralPath $BackendPath -ErrorAction Stop).Path
             $destination = [IO.Path]::GetFullPath($sidecar)
-            if ([IO.Path]::GetFullPath($protected) -ne $destination) {
-                Copy-Item -LiteralPath $protected -Destination $sidecar -Force
+            if ([IO.Path]::GetFullPath($existing) -ne $destination) {
+                Copy-Item -LiteralPath $existing -Destination $sidecar -Force
             }
         }
         if (-not (Test-Path -LiteralPath $sidecar)) {
-            throw "-UseExistingBackend requires a protected backend at $sidecar or -BackendPath."
+            throw "-UseExistingBackend requires a backend at $sidecar or -BackendPath."
         }
-        Write-Host "Using pre-protected backend: $sidecar"
+        Write-Host "Using existing backend: $sidecar"
     } else {
         # Pixel Seek does not use ONNX Runtime. Keep the retained development
         # adapter dynamically loaded so the portable build needs no ORT SDK.

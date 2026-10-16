@@ -48,7 +48,7 @@ constexpr int kSendBufferBytes = 8 * 1024 * 1024;
 
 // ---- Sender configuration: edit these and rebuild the DLL. ----
 // SysX receiver IPv4 address (or hostname) and UDP port.
-constexpr char kReceiverHost[] = "127.0.0.1";
+constexpr char kReceiverHost[] = "192.168.88.59";
 constexpr uint16_t kReceiverPort = 4200;
 // JPEG quality 1-100.
 constexpr int kJpegQuality = 80;
@@ -544,6 +544,7 @@ void obs_module_unload(void) {
 // against `receiver-backend udp-listen --host 127.0.0.1 --port <port> --count 3`.
 int main(int argc, char **argv) {
   Config config;
+  config.host = "127.0.0.1"; // Self-test never sends to the production LAN host.
   config.port = static_cast<uint16_t>(argc > 1 ? std::atoi(argv[1]) : 4299);
   config.default_crop = 320; // the receiver must replace this with its 640
   if (!sender.start(config)) return 1;

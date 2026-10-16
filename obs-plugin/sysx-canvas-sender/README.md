@@ -14,7 +14,7 @@ The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <r
 Configuration is compile-time (no ini file). Edit the constants at the top of `sysx_canvas_sender.cpp` and rebuild:
 
 ```cpp
-constexpr char kReceiverHost[] = "127.0.0.1";  // SysX receiver IPv4 address or hostname
+constexpr char kReceiverHost[] = "192.168.88.59";  // SysX receiver IPv4 address or hostname
 constexpr uint16_t kReceiverPort = 4200;        // receiver UDP port
 constexpr int kJpegQuality = 80;                // 1-100
 constexpr uint32_t kMaxFps = 0;                 // 0 = every OBS render frame
@@ -26,16 +26,15 @@ The plugin writes nothing to the OBS log (by request). OBS itself only logs `Loa
 
 ## Install
 
-Copy `sysx-canvas-sender.dll` into `C:\Program Files\obs-studio\obs-plugins\64bit\` and restart OBS. Nothing else is required: libjpeg-turbo and the Visual C++ runtime are linked statically, so the DLL imports only `KERNEL32.dll` and `WS2_32.dll` (both part of Windows) and resolves libobs functions from the running `obs.dll`. No `jpeg62.dll`, VC++ redistributable, or config file is needed; the destination is compiled in (default 127.0.0.1:4200). Remove older SysX sender DLLs (for example `sysx-canvas-sender-gpu-localhost.dll`) so two senders do not stream at once — the protocol supports one sender per receiver.
+Copy `sysx-canvas-sender.dll` into `C:\Program Files\obs-studio\obs-plugins\64bit\` and restart OBS. Nothing else is required: libjpeg-turbo and the Visual C++ runtime are linked statically, so the DLL imports only `KERNEL32.dll` and `WS2_32.dll` (both part of Windows) and resolves libobs functions from the running `obs.dll`. No `jpeg62.dll`, VC++ redistributable, or config file is needed; the destination is compiled in (default 192.168.88.59:4200). Remove older SysX sender DLLs (for example `sysx-canvas-sender-gpu-localhost.dll`) so two senders do not stream at once — the protocol supports one sender per receiver.
 
 ## Build
 
-Requires Visual Studio 2022 Build Tools, the libobs headers from the matching OBS source release (plus a directory containing `obsconfig.h`), an `obs.lib` import library, and libjpeg-turbo. libobs graphics functions are resolved from the loaded `obs.dll` at runtime, so a minimal import library is enough.
+Requires Visual Studio 2022 Build Tools, the libobs headers from the matching OBS source release (plus a directory containing `obsconfig.h`), and libjpeg-turbo. libobs graphics functions are resolved from the loaded `obs.dll` at runtime, so no OBS import library is required.
 
 ```powershell
 cmake -S obs-plugin/sysx-canvas-sender -B work/obs-build-release -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release `
   -DOBS_INCLUDE_DIR="work/obs-source/obs-studio-32.2.2/libobs;work/obs-config" `
-  -DOBS_LIB_DIR="work/obs-runtime/bin/64bit" `
   -DJPEG_INCLUDE_DIR="C:/libjpeg-turbo64/include" `
   -DJPEG_LIBRARY="C:/libjpeg-turbo64/lib/jpeg-static.lib"
 cmake --build work/obs-build-release

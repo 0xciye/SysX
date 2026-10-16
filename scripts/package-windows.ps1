@@ -1,16 +1,10 @@
 param(
     # Reuse the existing build output instead of rebuilding first.
     [switch] $SkipBuild,
-    # Raw packages are for local smoke testing only. A distributable package
-    # must point at the host after the final VMProtect pass.
-    [switch] $AllowUnprotected,
-    # Explicit acknowledgement that -ExecutablePath is the final VMProtected
-    # host. The script cannot prove a third-party protector was applied.
-    [switch] $VmProtected,
     # Path to WinRAR's Rar.exe; found automatically in the usual install folders.
     [string] $RarPath,
-    # Optional final executable, normally the host after the second VMProtect
-    # pass. When supplied, this file is copied into the package as SysX.exe.
+    # Optional existing executable. VMProtect is a separate user-managed step.
+    # When supplied, this file is copied into the package as SysX.exe.
     [string] $ExecutablePath
 )
 # Builds SysX and packs what another Windows PC needs to run it into one
@@ -23,12 +17,6 @@ $root = Split-Path -Parent $PSScriptRoot
 
 if ($ExecutablePath -and -not $SkipBuild) {
     throw "-ExecutablePath is for an existing final executable; pass -SkipBuild with it."
-}
-if (-not $ExecutablePath -and -not $AllowUnprotected) {
-    throw "Final packaging requires -ExecutablePath pointing to the VMProtected host. Use -AllowUnprotected only for a local raw smoke package."
-}
-if ($ExecutablePath -and -not $VmProtected -and -not $AllowUnprotected) {
-    throw "Pass -VmProtected when packaging the final host, or use -AllowUnprotected only for a local raw smoke package."
 }
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "build-windows.ps1")

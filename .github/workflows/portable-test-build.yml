@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ !contains(github.event.head_commit.message, '[obs-only]') }}
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -41,7 +42,7 @@ jobs:
       - name: Package raw test build (VMProtect not applied)
         shell: pwsh
         run: |
-          ./scripts/package-windows.ps1 -SkipBuild -AllowUnprotected
+          ./scripts/package-windows.ps1 -SkipBuild
           $note = @'
           SysX Windows x64 test build. Based on application source eec8692fee0af7373ddf77dbf8435ba89bb8aec1, with backend build/tests using ort/load-dynamic.
           Built-in release hardening and runtime integrity are enabled. VMProtect has NOT been applied.

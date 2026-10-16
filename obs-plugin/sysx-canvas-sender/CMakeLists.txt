@@ -8,13 +8,11 @@ if(NOT WIN32)
 endif()
 
 set(OBS_INCLUDE_DIR "" CACHE PATH "libobs include directory (obs-studio/libobs plus a directory with obsconfig.h)")
-set(OBS_LIB_DIR "" CACHE PATH "Directory containing obs.lib")
 set(JPEG_INCLUDE_DIR "" CACHE PATH "libjpeg-turbo include directory")
 set(JPEG_LIBRARY "" CACHE FILEPATH "libjpeg-turbo library; prefer jpeg-static.lib so OBS needs no jpeg62.dll")
 
 find_path(OBS_INCLUDE_DIR obs-module.h REQUIRED)
 find_path(JPEG_INCLUDE_DIR jpeglib.h REQUIRED)
-find_library(OBS_LIBRARY NAMES obs libobs PATHS "${OBS_LIB_DIR}" REQUIRED)
 if(NOT JPEG_LIBRARY)
   find_library(JPEG_LIBRARY NAMES jpeg-static jpeg REQUIRED)
 endif()
@@ -25,7 +23,7 @@ target_compile_features(sysx-canvas-sender PRIVATE cxx_std_17)
 # setjmp in the libjpeg error path, which holds no C++ objects.
 target_compile_options(sysx-canvas-sender PRIVATE /W4 /EHsc /wd4201 /wd4324 /wd4611)
 target_include_directories(sysx-canvas-sender PRIVATE ${OBS_INCLUDE_DIR} "${JPEG_INCLUDE_DIR}")
-target_link_libraries(sysx-canvas-sender PRIVATE "${OBS_LIBRARY}" "${JPEG_LIBRARY}" ws2_32)
+target_link_libraries(sysx-canvas-sender PRIVATE "${JPEG_LIBRARY}" ws2_32)
 target_compile_definitions(sysx-canvas-sender PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 set_target_properties(sysx-canvas-sender PROPERTIES PREFIX "" SUFFIX ".dll" OUTPUT_NAME "sysx-canvas-sender")
 
