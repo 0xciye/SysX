@@ -149,3 +149,7 @@ The Windows runner passed backend 89/4 ignored, UI 11 and host 39 tests, UDP fix
 - Diagnostics are shared in `native-shared/diagnostics.rs`: `%LOCALAPPDATA%\SysX\logs` for text/backtrace/backend stderr and `%LOCALAPPDATA%\SysX\crashes` for best-effort Windows minidumps. Do not add logging/dump generation to hot loops or log IPC tokens/arguments/settings wholesale. OBS keeps its own crash reports under `%APPDATA%\obs-studio\crashes`.
 - The DLL workflow accepts a validated canonical IPv4 build input, mapped to CMake `SYSX_RECEIVER_IP`, and uploads only the DLL. Keep the sender limited to image transmission: no PDB, custom diagnostics, log writes or security layer. Runtime INI/config controls remain absent.
 - The user explicitly requested no rebuild for this change. YAML/TOML/PowerShell/Python checks are separate from Windows compilation/runtime validation; the next manual workflow run performs the actual build, tests, symbol checks and smoke checks.
+
+### Receiver bootstrap validation
+
+- Keep Trunk `inject_scripts = true`: the static boot placeholder alone is not the Rust UI. After Wasm stripping, run `scripts/finalize-ui-bundle.ps1` to reject missing bootstrap/assets and refresh preload SRI against final bytes before embedding. Windows app smoke must observe `monitor_clients > 0` through a separate config-role probe, not merely a visible window.

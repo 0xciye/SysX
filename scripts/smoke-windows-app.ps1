@@ -126,8 +126,41 @@ try {
     if ($monitor.Count -eq 0) {
         throw "SysX did not open its monitor app window within 30 seconds."
     }
-    # Let the page connect before closing it.
-    Start-Sleep -Seconds 5
+    # A visible window alone can be the static HTML placeholder. Verify a
+    # real WASM monitor connected; this probe uses role=config, never monitor.
+    $instance = Get-Content (Join-Path $env:LOCALAPPDATA 'SysX\instance.json') -Raw | ConvertFrom-Json
+    $session = Invoke-RestMethod -Uri "http://127.0.0.1:$($instance.config_port)/api/session" -TimeoutSec 5
+    $probe = [System.Net.WebSockets.ClientWebSocket]::new()
+    $cancel = [System.Threading.CancellationTokenSource]::new(30000)
+    $connectedMonitor = $false
+    try {
+        $uri = [Uri]"ws://127.0.0.1:$($session.port)/receiver?role=config&token=$([Uri]::EscapeDataString($session.token))"
+        $probe.ConnectAsync($uri, $cancel.Token).GetAwaiter().GetResult()
+        $buffer = [byte[]]::new(65536)
+        while (-not $cancel.IsCancellationRequested -and -not $connectedMonitor) {
+            $message = [IO.MemoryStream]::new()
+            try {
+                do {
+                    $part = $probe.ReceiveAsync([ArraySegment[byte]]::new($buffer), $cancel.Token).GetAwaiter().GetResult()
+                    if ($part.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
+                        throw 'Backend disconnected before the WASM monitor became ready.'
+                    }
+                    $message.Write($buffer, 0, $part.Count)
+                    if ($message.Length -gt 262144) { throw 'Oversized smoke state message.' }
+                } while (-not $part.EndOfMessage)
+                if ($part.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Text) {
+                    $state = [Text.Encoding]::UTF8.GetString($message.ToArray()) | ConvertFrom-Json
+                    $connectedMonitor = $state.event -eq 'state' -and $state.monitor_clients -gt 0
+                }
+            } finally { $message.Dispose() }
+        }
+    } finally {
+        $probe.Abort()
+        $probe.Dispose()
+        $cancel.Dispose()
+    }
+    if (-not $connectedMonitor) { throw 'The WASM monitor never connected; static HTML is not a running UI.' }
+    Write-Host 'The WASM monitor connected to the backend.'
     foreach ($window in $monitor) {
         if (-not [SysXSmokeWindows]::Close($window.Handle)) {
             throw "Could not send WM_CLOSE to the SysX monitor."
@@ -151,7 +184,7 @@ try {
         throw "SysX exited but left its bundled backend running."
     }
 
-    Write-Host "Windows desktop smoke test passed: app launch, backend startup, monitor window, and shutdown on close."
+    Write-Host "Windows desktop smoke test passed: app launch, backend startup, WASM monitor connection, and shutdown on close."
 }
 finally {
     foreach ($window in $monitor) {
