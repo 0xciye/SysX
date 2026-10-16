@@ -51,8 +51,6 @@ jobs:
         run: |
           python scripts/check-obs-sender.py dist-package/OBS-plugin/sysx-canvas-sender.dll work/obs-build-release/sysx-sender-selftest.exe $env:RECEIVER_IP | Tee-Object dist-package/OBS-plugin/validation.json
           if ($LASTEXITCODE -ne 0) { throw 'Sender smoke failed' }
-          python scripts/check-windows-symbols.py dist-package/OBS-plugin/sysx-canvas-sender.dll dist-symbols/obs/sysx-canvas-sender.pdb
-          if ($LASTEXITCODE -ne 0) { throw 'OBS PDB mismatch' }
           $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if ($LASTEXITCODE -ne 0) { throw 'Visual Studio lookup failed' }
@@ -68,11 +66,8 @@ jobs:
         shell: pwsh
         run: |
           $dll = Get-Item dist-package/OBS-plugin/sysx-canvas-sender.dll
-          "$((Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant())  $($dll.Name)" | Set-Content "$($dll.FullName).sha256" -Encoding ascii
-          Compress-Archive -Path dist-symbols/obs -DestinationPath dist-package/OBS-plugin/OBS-symbols.zip -Force
           "Receiver: $($env:RECEIVER_IP):4200" | Add-Content $env:GITHUB_STEP_SUMMARY
-          Get-ChildItem dist-package/OBS-plugin/sysx-canvas-sender.dll, dist-package/OBS-plugin/OBS-symbols.zip | ForEach-Object {
-            "$($_.Name): $($_.Length) bytes" | Add-Content $env:GITHUB_STEP_SUMMARY
-          }
-          gh release create "obs-lan-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" 'dist-package/OBS-plugin/sysx-canvas-sender.dll' 'dist-package/OBS-plugin/sysx-canvas-sender.dll.sha256' 'dist-package/OBS-plugin/OBS-symbols.zip' 'dist-package/OBS-plugin/validation.json' 'dist-package/OBS-plugin/imports.txt' --draft --prerelease --target $env:GITHUB_SHA --title "SysX OBS sender $($env:RECEIVER_IP):4200" --notes 'Windows x64. Separate PDB archive. OBS 32.2.2 headers. Static JPEG and CRT. Headless loopback validation only; real OBS graphics and LAN delivery are not validated.'
+          "$($dll.Name): $($dll.Length) bytes" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "SHA256: $((Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content $env:GITHUB_STEP_SUMMARY
+          gh release create "obs-lan-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" 'dist-package/OBS-plugin/sysx-canvas-sender.dll' --draft --prerelease --target $env:GITHUB_SHA --title "SysX OBS sender $($env:RECEIVER_IP):4200" --notes 'Windows x64. DLL only; image sender without PDB or custom crash diagnostics. OBS 32.2.2 headers. Static JPEG and CRT. Headless loopback validation only; real OBS graphics and LAN delivery are not validated.'
           if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
