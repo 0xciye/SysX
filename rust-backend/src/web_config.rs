@@ -111,12 +111,19 @@ async fn put_settings(
 ) -> Result<Json<Value>, ApiError> {
     verify_local(&headers, state.config_port, true)?;
     let bytes = collect_limited(body, MAX_SETTINGS_BYTES).await?;
+    let path = state.data_dir.join("app-settings.json");
     let mut settings: crate::config::AppSettings =
         serde_json::from_slice(&bytes).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    // Older/config clients may not know about profiles. Keep the existing
+    // slots in that case instead of replacing the other two profiles.
+    if settings.profiles.is_empty() {
+        let existing = crate::config::load_settings(&path);
+        settings.profiles = existing.profiles;
+    }
     settings
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    crate::config::save_settings(state.data_dir.join("app-settings.json"), &settings)
+    crate::config::save_settings(path, &settings)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(json!({ "saved": true })))
 }

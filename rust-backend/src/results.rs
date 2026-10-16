@@ -35,6 +35,9 @@ pub struct DetectionResult {
     pub target_xy: Option<[f32; 2]>,
     #[serde(default)]
     pub smoothed_target_xy: Option<[f32; 2]>,
+    /// Auto's presence gate: any active-color pixel inside Auto FOV.
+    #[serde(default)]
+    pub auto_target_valid: bool,
 }
 
 impl DetectionResult {

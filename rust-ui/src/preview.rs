@@ -24,6 +24,7 @@ pub fn PreviewCanvas(
     target_point: RwSignal<Option<[f32; 2]>>,
     detection_color: RwSignal<String>,
     fov_degrees: RwSignal<u16>,
+    fov_color: RwSignal<String>,
 ) -> impl IntoView {
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     // One decode at a time: frames arriving meanwhile only mark the canvas
@@ -50,6 +51,7 @@ pub fn PreviewCanvas(
                         target_point.get_untracked(),
                         &detection_color.get_untracked(),
                         fov_degrees.get_untracked(),
+                        &fov_color.get_untracked(),
                     )
                     .await;
                 }
@@ -70,6 +72,7 @@ pub fn PreviewCanvas(
             let _ = target_point.get();
             let _ = detection_color.get();
             let _ = fov_degrees.get();
+            let _ = fov_color.get();
             draw();
         }
     });
@@ -91,6 +94,7 @@ async fn render(
     target: Option<[f32; 2]>,
     color: &str,
     fov: u16,
+    fov_color: &str,
 ) {
     let Some(current) = frame else {
         draw_empty(canvas);
@@ -115,6 +119,7 @@ async fn render(
         target,
         color,
         fov,
+        fov_color,
     );
     image.close();
 }
@@ -162,6 +167,7 @@ fn draw_image(
     target: Option<[f32; 2]>,
     detection_color: &str,
     fov_degrees: u16,
+    fov_color: &str,
 ) {
     let Some((context, width, height, _)) = context(canvas) else {
         return;
@@ -221,7 +227,9 @@ fn draw_image(
                 0.0,
                 std::f64::consts::TAU,
             );
-            context.set_stroke_style_str("rgba(67,207,160,.8)");
+            let ring_color =
+                color_with_alpha(fov_color, 0.8).unwrap_or_else(|| "rgba(67,207,160,.8)".into());
+            context.set_stroke_style_str(&ring_color);
             context.set_line_width(1.0);
             context.stroke();
         }

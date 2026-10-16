@@ -1,6 +1,6 @@
 # Development
 
-## Current milestone status (2026-10-15)
+## Current milestone status (2026-10-16)
 
 The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The receiver window is the Rust WASM monitor page (`/monitor.html`) served by the backend and opened by the native host as a chromeless Edge app window; the separate config page is the same bundle at `/config.html` in the default browser. The `eframe/egui` window was removed. Windows visual review and physical-device validation remain outstanding.
 
@@ -33,18 +33,18 @@ References:
 ### Desktop frontend
 
 - Keep the native monitor window focused on Preview, Mouse State, device state, and receiver connection state. Preview is always visible; its HUD shows only processing FPS, latency, and processing resolution.
-- Put all settings in one vertically scrolling page in the separate browser window, grouped into General and FOV sections with one global Apply Changes action. Persist settings in app data and restore them when the backend starts.
+- Put all settings in one vertically scrolling page in the separate browser window, grouped into Main, Motion, Auto, Recoil, and Settings cards with one global Apply Changes action. The profile toolbar supports selecting, cloning, renaming, creating, and deleting up to three profiles. Persist settings in app data and restore them when the backend starts.
 - Cap Preview at 640 × 640 px; preserve aspect ratio and enlarge smaller frames with smooth or nearest-neighbor scaling.
 - Keep a circle-only FOV overlay always enabled; expose its size as a 1–360° setting in the local config page, with no enable/disable control. Scale its diameter against the shorter side of the displayed image so it stays proportional across source resolutions; 360° is the largest inscribed circle.
 - Persist `offsetX` and `offsetY` as signed crop-pixel settings and display them relative to the selected target in the web config. Movement adds these offsets to the selected point before calculating crop-center error.
-- Persist a Trigger button preference in the web config with Right, Middle, M4, and M5 choices; exclude Left. Device output is sent only while that physical button is held.
+- Persist a Trigger button preference in the web config with Right, Middle, M4, and M5 choices; exclude Left. Device output is sent only while that physical button is held. Start with one `Default` profile and persist up to three independent settings profiles in `app-settings.json`; users can create, clone, rename, delete, and select them, while a middle-button rising edge cycles only through profiles that exist and immediately reconfigures the pipeline.
 - Provide independent X/Y exponential-smoothing alpha sliders in the local config. The backend applies `previous + alpha * (current - previous)` to selected target coordinates; the filtered point feeds Preview and device movement while raw detections remain intact. Alpha `1.0` disables filtering. Clear smoothing history when a target is lost or pipeline configuration changes.
-- Provide persisted user-entered sensitivity (`0.01..10`) and DPI (`100..100000`) in the local config. Movement scale uses `360 * 2.54 * max(sens, 0.01) / (54.54 * DPI)`.
+- Provide persisted user-entered sensitivity (`0.01..10`) in the local config. DPI is not a SysX setting because injected device counts are calibrated against measured image pixels per count.
 - Reflect backend IPC readiness in the connection status; show “Waiting for sender” after the authenticated socket connects and reserve “Starting receiver” for startup.
 - Retry frame-source runtime failures every 3 seconds. Retain the active listener while a requested port is occupied, then switch to the requested port and clear its error after a successful bind. Startup bind failures and later UDP read/decode failures retry until the listener returns.
 - Let the local configuration page scroll vertically as additional settings are added.
 - Apply backend and compute selections to inference. Precision remains a saved preference because the imported model artifact supplies its precision.
-- Send receiver, crop, and detection configuration to the backend. The sender provides full-frame MJPEG; the receiver takes a centered square crop before detection and publishes that cropped image to Preview.
+- Send receiver and detection configuration to the backend. The OBS sender provides the configured centered square MJPEG crop through `SYSCFG`; the receiver processes each decoded frame as received and publishes it to Preview without a second crop or resize.
 - Default the UDP listener to port `4200`. Show model controls (including import) only in Object Detection mode. Do not add a Data or export section to the desktop UI.
 - Object Detection's Min confidence threshold ranges from `0` to `1` and filters which detections are drawn in Preview.
 - Place Pixel Seek's Yellow/Red/Purple target-color selector in a separate full-width row below the Detection Engine cards; show it only in Pixel Seek mode.
@@ -63,7 +63,7 @@ References:
 - Runtime adapters compile, the pure output decoder and crop mismatch path have unit coverage, but no user model is present. Actual model inference and accelerator/runtime availability remain unverified.
 - `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the native executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
 
-The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pixel Seek or a selected Object Detection runtime, persists detections, and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
+The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pixel Seek or a selected Object Detection runtime, persists detections, and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
 
 ### Frame flow
 
@@ -82,9 +82,9 @@ The Rust sidecar receives full-frame MJPEG, applies the configured crop, runs Pi
 
 The CapkfaPlus mapping in [`docs/CAPKFA_RECONSTRUCTION_MAPPING.md`](docs/CAPKFA_RECONSTRUCTION_MAPPING.md) is reference material only. SysX does not expose or run the reconstructed active-state, mode-predicate, direct-offset, or timed-click branches because their live state producers are unavailable. The supported output path uses fresh summed deltas, the configured physical trigger, sampled recoil on Y, and the documented Medius/Ferrum relative-move APIs.
 
-The development and release launchers build the Rust UI before the Rust backend. The native host embeds the sidecar and static config bundle; Windows emits the `receiver.exe` portable executable. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
+The development and release launchers build the Rust UI before the Rust backend. The native host embeds the sidecar and static config bundle; Windows emits the `SysX.exe` portable executable. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
 
-The native host runs the vision sidecar and a background device monitor as separate Rust processes/threads. Pending movement-delta merging, freshness checks, trigger mapping, and the ±32 per-axis command clamp live in `src-tauri/src/movement.rs`; device monitors retain the Medius and Ferrum API calls. The host checks Medius devices using the official `medius` Rust client and watches five physical button states. Ferrum currently uses a Silicon Labs CP210x Legacy API connection at 115,200 baud, verified by `km.version()`. While the configured trigger is held, the host sends the merged movement through that same verified connection. The X/Y exponential filters are applied before movement. The Ferrum App Software API endpoint and movement behavior on either vendor's hardware remain unverified on Windows.
+The native host runs the vision sidecar and a background device monitor as separate Rust processes/threads. Pending movement-delta merging, freshness checks, trigger mapping, and the ±32 per-axis command clamp live in `src-tauri/src/movement.rs`; device monitors retain the Medius and Ferrum API calls. The host checks Medius devices using the official `medius` Rust client and watches five physical button states. Ferrum currently uses a Silicon Labs CP210x Legacy API connection at 115,200 baud, verified by `km.version()`. While the configured trigger is held, the host sends the merged movement through that same verified connection. Auto clicks use the same type-0 queue and verified device handles. The X/Y exponential filters are applied before movement. The Ferrum App Software API endpoint and movement behavior on either vendor's hardware remain unverified on Windows.
 
 No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` (no Node required) builds the Trunk UI, the Rust sidecar, runs all three test suites, emits one `SysX.exe` without an installer, and verifies UDP `4200` and 192×192 frame receipt. `-AppSmoke` additionally launches `SysX.exe`, waits for its backend to bind UDP `4200` and for the monitor Edge window, closes that window, and checks that SysX and its backend exit — it opens windows, so run it only when the machine is free. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
 
@@ -259,6 +259,13 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 120. [x] Changed the configuration card layout to a balanced three-column, two-row desktop rectangle with Main, Motion, Auto on the first row and Recoil plus Settings on the second; medium screens use two columns and compact screens fall back to one column.
 
 121. [x] Moved Motion, Auto, and Recoil enable switches into a compact toggle group below Detection Engine in Main; module cards now contain settings only.
+122. [x] Connected Auto's independent targeting state. Auto persists its own FOV; Motion and Auto use the same centralized HSV profile registry and the selected Motion target color. When Auto is enabled and its configured trigger is held, the backend reconfigures Pixel Seek to the Auto FOV and publishes effective values for Preview. Motion's FOV returns automatically after release and remains always visible otherwise. Added a regression test for the held/released trigger switch; backend 69 tests and UI 9 tests pass, and the release UI build succeeds.
+123. [x] Added `rust-backend/src/auto_target.rs` as Auto's presence-only target gate. While Auto is active, any nonzero pixel from the shared color mask inside the centered Auto FOV sets `detection.auto_target_valid`; it does not rank pixels, lock a blob, or emit movement coordinates. Backend 72 tests, UI 9 tests, and the release UI build pass.
+124. [x] Auto-valid frames no longer draw the Preview center-to-target line or target ring. Motion frames keep the existing target overlay.
+125. [x] Removed the Auto color selector from the web config. Auto now reuses Motion's selected HSV target profile; the old saved Auto color field is ignored for compatibility.
+126. [x] Separated Auto's visual FOV color from target detection. Auto target validity uses the shared Motion HSV mask, while the monitor switches only the FOV ring to blue while the Auto trigger is held. Backend 72 tests, UI 9 tests, and the release UI build pass.
+127. [x] Implemented the isolated Auto timing state machine and wired its left-click action to both device paths. A held Auto trigger plus any valid target pixel waits for Delay, emits one Medius `press/release(Button::LEFT)` or Ferrum `km.click()` command through the existing serial queue, then uses Cooldown plus Sleep before another action; target loss or trigger release rearms it. Hardware and Windows behavior remain unvalidated.
+128. [x] Added persisted profile management. First launch creates one `Default` profile; the backend keeps up to three independent snapshots in `app-settings.json`, and the config page supports create, clone, rename, delete, and select actions. The physical middle-button rising edge cycles only through profiles that exist, applies the selected snapshot immediately, and ignores repeated status reports while the button remains held. Backend 76 tests, UI 9 tests, and native 22 tests pass; Windows/device validation remains pending.
 
 ## Limitations to preserve
 

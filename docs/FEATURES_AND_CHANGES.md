@@ -1,13 +1,13 @@
 # SysX — tính năng và những gì đã làm
 
-Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-10-15 → 2026-10-16, theo từng phần, kèm file code và mức độ đã kiểm chứng. Lịch sử commit đầy đủ: `git log` trên `main` (từ `33208e5` trở đi).
+Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-10-15 → 2026-10-16, theo từng phần, kèm file code và mức độ đã kiểm chứng. Lịch sử commit đầy đủ nằm trong `git log` trên nhánh `main`.
 
 ## 1. Tổng quan kiến trúc
 
 ```
 OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)──▶ monitor /monitor.html
   sysx-canvas-sender.dll   ◀──SYSCFG──   (Rust, nhúng trong SysX.exe)  ──▶ config  /config.html
-                                              ▲   │ movement_target (stdout)
+                                              ▲   │ movement_target / auto_target (stdout)
                                               │   ▼
                                          SysX.exe (host native) ──▶ Medius / Ferrum (chuột)
 ```
@@ -15,7 +15,7 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 | Thành phần | Thư mục | Vai trò |
 |---|---|---|
 | OBS plugin | `obs-plugin/sysx-canvas-sender` | Crop canvas OBS trên GPU, nén JPEG, gửi UDP |
-| Backend | `rust-backend` | Nhận UDP, giải mã, Pixel Seek / Object Detection, chọn target, tính chuyển động, web server loopback |
+| Backend | `rust-backend` | Nhận UDP, giải mã, Pixel Seek / Object Detection, chọn target, tính chuyển động, Auto target gate, profile state, web server loopback |
 | Web UI | `rust-ui` (Leptos/WASM) | Trang monitor (receiver) và trang config |
 | Host native | `src-tauri` | Chạy backend, đọc thiết bị Medius/Ferrum, gửi chuyển động chuột, mở cửa sổ monitor |
 
@@ -71,21 +71,21 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 
 - **Làm mượt X/Y** (`ExponentialTargetSmoother`): alpha 0.01–1.0 cho từng trục; 1.0 = không làm mượt. Reset khi mất target hoặc đổi cấu hình.
 - **Backend** (`rust-backend/src/movement.rs`): bộ điều khiển NCAF ba vùng (snap 150 / near 50), dự đoán vận tốc; mỗi lượt di chuyển chọn một lần độ cong (giảm dần khi tới gần), thời gian tăng tốc, mức giảm tốc và đường cong Bézier cho độ lớn bước; nhiễu tương quan theo thời gian (Ornstein-Uhlenbeck, ngang hướng di chuyển và tốc độ) thay cho micro-correction ±1 độc lập, tắt dần khi gần đích; vùng dừng 2 px / chạy lại 4 px (hysteresis), không ép ±1 mà dùng bước tối thiểu theo vector cộng dồn phần lẻ; khi giữ trigger, tự hiệu chuẩn px/count và độ trễ bằng tín hiệu dò ±2 count (bám nhanh bật sau ~0,1 s ở 240 FPS, lưu vào `motion-calibration.json` theo sens để lần sau bám ngay) rồi tách chuyển động target khỏi chuyển động chuột, feedforward theo vận tốc target, tăng đáp ứng vùng gần khi target nhanh, không dừng khi target còn chạy, chỉ ramp khi bắt target mới; đổi pixel ra count bằng px/count đo được (sửa sai số theo px/s, hằng số thời gian 35 ms, chậm hơn khi ước lượng còn thô); trước khi đo xong dùng bước chậm 0,0035/sens count mỗi px — một count xoay camera yaw × sens độ nên sens cao cần ít count hơn, DPI không ảnh hưởng count gửi qua thiết bị (mặc định sens 0.25; không còn ô DPI — file cài đặt cũ có `dpi` vẫn đọc được và bỏ trường này ở lần lưu sau); offset X/Y cộng vào target. Ticker riêng chạy mỗi 4 ms với target mới nhất.
-- **Host** (`src-tauri/src/movement.rs`): cộng dồn delta còn tươi (≤100 ms), chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ, cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius `move_rel` hoặc Ferrum `km.move`.
+- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms), chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ, cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius `move_rel` hoặc Ferrum `km.move`. Auto giữ state riêng, chờ Delay, phát left-click qua Medius `press/release(Button::LEFT)` hoặc Ferrum `km.click()`, rồi áp dụng Cooldown + Sleep.
 - **Chưa kiểm chứng:** chưa có phần cứng Medius/Ferrum để thử.
 
 ## 7. Receiver UI (`rust-ui`)
 
 - **Không dùng egui:** trang `/monitor.html` (Leptos/WASM) mở trong cửa sổ Edge `--app` không viền, profile riêng tại `%LOCALAPPDATA%\SysX\monitor-window`, cỡ mặc định 550×620 (Edge nhớ cỡ sau khi bạn chỉnh).
 - **Thiết kế** (áp dụng các skill impeccable / ui-ux-pro-max / no-ai-design-slop; spec: `design-system/sysx-native-receiver/MASTER.md`):
-  - Header mỏng: logo SysX + trạng thái thiết bị (đã bỏ "Waiting for sender" và "UDP 4200" theo yêu cầu).
-  - Preview vuông tối đa 640px; HUD trong khung: `Res: 640 · <FPS> FPS · <ms> ms` (ms = thời gian detect mỗi frame: crop → detect → chọn target).
+  - Header mỏng: logo SysX + tên profile hiện tại + trạng thái thiết bị; profile tự cập nhật từ state WebSocket sau khi chọn/clone/đổi profile, không cần khởi động lại (đã bỏ "Waiting for sender" và "UDP 4200" theo yêu cầu).
+  - Preview vuông tối đa 640px; HUD trong khung: `Res: 640 · <FPS> FPS · <ms> ms` (ms = thời gian xử lý mỗi frame: detect → chọn target).
   - Khi chưa có frame: `NO FRAME` + trạng thái; dòng chi tiết chỉ hiện khi có lỗi.
   - Target vẽ kiểu **"Hairline reticle"**: đường 1.25 px mờ dần từ tâm, vòng 8 px có 4 vạch, chấm nhỏ ở giữa, có viền tối để nổi trên nền sáng.
   - Mouse State: một thanh liền 30 px, 5 nút bằng nhau; giữ = nền xanh + chữ đậm + vạch dưới; chưa có thiết bị = mờ.
 - **Preview đủ FPS đầu vào:** backend báo socket ngay khi có frame mới (kênh `watch`, không dùng timer vì timer Windows ~15,6 ms từng giới hạn ~60 FPS), gửi thẳng JPEG gốc không nén lại, chia sẻ frame bằng `Arc`, `state()` không còn khoá chờ luồng UDP; trang giải mã bằng `createImageBitmap` ngoài main thread. Đo với nguồn 240 FPS: trang nhận 230,3 và vẽ 229,7 frame/s (trước đó ~60). Mắt chỉ thấy tối đa bằng tần số quét màn hình.
 - **Giảm lag (2026-10-16):** mỗi frame chỉ giải mã + vẽ đúng 1 lần (trước đó 3 tín hiệu cùng báo nên mỗi frame bị giải mã ~3 lần), tại một thời điểm chỉ có 1 lượt giải mã (frame mới đến thì vẽ frame mới nhất kế tiếp), canvas chỉ cấp phát lại khi đổi kích thước, state 100 ms chỉ cập nhật khi giá trị thay đổi. Đo headless: frame = decode = draw, 0 lần resize canvas/s.
-- **Trang config chỉ để lưu cấu hình:** backend không gửi frame preview cho trang config (chỉ cửa sổ monitor nhận), nên Chrome không còn phải nhận 240 JPEG/s; đã bỏ ô "Actual inference device".
+- **Trang config chỉ để lưu cấu hình:** backend không gửi frame preview cho trang config (chỉ cửa sổ monitor nhận), nên Chrome không còn phải nhận 240 JPEG/s; đã bỏ ô "Actual inference device". Profile đang chọn được hiển thị trong cả config và Receiver, đồng bộ qua state WebSocket.
 - **Màu FPS và latency trên HUD:** FPS xử lý so với FPS đầu vào: ≥ 80 % = xanh, ≥ 50 % = vàng, dưới 50 % = đỏ (sender 60 FPS chạy đủ vẫn xanh). Latency theo thang cố định 0–10 ms cho mọi FPS: < 4 ms xanh, 4–7 ms vàng, 7–10 ms đỏ; trên 10 ms đỏ kèm tag **(HIGH)**. Hàm `fps_tone`/`latency_tone` trong `rust-ui/src/layout.rs` có test.
 - Ảnh kiểm tra: `design-review/receiver-monitor-web-*.png`.
 
@@ -97,7 +97,16 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 - **Thư mục runtime cố định** `%LOCALAPPDATA%\SysX\runtime` (dọn bản cũ khi khởi động) để quyền Windows Firewall cho LAN chỉ cần cấp một lần.
 - Trạng thái thiết bị/nút chuột: host → backend (`device_status`, có kiểm tra hợp lệ) → `state.device` → trang monitor.
 
-## 9. Chạy qua router LAN
+
+## 9. Profile settings
+
+- Lần chạy đầu tạo đúng một profile `Default`. `AppSettings` lưu tối đa ba snapshot profile trong `app-settings.json`; metadata của profile nằm ở lớp ngoài để snapshot không lồng đệ quy.
+- Trang config có dropdown profile hiện tại và bốn nút biểu tượng: đổi tên, clone, tạo mới và xoá. Clone sao chép toàn bộ setting của profile hiện tại rồi đặt tên `<tên hiện tại> Copy`; tạo mới dùng setting mặc định. Tên được trim, tối đa 32 ký tự. Profile cuối cùng không thể xoá.
+- Các lệnh `activate_profile`, `create_profile`, `rename_profile` và `delete_profile` lưu thay đổi rồi reconfigure runtime. Một rising edge của nút giữa trên chuột vật lý sẽ chuyển lần lượt qua các profile đang tồn tại; giữ nút không lặp chuyển.
+- State đã xác thực gồm `profile_index`, `profile_count` và `profiles`. Trang config và Receiver đều cập nhật profile đang chọn mà không cần khởi động lại; Receiver hiển thị tên profile trong header.
+- Các test backend bao phủ việc tách setting giữa profile, sinh tên, guard đổi tên/xoá, giới hạn ba profile, persistence và chuyển profile theo edge của nút giữa.
+
+## 10. Chạy qua router LAN
 
 1. Máy OBS: sửa `kReceiverHost` thành IP LAN của máy SysX, build lại DLL, cài vào OBS.
 2. Máy SysX: mở UDP 4200 một lần (PowerShell quyền admin):
@@ -106,13 +115,13 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 
 Chi tiết: `docs/OBS_RECEIVER_PROTOCOL.md` mục 7. **Chưa thử trên hai máy thật.**
 
-## 10. Build và test
+## 11. Build và test
 
 - `scripts/build-windows.ps1` (không cần Node): Trunk UI → backend → test cả 3 crate → `src-tauri/target/release/SysX.exe` → smoke UDP 4200. `-AppSmoke` (mở cửa sổ) là tuỳ chọn.
-- Test hiện tại: backend 45, UI 6, host 10 — đều pass.
+- Test hiện tại trên workspace: backend 76 pass / 4 ignored, UI 9 pass, native host 22 pass.
 - Plugin: build bằng CMake + MSVC (xem `obs-plugin/sysx-canvas-sender/README.md`), kèm `sysx-sender-selftest` và `sysx-obs-host-check`.
 
-## 11. Chưa làm / chưa kiểm chứng
+## 12. Chưa làm / chưa kiểm chứng
 
 - LAN giữa hai máy thật.
 - Model Object Detection thật, TensorRT/OpenVINO trên GPU/NPU.

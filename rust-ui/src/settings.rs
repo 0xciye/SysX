@@ -122,6 +122,8 @@ pub fn format_recoil_levels(levels: &[i32]) -> String {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
+    #[serde(default)]
+    pub active_profile: u8,
     pub motion_enabled: bool,
     pub trigger_button: String,
     pub strategy: String,
@@ -156,6 +158,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            active_profile: 0,
             motion_enabled: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),

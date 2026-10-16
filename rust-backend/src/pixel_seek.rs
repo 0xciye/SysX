@@ -4,6 +4,8 @@ use crate::targeting::{highest_pixel_in_fov, highest_pixel_in_fov_within, FrameC
 use image::RgbImage;
 use std::sync::OnceLock;
 
+/// Target colors shared by Motion and Auto. The selected module only changes
+/// which profile is active; HSV thresholds and lookup tables stay centralized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelTargetColor {
     Yellow,
@@ -34,6 +36,17 @@ pub struct PixelSeekOutput {
     pub objects: Vec<DetectionObject>,
     pub target: Option<FrameCoordinate>,
     pub mask: Vec<u8>,
+}
+
+/// Builds the shared color mask used by Motion selection and Auto's
+/// presence-only target gate.
+pub fn color_mask(image: &RgbImage, color: PixelTargetColor) -> Vec<u8> {
+    let lut = profile_lut(color);
+    image
+        .as_raw()
+        .chunks_exact(3)
+        .map(|pixel| lut_hit(lut, pixel[0], pixel[1], pixel[2]))
+        .collect()
 }
 
 /// Minimum lock margin around the previous target box, in crop pixels.
@@ -75,12 +88,7 @@ pub fn process_pixel_seek(
 ) -> PixelSeekOutput {
     let width = image.width();
     let height = image.height();
-    let lut = profile_lut(color);
-    let mask: Vec<u8> = image
-        .as_raw()
-        .chunks_exact(3)
-        .map(|pixel| lut_hit(lut, pixel[0], pixel[1], pixel[2]))
-        .collect();
+    let mask = color_mask(image, color);
     // Exactly one target per frame. While a fresh lock exists, take the
     // topmost FOV pixel near the locked target so two targets in the FOV do
     // not alternate; when the locked target is gone, take the topmost mask
@@ -178,7 +186,7 @@ fn lut_hit(lut: &[u64], r: u8, g: u8, b: u8) -> u8 {
     ((lut[rgb >> 6] >> (rgb & 63)) & 1) as u8
 }
 
-/// Builds all three profile tables off the processing thread so the first
+/// Builds all shared profile tables off the processing thread so the first
 /// frame after start or a color change does not pay for it.
 pub fn warm_profile_luts() {
     let _ = std::thread::Builder::new()

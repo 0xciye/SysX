@@ -19,6 +19,7 @@ pub fn MonitorApp() -> impl IntoView {
     let fov = RwSignal::new(36_u16);
     let scale = RwSignal::new("Smooth".to_string());
     let detection_color = RwSignal::new("#e3bf4d".to_string());
+    let fov_color = RwSignal::new("#43cfa0".to_string());
     let model_confidence = RwSignal::new(0.5_f32);
     let (command_sender, command_receiver) = command_channel();
     let command_receiver = Rc::new(RefCell::new(Some(command_receiver)));
@@ -42,7 +43,12 @@ pub fn MonitorApp() -> impl IntoView {
                         // wake the preview redraw.
                         set_changed(backend_connected, true);
                         set_changed(backend_error, state.last_error.clone().unwrap_or_default());
-                        set_changed(fov, state.fov_degrees.clamp(1, 360));
+                        let effective_fov = if state.effective_fov_degrees == 0 {
+                            state.fov_degrees
+                        } else {
+                            state.effective_fov_degrees
+                        };
+                        set_changed(fov, effective_fov.clamp(1, 360));
                         set_changed(
                             scale,
                             if state.preview_scale == "Pixel perfect" {
@@ -51,7 +57,20 @@ pub fn MonitorApp() -> impl IntoView {
                                 "Smooth".into()
                             },
                         );
-                        set_changed(detection_color, pixel_color_hex(&state.pixel_color).into());
+                        let effective_color = if state.effective_pixel_color.is_empty() {
+                            &state.pixel_color
+                        } else {
+                            &state.effective_pixel_color
+                        };
+                        set_changed(detection_color, pixel_color_hex(effective_color).into());
+                        set_changed(
+                            fov_color,
+                            if state.auto_trigger_held {
+                                "#4da7e8".into()
+                            } else {
+                                "#43cfa0".into()
+                            },
+                        );
                         // "waiting" = no frame for a second: show the empty
                         // state instead of a frozen image.
                         if state.status == "waiting" {
@@ -83,10 +102,16 @@ pub fn MonitorApp() -> impl IntoView {
                         // Detections and target ride along with the frame:
                         // only `frame` notifies, so each frame is drawn once.
                         target.update_untracked(|value| {
-                            *value = next
-                                .detection
-                                .smoothed_target_xy
-                                .or(next.detection.target_xy)
+                            *value = if next.detection.auto_target_valid {
+                                // Auto is a presence gate: a matching pixel
+                                // is enough, so never draw Motion's target
+                                // line/ring to an arbitrary pixel.
+                                None
+                            } else {
+                                next.detection
+                                    .smoothed_target_xy
+                                    .or(next.detection.target_xy)
+                            }
                         });
                         detections.update_untracked(|value| *value = visible);
                         frame.set(Some(PreviewFrame { frame: next, image }));
@@ -123,6 +148,25 @@ pub fn MonitorApp() -> impl IntoView {
             "error" => "Device error".into(),
             _ => "No device".into(),
         }
+    };
+    let profile_label = move || {
+        backend_state
+            .get()
+            .map(|state| {
+                state
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.index == usize::from(state.profile_index))
+                    .map(|profile| profile.name.clone())
+                    .unwrap_or_else(|| {
+                        if state.profile_index == 0 {
+                            "Default".into()
+                        } else {
+                            format!("Profile {}", state.profile_index + 1)
+                        }
+                    })
+            })
+            .unwrap_or_else(|| "Default".into())
     };
     let device_tone = move || match device.get().state.as_str() {
         "connected" => "live",
@@ -181,6 +225,10 @@ pub fn MonitorApp() -> impl IntoView {
                     <span>"SysX"</span>
                 </div>
                 <div class="monitor-status">
+                    <span class="monitor-profile" aria-live="polite">
+                        <span class="monitor-profile-label">"Profile"</span>
+                        <strong>{profile_label}</strong>
+                    </span>
                     <span class="status" data-tone=device_tone aria-live="polite">
                         <i aria-hidden="true"/>{device_label}
                     </span>
@@ -189,7 +237,7 @@ pub fn MonitorApp() -> impl IntoView {
             <section class="monitor-stage" aria-label="Live preview">
                 <div class="monitor-column">
                     <div class="feed">
-                        <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov/>
+                        <PreviewCanvas frame=frame scale=scale detections=detections target_point=target detection_color=detection_color fov_degrees=fov fov_color=fov_color/>
                         <div class="feed-hud" aria-label="Processing resolution, FPS and latency">
                             <span><i>"Res:"</i><b>{move || hud().0}</b></span>
                             <span data-level=fps_level><b>{move || hud().1}</b><i>"FPS"</i></span>

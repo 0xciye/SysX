@@ -1,7 +1,7 @@
 use crate::client::{
     command_channel, get_local_settings, save_local_settings, send_command, start_backend_client,
 };
-use crate::protocol::{BackendEvent, BackendModel, BackendState, ModelArtifacts};
+use crate::protocol::{BackendEvent, BackendModel, BackendState, ModelArtifacts, ProfileSummary};
 use crate::settings::{
     format_recoil_levels, parse_recoil_levels, AppSettings, SmoothingAxis, SmoothingBound,
 };
@@ -19,6 +19,10 @@ use web_sys::{File, HtmlInputElement};
 pub fn ConfigApp() -> impl IntoView {
     let settings = RwSignal::new(AppSettings::default());
     let models = RwSignal::new(Vec::<BackendModel>::new());
+    let profiles = RwSignal::new(vec![ProfileSummary {
+        index: 0,
+        name: "Default".into(),
+    }]);
     let backend_connected = RwSignal::new(false);
     let backend_error = RwSignal::new(String::new());
     let apply_message = RwSignal::new(String::new());
@@ -57,7 +61,10 @@ pub fn ConfigApp() -> impl IntoView {
                 BackendEvent::State(state) => {
                     backend_connected.set(true);
                     backend_error.set(state.last_error.clone().unwrap_or_default());
-                    if !loaded_state_for_events.get() {
+                    profiles.set(state.profiles.clone());
+                    if !loaded_state_for_events.get()
+                        || state.profile_index != settings.get_untracked().active_profile
+                    {
                         copy_state_to_settings(
                             &state,
                             settings,
@@ -289,7 +296,6 @@ pub fn ConfigApp() -> impl IntoView {
         move || (parse_float(&offset_x_draft.get()).unwrap_or(0.0) * 2.25).clamp(-320.0, 320.0);
     let marker_y =
         move || (parse_float(&offset_y_draft.get()).unwrap_or(0.0) * 2.25).clamp(-32.0, 32.0);
-
     view! {
         <main class="app-window config-window">
             <header class="app-header">
@@ -310,6 +316,39 @@ pub fn ConfigApp() -> impl IntoView {
                             </Show>
                         </div>
                     </div>
+                    <section class="profile-control" aria-labelledby="active-profile-title">
+                        <div class="profile-label" id="active-profile-title">"ACTIVE PROFILE"</div>
+                        <div class="profile-toolbar">
+                            <select class="profile-select" aria-label="Active profile" prop:value=move || settings.get().active_profile.to_string() on:change=move |event| {
+                                if let Ok(index) = event_target_value(&event).parse::<usize>() {
+                                    send_command_from(command_sender, "activate_profile", serde_json::json!({"index":index}));
+                                }
+                            }>
+                                {move || profiles.get().into_iter().map(|profile| view! { <option value=profile.index.to_string()>{profile.name}</option> }).collect_view()}
+                            </select>
+                            <button type="button" class="profile-action" aria-label="Rename active profile" title="Rename active profile" on:click=move |_| {
+                                let current = profiles.get_untracked().into_iter()
+                                    .find(|profile| profile.index == settings.get_untracked().active_profile as usize)
+                                    .map(|profile| profile.name)
+                                    .unwrap_or_else(|| format!("Profile {}", settings.get_untracked().active_profile + 1));
+                                if let Some(name) = web_sys::window().and_then(|window| window.prompt_with_message_and_default(&format!("Rename profile (current: {current})"), &current).ok()).flatten() {
+                                    if !name.trim().is_empty() { send_command_from(command_sender, "rename_profile", serde_json::json!({"name":name})); }
+                                }
+                            }>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10.5-10.5a2.12 2.12 0 0 0-3-3L5 17v3Zm9.5-11.5 3 3M14 4h6v6"/></svg>
+                            </button>
+                            <button type="button" class="profile-action" aria-label="Clone active profile" title="Clone active profile" on:click=move |_| send_command_from(command_sender, "create_profile", serde_json::json!({"duplicate":true}))>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V5a2 2 0 0 1 2-2h9"/></svg>
+                            </button>
+                            <button type="button" class="profile-action" aria-label="Create profile" title="Create profile" on:click=move |_| send_command_from(command_sender, "create_profile", serde_json::json!({"duplicate":false}))>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                            </button>
+                            <button type="button" class="profile-action profile-delete" aria-label="Delete active profile" title="Delete active profile" prop:disabled=move || profiles.get().len() <= 1 on:click=move |_| send_command_from(command_sender, "delete_profile", serde_json::json!({}))>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 11v6M14 11v6M8 7l1-3h6l1 3m-9 0 1 13h8l1-13"/></svg>
+                            </button>
+                        </div>
+                        <span class="profile-hint">{move || format!("{} / 3 profiles · Middle click to switch", profiles.get().len())}</span>
+                    </section>
                     <div class="general-page config-general">
                         <div class="settings-panel general-settings">
                             <section class="config-card" aria-labelledby="settings-section-title">
@@ -575,6 +614,7 @@ fn copy_state_to_settings(
     recoil_levels: RwSignal<String>,
 ) {
     settings.update(|value| {
+        value.active_profile = state.profile_index;
         value.motion_enabled = state.motion_enabled;
         value.strategy = state.mode.clone();
         value.fov_degrees = state.fov_degrees.clamp(1, 360);

@@ -1,3 +1,4 @@
+use crate::auto_target::has_pixel_in_fov;
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
@@ -20,6 +21,9 @@ pub struct PipelineConfig {
     pub pixel_color: PixelTargetColor,
     pub crop_resolution: Option<u32>,
     pub fov_degrees: u16,
+    /// True only while the enabled Auto trigger is held. In that state the
+    /// Pixel Seek mask also feeds Auto's presence-only validity gate.
+    pub auto_target_active: bool,
     pub smoothing_x: SmoothingRange,
     pub smoothing_y: SmoothingRange,
     pub model: Option<ModelDefinition>,
@@ -34,6 +38,7 @@ impl Default for PipelineConfig {
             pixel_color: PixelTargetColor::Yellow,
             crop_resolution: Some(640),
             fov_degrees: 36,
+            auto_target_active: false,
             smoothing_x: SmoothingRange::NONE,
             smoothing_y: SmoothingRange::NONE,
             model: None,
@@ -389,6 +394,7 @@ fn process_frame(
             inference_device: Some(inference.device),
             target_xy: None,
             smoothed_target_xy: None,
+            auto_target_valid: false,
         };
         let candidates = object_detection_candidates(&result, model.confidence);
         let selected_target = object_detection_target(
@@ -434,6 +440,13 @@ fn process_frame(
     );
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
+    let auto_target_valid = config.auto_target_active
+        && has_pixel_in_fov(
+            &output.mask,
+            processed.width(),
+            processed.height(),
+            config.fov_degrees,
+        );
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
         x: point[0],
         y: point[1],
@@ -456,6 +469,7 @@ fn process_frame(
         inference_device: Some("cpu".into()),
         target_xy,
         smoothed_target_xy: filtered.map(|point| [point.x, point.y]),
+        auto_target_valid,
     };
     Ok(ProcessedFrame {
         frame: SourceFrame { ..frame },

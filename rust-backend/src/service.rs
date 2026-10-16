@@ -66,6 +66,7 @@ impl SourceView {
 
 pub struct ReceiverService {
     settings: Arc<Mutex<AppSettings>>,
+    settings_path: PathBuf,
     registry: Arc<Mutex<ModelRegistry>>,
     pipeline: Arc<LatestFramePipeline>,
     store: Arc<DetectionDataStore>,
@@ -155,6 +156,7 @@ impl ReceiverService {
             pixel_color,
             crop_resolution: Some(app.crop_resolution),
             fov_degrees: app.fov_degrees,
+            auto_target_active: false,
             smoothing_x: app.smoothing_x(),
             smoothing_y: app.smoothing_y(),
             model,
@@ -194,6 +196,8 @@ impl ReceiverService {
             Arc::new(move |event| ticker_batcher.submit(event)),
         ));
         let callback_ticker = Arc::clone(&movement_ticker);
+        let callback_settings = Arc::clone(&settings);
+        let callback_device = Arc::clone(&device);
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(0_u64);
         let callback: Arc<dyn Fn(&ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
             // Wake every preview socket for this frame (no timer polling:
@@ -214,6 +218,22 @@ impl ReceiverService {
                 ),
                 received_s: 0.0,
             });
+            if let (Ok(settings), Ok(device)) = (callback_settings.lock(), callback_device.lock()) {
+                let auto_active = auto_trigger_active(&settings.auto, &device);
+                println!(
+                    "{}",
+                    json!({
+                        "event": "auto_target",
+                        "enabled": settings.auto.enabled,
+                        "trigger_button": settings.auto.trigger_button,
+                        "delay_ms": settings.auto.delay_ms,
+                        "cooldown_ms": settings.auto.cooldown_ms,
+                        "sleep_ms": settings.auto.sleep_ms,
+                        "target_valid": auto_active && processed.result.auto_target_valid,
+                        "timestamp_ms": unix_ms(),
+                    })
+                );
+            }
         });
         let pipeline = Arc::new(LatestFramePipeline::new(
             config,
@@ -243,6 +263,7 @@ impl ReceiverService {
         }
         let service = Arc::new(Self {
             settings,
+            settings_path: settings_path.clone(),
             registry,
             pipeline,
             store,
@@ -320,6 +341,19 @@ impl ReceiverService {
             .clone()
             .or(source_error)
             .or_else(|| self.errors.lock().ok()?.last().cloned());
+        let device = self
+            .device
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| missing_device());
+        let (effective_fov_degrees, effective_pixel_color, auto_trigger_held) =
+            effective_detection_settings(&settings, &device);
+        let profiles: Vec<Value> = settings
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| json!({"index":index,"name":profile.name}))
+            .collect();
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
@@ -328,13 +362,19 @@ impl ReceiverService {
             "recoil":settings.recoil,
             "auto":settings.auto,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
+            "effective_fov_degrees":effective_fov_degrees,
+            "effective_pixel_color":effective_pixel_color,
+            "auto_trigger_held":auto_trigger_held,
+            "profile_index":settings.active_profile,
+            "profile_count":profiles.len(),
+            "profiles":profiles,
             "active_model_id":active_model_id,
             "expected_source_resolution":expected_source_resolution,
             "session_id":self.session_id, "processed_frames":stats.processed_frames, "dropped_input_frames":stats.dropped_input_frames,
             "rejected_frames":stats.rejected_frames, "resolution_mismatches":stats.resolution_mismatches,
             "transport_dropped_frames":transport.dropped_frames + transport.expired_frames, "invalid_packets":transport.invalid_packets,
             "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
-            "device":self.device.lock().map(|device| device.clone()).unwrap_or_else(|_| missing_device()),
+            "device":device,
             "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
             "config_clients":self.config_clients.load(Ordering::Relaxed)
         })
@@ -423,8 +463,15 @@ impl ReceiverService {
             "object_detection" => DetectionMode::ObjectDetection,
             _ => return Err("invalid detection strategy".into()),
         };
+        let device = self
+            .device
+            .lock()
+            .map_err(|_| "device lock poisoned")?
+            .clone();
+        let (fov_degrees, pixel_color_name, auto_target_active) =
+            effective_detection_settings(settings, &device);
         let pixel_color =
-            PixelTargetColor::parse(&settings.pixel_color).ok_or("invalid Pixel Seek color")?;
+            PixelTargetColor::parse(&pixel_color_name).ok_or("invalid Pixel Seek color")?;
         let model = {
             let registry = self
                 .registry
@@ -439,7 +486,8 @@ impl ReceiverService {
             strategy,
             pixel_color,
             crop_resolution: Some(settings.crop_resolution),
-            fov_degrees: settings.fov_degrees,
+            fov_degrees,
+            auto_target_active,
             smoothing_x: settings.smoothing_x(),
             smoothing_y: settings.smoothing_y(),
             model,
@@ -471,7 +519,27 @@ impl ReceiverService {
             "state" => Ok(self.state()),
             "device_status" => {
                 let device = parse_device_status(&command)?;
+                let settings = self
+                    .settings
+                    .lock()
+                    .map_err(|_| "settings lock poisoned")?
+                    .clone();
+                let previous = self
+                    .device
+                    .lock()
+                    .map_err(|_| "device lock poisoned")?
+                    .clone();
+                let previous_auto = auto_trigger_active(&settings.auto, &previous);
+                let next_auto = auto_trigger_active(&settings.auto, &device);
+                let middle_pressed =
+                    !trigger_held(&previous, "middle") && trigger_held(&device, "middle");
                 *self.device.lock().map_err(|_| "device lock poisoned")? = device;
+                if middle_pressed {
+                    self.cycle_profile()?;
+                }
+                if previous_auto != next_auto {
+                    self.reconfigure()?;
+                }
                 Ok(json!({"event":"ack","type":kind}))
             }
             "apply_settings" => {
@@ -495,6 +563,36 @@ impl ReceiverService {
                     .and_then(|v| u16::try_from(v).ok())
                     .ok_or("UDP port must be between 1 and 65535")?;
                 self.set_udp_port(port)?;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "activate_profile" => {
+                let index = command
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or("profile index is required")?;
+                self.activate_profile(index)?;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "create_profile" => {
+                let name = command.get("name").and_then(Value::as_str);
+                let duplicate = command
+                    .get("duplicate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.create_profile(name, duplicate)?;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "rename_profile" => {
+                let name = command
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("profile name is required")?;
+                self.rename_profile(name)?;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "delete_profile" => {
+                self.delete_profile()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_pixel_color" => {
@@ -582,6 +680,7 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
                     .auto = auto;
+                self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_movement_calibration" => {
@@ -727,6 +826,72 @@ impl ReceiverService {
             }
             _ => Err(format!("unsupported command type: {kind}")),
         }
+    }
+
+    fn cycle_profile(&self) -> Result<(), String> {
+        let next = {
+            let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+            settings.normalize_profiles();
+            (usize::from(settings.active_profile) + 1) % settings.profiles.len()
+        };
+        self.activate_profile(next)
+    }
+
+    fn activate_profile(&self, index: usize) -> Result<(), String> {
+        let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        settings
+            .activate_profile(index)
+            .map_err(|error| error.to_string())?;
+        let port = settings
+            .port
+            .parse::<u16>()
+            .map_err(|_| "profile UDP port is invalid".to_string())?;
+        save_settings(&self.settings_path, &settings).map_err(|error| error.to_string())?;
+        drop(settings);
+        // Keep the current listener if the profile's port is temporarily
+        // occupied; the source retry loop will adopt it when it is free.
+        let _ = self.set_udp_port(port);
+        self.reconfigure()
+    }
+
+    fn create_profile(&self, name: Option<&str>, duplicate: bool) -> Result<(), String> {
+        let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        settings
+            .create_profile(name, duplicate)
+            .map_err(|error| error.to_string())?;
+        let port = settings
+            .port
+            .parse::<u16>()
+            .map_err(|_| "profile UDP port is invalid")?;
+        save_settings(&self.settings_path, &settings).map_err(|error| error.to_string())?;
+        drop(settings);
+        let _ = self.set_udp_port(port);
+        self.reconfigure()
+    }
+
+    fn rename_profile(&self, name: &str) -> Result<(), String> {
+        let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        let index = usize::from(settings.active_profile);
+        settings
+            .rename_profile(index, name)
+            .map_err(|error| error.to_string())?;
+        save_settings(&self.settings_path, &settings).map_err(|error| error.to_string())
+    }
+
+    fn delete_profile(&self) -> Result<(), String> {
+        let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        let index = usize::from(settings.active_profile);
+        settings
+            .delete_profile(index)
+            .map_err(|error| error.to_string())?;
+        let port = settings
+            .port
+            .parse::<u16>()
+            .map_err(|_| "profile UDP port is invalid")?;
+        save_settings(&self.settings_path, &settings).map_err(|error| error.to_string())?;
+        drop(settings);
+        let _ = self.set_udp_port(port);
+        self.reconfigure()
     }
 
     fn update_model(&self, command: &Value) -> Result<Value, String> {
@@ -1070,6 +1235,24 @@ fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
 }
 
 /// Whether the device status reports the configured trigger button as held.
+fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bool {
+    auto.enabled && trigger_held(device, &auto.trigger_button)
+}
+
+fn effective_detection_settings(settings: &AppSettings, device: &Value) -> (u16, String, bool) {
+    let auto_active = auto_trigger_active(&settings.auto, device);
+    if auto_active {
+        (
+            settings.auto.fov_degrees,
+            settings.pixel_color.clone(),
+            true,
+        )
+    } else {
+        (settings.fov_degrees, settings.pixel_color.clone(), false)
+    }
+}
+
+/// Whether the device status reports the configured trigger button as held.
 fn trigger_held(device: &Value, trigger_button: &str) -> bool {
     let index = match trigger_button {
         "right" => 1,
@@ -1331,6 +1514,39 @@ mod tests {
     }
 
     #[test]
+    fn middle_button_rising_edge_cycles_profiles_once_and_persists() {
+        let (service, data_dir) = test_service("profiles");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        service
+            .dispatch(json!({"version":1,"type":"create_profile","duplicate":false}))
+            .unwrap();
+        service
+            .dispatch(json!({"version":1,"type":"activate_profile","index":0}))
+            .unwrap();
+        let release = json!({
+            "version":1,
+            "type":"device_status",
+            "state":"connected",
+            "buttons":[false,false,false,false,false]
+        });
+        let press = json!({
+            "version":1,
+            "type":"device_status",
+            "state":"connected",
+            "buttons":[false,false,true,false,false]
+        });
+        service.dispatch(release).unwrap();
+        service.dispatch(press.clone()).unwrap();
+        assert_eq!(service.state()["profile_index"], 1);
+        service.dispatch(press).unwrap();
+        assert_eq!(service.state()["profile_index"], 1);
+        let saved = load_settings(data_dir.join("app-settings.json"));
+        assert_eq!(saved.active_profile, 1);
+        assert_eq!(saved.profiles.len(), 2);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn stale_preview_frames_are_not_sent_to_new_clients() {
         let published = 5_000_000_000;
         assert!(super::preview_is_fresh(published, published + 999_999_999));
@@ -1339,6 +1555,28 @@ mod tests {
             published + 1_000_000_000
         ));
         assert!(super::preview_is_fresh(published, published - 1));
+    }
+
+    #[test]
+    fn auto_trigger_switches_effective_fov_without_changing_shared_target_color() {
+        let mut settings = AppSettings::default();
+        settings.fov_degrees = 42;
+        settings.pixel_color = "yellow".into();
+        settings.auto.enabled = true;
+        settings.auto.trigger_button = "m4".into();
+        settings.auto.fov_degrees = 88;
+
+        let released = json!({"state":"connected","buttons":[false,false,false,false,false]});
+        assert_eq!(
+            super::effective_detection_settings(&settings, &released),
+            (42, "yellow".into(), false)
+        );
+
+        let held = json!({"state":"connected","buttons":[false,false,false,true,false]});
+        assert_eq!(
+            super::effective_detection_settings(&settings, &held),
+            (88, "yellow".into(), true)
+        );
     }
 
     #[test]

@@ -52,6 +52,18 @@ pub struct BackendState {
     #[serde(default)]
     pub pixel_color: String,
     #[serde(default)]
+    pub effective_fov_degrees: u16,
+    #[serde(default)]
+    pub effective_pixel_color: String,
+    #[serde(default)]
+    pub auto_trigger_held: bool,
+    #[serde(default)]
+    pub profile_index: u8,
+    #[serde(default = "default_profile_count")]
+    pub profile_count: u8,
+    #[serde(default)]
+    pub profiles: Vec<ProfileSummary>,
+    #[serde(default)]
     pub pixel_profile_configured: bool,
     #[serde(default)]
     pub active_model_id: Option<String>,
@@ -73,6 +85,16 @@ pub struct BackendState {
     pub port: Option<u16>,
     #[serde(default)]
     pub device: Option<DeviceStatus>,
+}
+
+fn default_profile_count() -> u8 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ProfileSummary {
+    pub index: usize,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -124,6 +146,8 @@ pub struct Detection {
     pub target_xy: Option<[f32; 2]>,
     #[serde(default)]
     pub smoothed_target_xy: Option<[f32; 2]>,
+    #[serde(default)]
+    pub auto_target_valid: bool,
     #[serde(default)]
     pub inference_device: Option<String>,
 }

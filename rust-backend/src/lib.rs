@@ -1,3 +1,6 @@
+#![recursion_limit = "256"]
+
+pub mod auto_target;
 pub mod cli;
 pub mod config;
 pub mod crop;

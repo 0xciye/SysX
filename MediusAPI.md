@@ -185,7 +185,7 @@ while let Some(event) = input.recv_timeout(std::time::Duration::from_millis(100)
 - Do not rescan/open the same port every frame. Rescan on startup and reconnect with backoff on disconnect.
 - Drop the client handle on shutdown; the official client stops its reader/keepalive threads and closes serial on drop.
 - Do not report `input chain ready` based only on `VERSION`; call `query_health()` and evaluate the flags relevant to the product.
-- Current SysX monitor discovers the CH343 VID/PID, opens the path, verifies `query_version()`, and subscribes to all five physical buttons. While the configured Right/Middle/M4/M5 button is held, it sends fresh movement through `Device::move_rel()`, capped to ±32 per axis. It does not yet call `query_health()`, `device_info()`, or `inject()`.
+- Current SysX monitor discovers the CH343 VID/PID, opens the path, verifies `query_version()`, and subscribes to all five physical buttons. While the configured Right/Middle/M4/M5 button is held, it sends fresh movement through `Device::move_rel()`, capped to ±32 per axis. Auto clicks use `Device::press(Button::LEFT)` followed by `Device::release(Button::LEFT)` on the same verified handle. It does not yet call `query_health()` or `device_info()`.
 - No Medius hardware or Windows movement test has been run. The implemented call path and software caps do not establish physical calibration or end-to-end device latency.
 
 ## 8. API map and official references

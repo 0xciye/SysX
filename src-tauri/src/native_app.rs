@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{connect, Message};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_runtime.rs"));
@@ -43,6 +43,28 @@ struct DeviceStatus {
     state: DeviceState,
     name: Option<String>,
     buttons: [Option<bool>; 5],
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "snake_case")]
+struct AutoTargetEvent {
+    enabled: bool,
+    trigger_button: String,
+    delay_ms: u32,
+    cooldown_ms: u32,
+    sleep_ms: u32,
+    target_valid: bool,
+    timestamp_ms: u64,
+}
+
+impl AutoTargetEvent {
+    fn is_fresh(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(u64::MAX);
+        now.saturating_sub(self.timestamp_ms) <= 100 && self.timestamp_ms <= now.saturating_add(100)
+    }
 }
 
 impl DeviceStatus {
@@ -101,16 +123,21 @@ pub fn run() {
         return;
     };
     let movement_state = Arc::new(crate::movement::MovementState::default());
+    let auto_target = Arc::new(Mutex::new(AutoTargetEvent::default()));
     let device_state = Arc::new(Mutex::new(DeviceStatus::missing()));
     let (runtime, port, token, data_dir, config_port) =
-        match start_backend(Arc::clone(&movement_state)) {
+        match start_backend(Arc::clone(&movement_state), Arc::clone(&auto_target)) {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("SysX could not start: {error}");
                 return;
             }
         };
-    start_device_monitor(Arc::clone(&movement_state), Arc::clone(&device_state));
+    start_device_monitor(
+        Arc::clone(&movement_state),
+        Arc::clone(&auto_target),
+        Arc::clone(&device_state),
+    );
     let (event_tx, event_rx) = mpsc::channel();
     start_host_client(port, token, Arc::clone(&device_state), event_tx);
     let Some(config_port) = config_port else {
@@ -225,6 +252,7 @@ impl MonitorLifecycle {
 
 fn start_backend(
     movement_state: Arc<crate::movement::MovementState>,
+    auto_target: Arc<Mutex<AutoTargetEvent>>,
 ) -> Result<(BackendRuntime, u16, String, PathBuf, Option<u16>), String> {
     let token = make_token()?;
     let data_dir = app_data_dir();
@@ -262,6 +290,14 @@ fn start_backend(
                 };
                 if value.get("event").and_then(|value| value.as_str()) == Some("movement_target") {
                     crate::movement::set_target(&movement_state, &value);
+                    continue;
+                }
+                if value.get("event").and_then(|value| value.as_str()) == Some("auto_target") {
+                    if let Ok(event) = serde_json::from_value::<AutoTargetEvent>(value) {
+                        if let Ok(mut current) = auto_target.lock() {
+                            *current = event;
+                        }
+                    }
                     continue;
                 }
                 if value.get("event").and_then(|value| value.as_str()) == Some("ready") {
@@ -371,14 +407,39 @@ fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
     }
 }
 
+fn auto_action(
+    state: &mut crate::auto::AutoState,
+    input: &AutoTargetEvent,
+    trigger_held: bool,
+    now: Instant,
+) -> Option<crate::auto::AutoAction> {
+    if state.enabled() != input.enabled {
+        state.set_enabled(input.enabled);
+    }
+    let timing = crate::auto::AutoTiming {
+        delay_ms: input.delay_ms,
+        cooldown_ms: input.cooldown_ms,
+        sleep_ms: input.sleep_ms,
+    };
+    if state.timing() != timing {
+        state.set_timing(timing);
+    }
+    state.update(trigger_held, input.is_fresh() && input.target_valid, now)
+}
+
+fn auto_trigger_held(input: &AutoTargetEvent, held: impl FnOnce(u16) -> bool) -> bool {
+    crate::movement::trigger_button_index(&input.trigger_button).is_some_and(held)
+}
+
 fn start_device_monitor(
     movement_state: Arc<crate::movement::MovementState>,
+    auto_target: Arc<Mutex<AutoTargetEvent>>,
     device_state: Arc<Mutex<DeviceStatus>>,
 ) {
     let _ = thread::Builder::new()
         .name("sysx-device-monitor".into())
         .spawn(move || loop {
-            if inspect_devices(&movement_state, &device_state) {
+            if inspect_devices(&movement_state, &auto_target, &device_state) {
                 thread::sleep(Duration::from_millis(250));
             } else {
                 thread::sleep(Duration::from_secs(2));
@@ -388,11 +449,12 @@ fn start_device_monitor(
 
 fn inspect_devices(
     movement_state: &crate::movement::MovementState,
+    auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
 ) -> bool {
     let medius_ports = medius::find_medius();
     for port in &medius_ports {
-        if monitor_medius(movement_state, device_state, &port.path) {
+        if monitor_medius(movement_state, auto_target, device_state, &port.path) {
             return true;
         }
     }
@@ -413,7 +475,7 @@ fn inspect_devices(
             continue;
         }
         ferrum_candidate = true;
-        if monitor_ferrum(movement_state, device_state, &port.port_name) {
+        if monitor_ferrum(movement_state, auto_target, device_state, &port.port_name) {
             return true;
         }
     }
@@ -431,6 +493,7 @@ fn inspect_devices(
 
 fn monitor_medius(
     movement_state: &crate::movement::MovementState,
+    auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
     path: &str,
 ) -> bool {
@@ -472,11 +535,18 @@ fn monitor_medius(
     // (the crate shares one link), so a slow move never delays button events.
     let move_device = device.clone();
     let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
-        let (dx, dy) = crate::serial_queue::decode_medius_move(bytes)
-            .ok_or_else(|| "unsupported Medius command".to_string())?;
-        move_device
-            .move_rel(dx, dy)
-            .map_err(|error| error.to_string())
+        if crate::serial_queue::is_medius_left_click(bytes) {
+            move_device
+                .press(Button::LEFT)
+                .and_then(|_| move_device.release(Button::LEFT))
+                .map_err(|error| error.to_string())
+        } else {
+            let (dx, dy) = crate::serial_queue::decode_medius_move(bytes)
+                .ok_or_else(|| "unsupported Medius command".to_string())?;
+            move_device
+                .move_rel(dx, dy)
+                .map_err(|error| error.to_string())
+        }
     }) else {
         return false;
     };
@@ -484,6 +554,7 @@ fn monitor_medius(
     let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     let mut movement_error = false;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
+    let mut auto_state = crate::auto::AutoState::new();
     loop {
         if let Some(event) = events.recv_timeout(Duration::from_millis(4)) {
             let usage = match event.input {
@@ -523,6 +594,31 @@ fn monitor_medius(
         // (and expire after 100 ms) instead of queueing up behind it.
         if !serial.is_idle() {
             continue;
+        }
+        let auto_input = auto_target
+            .lock()
+            .map(|input| input.clone())
+            .unwrap_or_default();
+        let auto_held = auto_trigger_held(&auto_input, |button| {
+            events
+                .held(Class::Button)
+                .iter()
+                .any(|usage| usage.id == button)
+        });
+        if let Some(crate::auto::AutoAction::LeftClick) =
+            auto_action(&mut auto_state, &auto_input, auto_held, Instant::now())
+        {
+            match serial.submit_medius_left_click() {
+                Ok(completion) => {
+                    move_completion = Some(completion);
+                    serial.pump();
+                    continue;
+                }
+                Err(_) => {
+                    movement_error = true;
+                    break;
+                }
+            }
         }
         if let Some(target) = crate::movement::take_target(movement_state) {
             let held = crate::movement::trigger_button_index(&target.trigger_button).is_some_and(
@@ -595,6 +691,7 @@ fn parse_ferrum_button_mask(bytes: &[u8]) -> Option<u8> {
 
 fn monitor_ferrum(
     movement_state: &crate::movement::MovementState,
+    auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
     port_name: &str,
 ) -> bool {
@@ -652,6 +749,7 @@ fn monitor_ferrum(
     let mut last_mask = 0_u8;
     let mut movement_error = false;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
+    let mut auto_state = crate::auto::AutoState::new();
     loop {
         match connection.read(&mut chunk) {
             Ok(count) => {
@@ -686,6 +784,26 @@ fn monitor_ferrum(
         // they keep summing there and expire after 100 ms instead of queueing up.
         if !serial.is_idle() {
             continue;
+        }
+        let auto_input = auto_target
+            .lock()
+            .map(|input| input.clone())
+            .unwrap_or_default();
+        let auto_held = auto_trigger_held(&auto_input, |button| last_mask & (1 << button) != 0);
+        if let Some(crate::auto::AutoAction::LeftClick) =
+            auto_action(&mut auto_state, &auto_input, auto_held, Instant::now())
+        {
+            match serial.submit_left_click() {
+                Ok(completion) => {
+                    move_completion = Some(completion);
+                    serial.pump();
+                    continue;
+                }
+                Err(_) => {
+                    movement_error = true;
+                    break;
+                }
+            }
         }
         if let Some(target) = crate::movement::take_target(movement_state) {
             let held = crate::movement::trigger_button_index(&target.trigger_button)

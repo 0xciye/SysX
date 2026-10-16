@@ -90,6 +90,14 @@ impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
         })
     }
 
+    pub fn submit_left_click(&mut self) -> Result<Receiver<Result<(), String>>, String> {
+        self.submit(QueuedSerialCommand {
+            kind: 0,
+            bytes: b"km.click()\n".to_vec(),
+            request_ms: MOVE_REQUEST_MS,
+        })
+    }
+
     // Advance at most one request. `request_ms` is handed to the writer as its
     // per-command write budget.
     pub fn pump(&mut self) {
@@ -213,6 +221,24 @@ pub fn decode_medius_move(bytes: &[u8]) -> Option<(i16, i16)> {
             i16::from_le_bytes([*y0, *y1]),
         )),
         _ => None,
+    }
+}
+
+pub fn encode_medius_left_click() -> Vec<u8> {
+    vec![b'C']
+}
+
+pub fn is_medius_left_click(bytes: &[u8]) -> bool {
+    bytes == [b'C']
+}
+
+impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
+    pub fn submit_medius_left_click(&mut self) -> Result<Receiver<Result<(), String>>, String> {
+        self.submit(QueuedSerialCommand {
+            kind: 0,
+            bytes: encode_medius_left_click(),
+            request_ms: MOVE_REQUEST_MS,
+        })
     }
 }
 
@@ -437,6 +463,10 @@ mod tests {
         }
         assert_eq!(decode_medius_move(b"km.move(1,2)\n"), None);
         assert_eq!(decode_medius_move(&[b'M', 1, 0, 2]), None);
+        assert!(super::is_medius_left_click(
+            &super::encode_medius_left_click()
+        ));
+        assert!(!super::is_medius_left_click(b"km.click()\n"));
 
         let moves = Arc::new(Mutex::new(Vec::new()));
         let seen = moves.clone();
@@ -457,5 +487,16 @@ mod tests {
         assert_eq!(first.try_recv().unwrap(), Ok(()));
         assert_eq!(wrong.try_recv().unwrap(), Err("not a Medius move".into()));
         assert_eq!(moves.lock().unwrap().as_slice(), &[(7, -3)]);
+    }
+
+    #[test]
+    fn ferrum_left_click_uses_the_documented_km_command() {
+        let mut queue = SerialCommandQueue::new(FakeWriter::default());
+        let completion = queue.submit_left_click().unwrap();
+        queue.pump();
+        assert_eq!(queue.in_flight_bytes(), Some(b"km.click()\n".as_slice()));
+        queue.writer.completions[0] = Some(Ok(()));
+        queue.pump();
+        assert_eq!(completion.try_recv().unwrap(), Ok(()));
     }
 }

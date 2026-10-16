@@ -1,5 +1,12 @@
 # Tổng hợp công việc — 2026-10-15
 
+## Cập nhật hiện tại — 2026-10-16
+
+- Đã hoàn thiện profile settings trong backend và Web Config: khởi đầu với `Default`, tối đa ba profile, tạo, clone, đổi tên, xoá và chọn profile. Mỗi profile giữ snapshot setting riêng trong `app-settings.json`; nút chuột giữa chỉ chuyển profile một lần theo rising edge.
+- Receiver monitor hiện hiển thị tên profile đang chọn trong header. Tên và index lấy từ state WebSocket (`profile_index`/`profiles`), vì vậy Receiver tự đổi theo thao tác trên Web Config hoặc lần chuyển profile bằng chuột giữa mà không cần khởi động lại.
+- Auto target gate dùng mask HSV chung với Motion, chỉ báo target hợp lệ trong Auto FOV; không chọn target chuyển động và không vẽ line/ring tới pixel Auto. Auto state machine xử lý Delay, Cooldown, Sleep và gửi left-click qua Medius/Ferrum khi đủ điều kiện.
+- Đã cập nhật README, AGENTS, DEVELOPMENT và `docs/FEATURES_AND_CHANGES.md` theo source hiện tại. Kiểm thử cuối được ghi ở commit mới; Windows, OBS LAN và thiết bị Medius/Ferrum thật vẫn chưa được xác thực trong môi trường macOS.
+
 ## 1. Skill
 
 - Đã cài 7 design skill từ `~/.codex/skills` vào `~/.claude/skills`: `impeccable`, `ui-ux-pro-max`, `design`, `design-system`, `ui-styling`, `no-ai-design-slop`, `design-first-ui-prompting`.

@@ -1,5 +1,6 @@
 use crate::targeting::SmoothingRange;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -67,6 +68,27 @@ pub struct AutoSettings {
     pub sleep_ms: u32,
 }
 
+pub const MAX_PROFILES: usize = 3;
+
+/// Persisted snapshot for one profile. The snapshot deliberately contains
+/// only the normal AppSettings fields; profile metadata is kept by the outer
+/// AppSettings object so snapshots cannot recursively contain themselves.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProfileSlot {
+    pub name: String,
+    pub settings: Value,
+}
+
+impl Default for ProfileSlot {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            settings: Value::Object(Default::default()),
+        }
+    }
+}
+
 impl Default for AutoSettings {
     fn default() -> Self {
         Self {
@@ -98,6 +120,11 @@ impl AutoSettings {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
+    /// Zero-based active profile slot. The UI presents the active name and
+    /// allows up to three saved profiles.
+    pub active_profile: u8,
+    /// Up to three independent setting snapshots.
+    pub profiles: Vec<ProfileSlot>,
     pub motion_enabled: bool,
     pub trigger_button: String,
     pub strategy: String,
@@ -132,6 +159,8 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            active_profile: 0,
+            profiles: Vec::new(),
             motion_enabled: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
@@ -163,6 +192,135 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn normalize_profiles(&mut self) {
+        let current = profile_snapshot(self);
+        if self.profiles.len() > MAX_PROFILES {
+            self.profiles.truncate(MAX_PROFILES);
+        }
+        if self.profiles.is_empty() {
+            self.profiles.push(ProfileSlot {
+                name: "Default".into(),
+                settings: current,
+            });
+        }
+        for (index, slot) in self.profiles.iter_mut().enumerate() {
+            if slot.name.trim().is_empty() {
+                slot.name = if index == 0 {
+                    "Default".into()
+                } else {
+                    format!("Profile {}", index + 1)
+                };
+            }
+            if !slot.settings.is_object()
+                || serde_json::from_value::<AppSettings>(slot.settings.clone()).is_err()
+            {
+                slot.settings = profile_snapshot(&AppSettings::default());
+            }
+        }
+        self.active_profile =
+            usize::from(self.active_profile).min(self.profiles.len().saturating_sub(1)) as u8;
+    }
+
+    pub fn sync_active_profile(&mut self) {
+        self.normalize_profiles();
+        let index = usize::from(self.active_profile).min(self.profiles.len() - 1);
+        let snapshot = profile_snapshot(self);
+        self.profiles[index].settings = snapshot;
+    }
+
+    pub fn activate_profile(&mut self, index: usize) -> Result<(), SettingsError> {
+        self.normalize_profiles();
+        if index >= self.profiles.len() {
+            return Err(SettingsError::Invalid("profile does not exist"));
+        }
+        self.sync_active_profile();
+        let mut next: AppSettings =
+            serde_json::from_value(self.profiles[index].settings.clone())
+                .map_err(|_| SettingsError::Invalid("profile settings are invalid"))?;
+        next.profiles = self.profiles.clone();
+        next.active_profile = index as u8;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn rename_profile(&mut self, index: usize, name: &str) -> Result<(), SettingsError> {
+        self.normalize_profiles();
+        let name = name.trim();
+        if index >= self.profiles.len() {
+            return Err(SettingsError::Invalid("profile does not exist"));
+        }
+        if name.is_empty() || name.chars().count() > 32 {
+            return Err(SettingsError::Invalid(
+                "profile name must be 1..32 characters",
+            ));
+        }
+        self.profiles[index].name = name.to_owned();
+        Ok(())
+    }
+
+    pub fn create_profile(
+        &mut self,
+        name: Option<&str>,
+        duplicate_current: bool,
+    ) -> Result<(), SettingsError> {
+        self.normalize_profiles();
+        if self.profiles.len() >= MAX_PROFILES {
+            return Err(SettingsError::Invalid("maximum of 3 profiles reached"));
+        }
+        let index = self.profiles.len();
+        let snapshot = if duplicate_current {
+            self.sync_active_profile();
+            self.profiles[usize::from(self.active_profile)]
+                .settings
+                .clone()
+        } else {
+            profile_snapshot(&AppSettings::default())
+        };
+        let generated_name = if duplicate_current {
+            format!(
+                "{} Copy",
+                self.profiles[usize::from(self.active_profile)].name
+            )
+        } else {
+            format!("Profile {}", index + 1)
+        };
+        let profile_name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or(generated_name);
+        if profile_name.chars().count() > 32 {
+            return Err(SettingsError::Invalid(
+                "profile name must be 1..32 characters",
+            ));
+        }
+        self.profiles.push(ProfileSlot {
+            name: profile_name,
+            settings: snapshot,
+        });
+        self.activate_profile(index)
+    }
+
+    pub fn delete_profile(&mut self, index: usize) -> Result<(), SettingsError> {
+        self.normalize_profiles();
+        if self.profiles.len() <= 1 {
+            return Err(SettingsError::Invalid("at least one profile is required"));
+        }
+        if index >= self.profiles.len() {
+            return Err(SettingsError::Invalid("profile does not exist"));
+        }
+        let previous_active = usize::from(self.active_profile);
+        self.sync_active_profile();
+        self.profiles.remove(index);
+        let next_index = if previous_active > index {
+            previous_active - 1
+        } else {
+            previous_active.min(self.profiles.len() - 1)
+        };
+        self.activate_profile(next_index)
+    }
+
     pub fn smoothing_x(&self) -> SmoothingRange {
         SmoothingRange {
             min: self.smoothing_x_min,
@@ -237,6 +395,16 @@ impl AppSettings {
     }
 }
 
+fn profile_snapshot(settings: &AppSettings) -> Value {
+    let mut value =
+        serde_json::to_value(settings).unwrap_or_else(|_| Value::Object(Default::default()));
+    if let Some(object) = value.as_object_mut() {
+        object.remove("activeProfile");
+        object.remove("profiles");
+    }
+    value
+}
+
 #[derive(Debug, Error)]
 pub enum SettingsError {
     #[error("{0}")]
@@ -249,20 +417,27 @@ pub enum SettingsError {
 
 pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
     let Ok(raw) = fs::read_to_string(path) else {
-        return AppSettings::default();
+        return default_settings_with_profiles();
     };
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return AppSettings::default();
+        return default_settings_with_profiles();
     };
     migrate_smoothing(&mut json);
     let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
-        return AppSettings::default();
+        return default_settings_with_profiles();
     };
+    value.normalize_profiles();
     if value.validate().is_err() {
-        AppSettings::default()
+        default_settings_with_profiles()
     } else {
         value
     }
+}
+
+fn default_settings_with_profiles() -> AppSettings {
+    let mut settings = AppSettings::default();
+    settings.normalize_profiles();
+    settings
 }
 
 /// Files from before the 1–50 scale stored one alpha per axis; strength is
@@ -289,6 +464,7 @@ fn migrate_smoothing(json: &mut serde_json::Value) {
 
 pub fn save_settings(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let mut settings = settings.clone();
+    settings.sync_active_profile();
     settings.validate()?;
     atomic_write(path.as_ref(), &serde_json::to_vec(&settings)?)?;
     Ok(())
@@ -532,6 +708,54 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_have_three_independent_profile_slots() {
+        let mut first = AppSettings::default();
+        first.fov_degrees = 77;
+        first.normalize_profiles();
+        assert_eq!(first.profiles.len(), 1);
+        assert_eq!(first.profiles[0].name, "Default");
+        first.sync_active_profile();
+        first.create_profile(Some("Second"), false).unwrap();
+        first.activate_profile(1).unwrap();
+        assert_eq!(first.active_profile, 1);
+        assert_eq!(first.fov_degrees, AppSettings::default().fov_degrees);
+        first.fov_degrees = 123;
+        first.activate_profile(0).unwrap();
+        assert_eq!(first.fov_degrees, 77);
+        first.create_profile(Some("Third"), false).unwrap();
+        first.activate_profile(2).unwrap();
+        first.activate_profile(0).unwrap();
+        assert_eq!(first.profiles.len(), MAX_PROFILES);
+    }
+
+    #[test]
+    fn profile_crud_uses_clear_generated_names_and_keeps_one_profile() {
+        let mut settings = AppSettings::default();
+        settings.normalize_profiles();
+        settings.rename_profile(0, "Aim").unwrap();
+        settings.create_profile(None, false).unwrap();
+        assert_eq!(settings.profiles[1].name, "Profile 2");
+        settings.create_profile(None, true).unwrap();
+        assert_eq!(settings.profiles[2].name, "Profile 2 Copy");
+
+        settings.delete_profile(1).unwrap();
+        assert_eq!(settings.profiles.len(), 2);
+        settings.delete_profile(0).unwrap();
+        assert_eq!(settings.profiles.len(), 1);
+        assert!(settings.delete_profile(0).is_err());
+    }
+
+    #[test]
+    fn profile_slots_are_trimmed_and_active_index_is_clamped() {
+        let mut settings = AppSettings::default();
+        settings.active_profile = 99;
+        settings.profiles = vec![ProfileSlot::default(); 8];
+        settings.normalize_profiles();
+        assert_eq!(settings.profiles.len(), MAX_PROFILES);
+        assert_eq!(settings.active_profile, 2);
+    }
 
     #[test]
     fn older_alpha_smoothing_settings_become_the_one_to_ten_scale() {

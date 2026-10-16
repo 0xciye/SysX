@@ -89,7 +89,7 @@ There are no retransmissions or per-frame acknowledgements. Send each frame once
 The plugin:
 
 1. Reads the OBS main texture in the main-rendered callback and copies the centered `N × N` crop (N from `SYSCFG`, capped by the canvas size) on the GPU, then reads it back through a three-surface staging ring so the render thread never waits on the readback it just queued. HDR/non-BGRA canvases are silently skipped. Object Detection also requires the crop to match the selected model input dimensions; mismatches are rejected, not resized.
-2. JPEG-encodes the 8-bit BGRA crop with libjpeg-turbo (direct BGRA input, `jpeg_quality` default 80, 4:4:4 chroma by default so small Pixel Seek targets keep their color; `chroma_444 = 0` selects 4:2:0). The Receiver decodes JPEG to RGB, applies its center crop, then converts RGB → HSV for Pixel Seek.
+2. JPEG-encodes the 8-bit BGRA crop with libjpeg-turbo (direct BGRA input, `jpeg_quality` default 80, 4:4:4 chroma by default so small Pixel Seek targets keep their color; `chroma_444 = 0` selects 4:2:0). The Receiver decodes the sender crop to RGB, then converts RGB → HSV for Pixel Seek.
 3. Assign a frame ID and capture timestamp, split the JPEG into 1,170-byte payloads, write the v1 header in big-endian order, and send all chunks to the Receiver IP and port.
 4. Run capture conversion, compression, and socket sends outside OBS's render callback. Use a bounded queue with latest-frame behavior; discard obsolete unsent frames if encoding or the network falls behind.
 5. Send chunks in order for efficiency, while still tolerating receiver-side reordering. Do not use IP fragmentation or datagrams larger than the 1,200-byte protocol limit.
@@ -99,7 +99,7 @@ Respect the cadence of the source OBS output. The requested 180–360 FPS is a s
 
 ### Pixel Seek color path
 
-Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The Rust receiver decodes frames to RGB, applies the centered crop, and converts RGB to HSV in `rust-backend/src/pixel_seek.rs`. HSV thresholds are code-defined and are not configurable in the UI. Detection runs across the processed crop; FOV filters candidates passed to target selection, while detections outside FOV remain available to Preview. Box coordinates are mapped with the crop origin. The OBS plugin does not choose thresholds or ROI and should send the same frame regardless of the selected color.
+Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The OBS plugin applies the receiver-requested centered crop before JPEG encoding; the Rust receiver decodes that crop to RGB and converts RGB to HSV in `rust-backend/src/pixel_seek.rs`. HSV thresholds are code-defined and are not configurable in the UI. Detection runs across the received crop; FOV filters candidates passed to target selection, while detections outside FOV remain available to Preview. The plugin does not choose thresholds or ROI and should send the same crop regardless of the selected color.
 
 ## 5. Receiver operator workflow
 
