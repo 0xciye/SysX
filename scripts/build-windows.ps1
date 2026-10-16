@@ -69,6 +69,10 @@ try {
     )
     Invoke-CheckedNative -Command $stripper -CommandArguments @((Join-Path $root "dist"))
 
+    & (Join-Path $root "scripts\tests\ui-bundle.Tests.ps1")
+    # Check the generated loader and refresh SRI after stripping final Wasm bytes.
+    & (Join-Path $root "scripts\finalize-ui-bundle.ps1") -Directory (Join-Path $root "dist")
+
     # 2. Backend sidecar, embedded into SysX.exe.
     if ($UseExistingBackend) {
         if ($BackendPath) {

@@ -3,7 +3,8 @@ target = "index.html"
 dist = "../dist"
 public_url = "./"
 filehash = false
-inject_scripts = false
+# Required: inject the Rust/WASM loader, not only the static boot placeholder.
+inject_scripts = true
 
 [serve]
 addresses = ["127.0.0.1"]
