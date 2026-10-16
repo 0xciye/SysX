@@ -169,7 +169,6 @@ impl ReceiverService {
         let ticker_batcher = Arc::clone(&movement_batcher);
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
-            f64::from(app.dpi),
             Arc::new(CalibrationStore::load(
                 data_dir.join("motion-calibration.json"),
             )),
@@ -182,7 +181,6 @@ impl ReceiverService {
                 Some(MovementRuntimeSettings {
                     trigger_held,
                     sens: settings.sens,
-                    dpi: f64::from(settings.dpi),
                     offset_x: settings.offset_x,
                     offset_y: settings.offset_y,
                     trigger_button: settings.trigger_button,

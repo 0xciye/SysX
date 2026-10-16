@@ -11,9 +11,15 @@ const BEZIER_STRENGTH: f64 = 0.35;
 const STOP_RADIUS_PX: f64 = 2.0;
 /// ...and resume only once the error grows past this one (hysteresis).
 const RESUME_RADIUS_PX: f64 = 4.0;
-/// Smallest step outside the dead zone, in device counts per tick. It is a
-/// vector length, so with the residual accumulator a small diagonal error
-/// is walked as a diagonal instead of a forced ±1 staircase on one axis.
+/// The same radii in counts, for games where one count is several pixels.
+const STOP_RADIUS_COUNTS: f64 = 0.6;
+const RESUME_RADIUS_COUNTS: f64 = 1.2;
+/// A rough calibration closes errors more slowly: the time constant grows by
+/// this factor per unit of relative standard error.
+const CORRECTION_TAU_PER_ERROR: f64 = 4.0;
+/// Smallest uncalibrated step outside the dead zone, in device counts per
+/// tick. Steps are vector lengths, so with the residual accumulator a small
+/// diagonal error is walked as a diagonal, not a forced ±1 staircase.
 const MIN_STEP_COUNTS: f64 = 0.4;
 /// A target this much farther than the stroke's start distance starts a new stroke.
 const RESTROKE_GROWTH: f64 = 1.5;
@@ -25,19 +31,30 @@ const SPEED_SIGMA: f64 = 0.06;
 const SPEED_TAU_S: f64 = 0.15;
 const DEFAULT_TICK_S: f64 = 0.004;
 
+/// How fast the aim closes an error once px/count is measured: the remaining
+/// error shrinks with this time constant (before NCAF and the speed curve).
+const CORRECTION_TAU_S: f64 = 0.035;
+/// Correction speed cap and floor, in image px/s.
+const MAX_CORRECTION_PX_S: f64 = 4000.0;
+const MIN_CORRECTION_PX_S: f64 = 300.0;
+/// Before px/count is measured (the first ~0.1 s, never with a saved file):
+/// a deliberately slow step, safe for any game. A count turns the camera by
+/// yaw × sens degrees, so a higher sens needs fewer counts: counts scale with
+/// 1/sens. DPI only describes the physical mouse; injected counts ignore it.
+const UNCALIBRATED_COUNTS_PER_PX_AT_SENS_1: f64 = 0.0035;
+const UNCALIBRATED_MAX_STEP_COUNTS: f64 = 50.0;
+
 #[derive(Clone, Debug)]
 pub struct MovementConfig {
     pub snap_radius: f64,
     pub near_radius: f64,
     pub alpha: f64,
     pub snap_boost: f64,
-    pub max_step: f64,
     pub min_speed_multiplier: f64,
     pub max_speed_multiplier: f64,
-    pub x_speed: f64,
-    pub y_speed: f64,
+    /// In-game sensitivity: only scales the uncalibrated step and keys the
+    /// saved calibrations.
     pub sens: f64,
-    pub dpi: f64,
     pub clip_speed: f64,
 }
 
@@ -48,21 +65,17 @@ impl Default for MovementConfig {
             near_radius: 50.0,
             alpha: 1.5,
             snap_boost: 0.3,
-            max_step: 50.0,
             min_speed_multiplier: 0.01,
             max_speed_multiplier: 10.0,
-            x_speed: 3.0,
-            y_speed: 3.0,
             sens: 0.25,
-            dpi: 1600.0,
             clip_speed: 1000.0,
         }
     }
 }
 
-pub fn image_to_mouse_scale(dx: f64, dy: f64, sens: f64, dpi: f64) -> (f64, f64) {
-    let factor = 360.0 * 2.54 * sens.max(0.01) / (54.54 * dpi);
-    (dx * factor, dy * factor)
+/// Uncalibrated step size: device counts per image pixel of error.
+pub fn uncalibrated_counts_per_px(sens: f64) -> f64 {
+    UNCALIBRATED_COUNTS_PER_PX_AT_SENS_1 / sens.max(0.01)
 }
 
 pub fn crop_target_error(
@@ -150,7 +163,8 @@ struct Stroke {
     /// Scales the NCAF near-zone exponent: >1 brakes harder near the target.
     decel: f64,
     bezier: (f64, f64),
-    min_step: f64,
+    /// Scales the minimum step for this stroke.
+    min_step_scale: f64,
 }
 
 impl Stroke {
@@ -169,7 +183,7 @@ impl Stroke {
             },
             decel: rng.random_range(0.8..=1.25),
             bezier: (rng.random_range(0.06..=0.2), rng.random_range(0.8..=0.94)),
-            min_step: MIN_STEP_COUNTS * rng.random_range(0.75..=1.25),
+            min_step_scale: rng.random_range(0.75..=1.25),
         }
     }
 }
@@ -193,7 +207,8 @@ fn gaussian(rng: &mut StdRng) -> f64 {
 }
 
 /// Measured link between device counts and image motion, found online while
-/// tracking (the Sens/DPI formula is a gain setting, not a physical mapping).
+/// tracking: image pixels per count depend on the game's yaw, sensitivity,
+/// FOV and capture resolution, none of which SysX knows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionCalibration {
     /// Image pixels the target shifts per applied device count.
@@ -245,6 +260,8 @@ const FEEDFORWARD_GAIN: f64 = 0.9;
 const PROBE_COUNTS: i64 = 2;
 const PROBE_PROBABILITY: f64 = 1.0;
 const PROBE_PROBABILITY_CALIBRATED: f64 = 0.2;
+const PROBE_TARGET_PX: f64 = 0.8;
+const PROBE_MAX_PX: f64 = 3.0;
 /// Before the first estimate: the frame error with this short velocity lead
 /// (the original uncompensated behaviour, stable for any game).
 const UNCALIBRATED_LEAD_S: f64 = 0.016;
@@ -368,6 +385,8 @@ pub struct MovementController {
     calibration: Option<MotionCalibration>,
     /// Relative standard error of `calibration` (0 for a loaded one).
     calibration_error: f64,
+    /// `calibration` came from the saved file and is not yet re-measured.
+    calibration_loaded: bool,
     /// Applied moves in device counts, newest last.
     move_log: VecDeque<AppliedMove>,
     last_tick_s: Option<f64>,
@@ -383,10 +402,9 @@ pub struct MovementController {
 }
 
 impl MovementController {
-    pub fn new(sens: f64, dpi: f64) -> Self {
+    pub fn new(sens: f64) -> Self {
         Self::with_config(MovementConfig {
             sens,
-            dpi,
             ..MovementConfig::default()
         })
     }
@@ -404,6 +422,7 @@ impl MovementController {
             calibrator: MotionCalibrator::default(),
             calibration: None,
             calibration_error: 0.0,
+            calibration_loaded: false,
             move_log: VecDeque::new(),
             last_tick_s: None,
             residual: (0.0, 0.0),
@@ -436,16 +455,17 @@ impl MovementController {
         self.lateral = Drift::default();
         self.speed = Drift::default();
     }
-    pub fn set_calibration(&mut self, sens: f64, dpi: f64) -> Result<(), &'static str> {
-        if !(0.01..=10.0).contains(&sens) || !(100.0..=100_000.0).contains(&dpi) {
-            return Err("sens must be 0.01..10 and DPI must be 100..100000");
+    /// A new in-game sensitivity. (DPI does not change injected counts.)
+    pub fn set_sensitivity(&mut self, sens: f64) -> Result<(), &'static str> {
+        if !(0.01..=10.0).contains(&sens) {
+            return Err("sens must be 0.01..10");
         }
         self.config.sens = sens;
-        self.config.dpi = dpi;
         // A new in-game sensitivity changes pixels per count: measure again.
         self.calibrator = MotionCalibrator::default();
         self.calibration = None;
         self.calibration_error = 0.0;
+        self.calibration_loaded = false;
         self.reset();
         Ok(())
     }
@@ -457,6 +477,7 @@ impl MovementController {
     pub fn load_calibration(&mut self, calibration: Option<MotionCalibration>) {
         self.calibration = calibration;
         self.calibration_error = 0.0;
+        self.calibration_loaded = calibration.is_some();
     }
     /// The calibration once it is tight enough to save for later sessions.
     pub fn saveable_calibration(&self) -> Option<MotionCalibration> {
@@ -522,7 +543,10 @@ impl MovementController {
         // Feedforward: turn at the target's own speed, so a moving target is
         // followed without waiting for a large error to build up.
         if let Some(calibration) = self.calibration {
-            let scale = FEEDFORWARD_GAIN * tick_s / calibration.px_per_count;
+            // Feedforward trusts the latency and px/count as much as they deserve:
+            // with a wrong latency it would feed the loop's own oscillation.
+            let caution = 1.0 + CORRECTION_TAU_PER_ERROR * self.calibration_error;
+            let scale = FEEDFORWARD_GAIN / caution * tick_s / calibration.px_per_count;
             vx += self.target_velocity.0 * scale;
             vy += self.target_velocity.1 * scale;
         }
@@ -569,17 +593,26 @@ impl MovementController {
     }
 
     fn probe(&mut self) -> i64 {
-        let probability = if self.calibration.is_some() {
-            PROBE_PROBABILITY_CALIBRATED
-        } else {
-            PROBE_PROBABILITY
+        let (probability, counts) = match self.calibration {
+            None => (PROBE_PROBABILITY, PROBE_COUNTS),
+            // Calibrated: size the probe to about PROBE_TARGET_PX of image
+            // motion, and stop probing where one count is already visible jitter.
+            Some(calibration) => {
+                let counts = (PROBE_TARGET_PX / calibration.px_per_count)
+                    .round()
+                    .clamp(1.0, PROBE_COUNTS as f64);
+                if counts * calibration.px_per_count > PROBE_MAX_PX {
+                    return 0;
+                }
+                (PROBE_PROBABILITY_CALIBRATED, counts as i64)
+            }
         };
         if self.rng.random::<f64>() >= probability {
             0
         } else if self.rng.random::<bool>() {
-            PROBE_COUNTS
+            counts
         } else {
-            -PROBE_COUNTS
+            -counts
         }
     }
 
@@ -710,9 +743,10 @@ impl MovementController {
         };
         let accept = match self.calibration {
             None => relative_error <= enter,
-            // A loaded (or tighter) value is not traded for a rougher one
-            // until enough new evidence exists.
-            Some(_) if !trusted => relative_error <= self.calibration_error,
+            // A saved value is not traded for a rougher new one until enough
+            // new evidence exists. A fresh estimate always follows the data,
+            // so an early wrong guess is corrected as evidence arrives.
+            Some(_) if self.calibration_loaded && !trusted => relative_error <= 0.0,
             Some(_) => relative_error <= CALIBRATION_KEEP_REL_ERROR,
         };
         if accept {
@@ -722,6 +756,7 @@ impl MovementController {
                 ..estimate
             });
             self.calibration_error = relative_error;
+            self.calibration_loaded = false;
         } else if trusted && self.calibration.is_some() {
             // Plenty of new evidence and it no longer fits: measure afresh.
             self.calibration = None;
@@ -755,10 +790,13 @@ impl MovementController {
         target_speed: f64,
     ) -> (f64, f64) {
         let distance = px.hypot(py);
+        // The aim cannot settle closer than about half a count, so where one
+        // count is several pixels the dead zone grows with it.
+        let count_px = self.calibration.map_or(0.0, |c| c.px_per_count);
         let threshold = if self.settled {
-            RESUME_RADIUS_PX
+            RESUME_RADIUS_PX.max(RESUME_RADIUS_COUNTS * count_px)
         } else {
-            STOP_RADIUS_PX
+            STOP_RADIUS_PX.max(STOP_RADIUS_COUNTS * count_px)
         };
         if !distance.is_finite() || distance < threshold {
             // On a moving target only feedforward runs here; settling (and the
@@ -781,9 +819,6 @@ impl MovementController {
         };
 
         let c = &self.config;
-        let (mut mx, mut my) = image_to_mouse_scale(px, py, c.sens, c.dpi);
-        mx *= c.x_speed;
-        my *= c.y_speed;
         let mut factor = ncaf_factor(
             distance,
             c.snap_radius,
@@ -798,13 +833,31 @@ impl MovementController {
             factor += (1.0 - factor) * boost;
         }
         let factor = factor.clamp(c.min_speed_multiplier, c.max_speed_multiplier);
-        mx *= factor;
-        my *= factor;
-        let magnitude = mx.hypot(my);
+        // Step length in device counts per tick, with its cap and floor.
+        let (magnitude, cap, floor) = match self.calibration {
+            // Physical: close the error in image px/s, then convert with the
+            // measured px/count.
+            Some(calibration) => {
+                let to_counts = tick_s / calibration.px_per_count;
+                // A rough calibration (wrong latency, px/count) closes errors
+                // more gently, so a wrong estimate cannot fling the aim.
+                let caution = 1.0 + CORRECTION_TAU_PER_ERROR * self.calibration_error;
+                (
+                    distance / (CORRECTION_TAU_S * caution) * factor * to_counts,
+                    MAX_CORRECTION_PX_S * to_counts,
+                    MIN_CORRECTION_PX_S / caution * to_counts,
+                )
+            }
+            None => (
+                distance * uncalibrated_counts_per_px(c.sens) * factor,
+                UNCALIBRATED_MAX_STEP_COUNTS,
+                MIN_STEP_COUNTS,
+            ),
+        };
         if magnitude <= 1e-12 {
             return (0.0, 0.0);
         }
-        let (ux, uy) = (mx / magnitude, my / magnitude);
+        let (ux, uy) = (px / distance, py / distance);
 
         // Variation (curve, drift) fades out approaching the target, so the
         // final approach stays precise and does not jitter around it.
@@ -824,12 +877,8 @@ impl MovementController {
                 .lateral
                 .advance(&mut self.rng, tick_s, LATERAL_SIGMA, LATERAL_TAU_S);
 
-        let mut step = magnitude;
-        if c.max_step > 0.0 {
-            step = step.min(c.max_step);
-            step = bezier_response(step, c.max_step, BEZIER_STRENGTH, stroke.bezier);
-        }
-        step = (step * ramp * speed_noise).max(stroke.min_step);
+        let step = bezier_response(magnitude.min(cap), cap, BEZIER_STRENGTH, stroke.bezier);
+        let step = (step * ramp * speed_noise).max(floor * stroke.min_step_scale);
 
         // Bend the heading by the stroke's curve, fading as the gap closes, then
         // add the correlated lateral drift along the perpendicular.
@@ -863,7 +912,6 @@ pub struct MovementEvent {
 #[derive(Clone, Debug)]
 pub struct MovementRuntimeSettings {
     pub sens: f64,
-    pub dpi: f64,
     pub offset_x: f64,
     pub offset_y: f64,
     pub trigger_button: String,
@@ -894,15 +942,15 @@ fn calibration_changed(old: MotionCalibration, new: MotionCalibration) -> bool {
         || (new.latency_s - old.latency_s).abs() > LATENCY_STEP_S / 2.0
 }
 
+/// Keyed by sensitivity only: DPI does not change what a count does.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 struct SavedCalibration {
     sens: f64,
-    dpi: f64,
     px_per_count: f64,
     latency_s: f64,
 }
 
-/// Measured calibrations per Sens/DPI pair, kept in a small JSON file in the
+/// Measured calibrations per sensitivity, kept in a small JSON file in the
 /// app data directory so later sessions track at full speed from the start.
 /// Writes happen on a short-lived background thread.
 pub struct CalibrationStore {
@@ -930,25 +978,24 @@ impl CalibrationStore {
         }
     }
 
-    pub fn get(&self, sens: f64, dpi: f64) -> Option<MotionCalibration> {
+    pub fn get(&self, sens: f64) -> Option<MotionCalibration> {
         let entries = self.entries.lock().ok()?;
         entries
             .iter()
-            .find(|entry| entry.sens == sens && entry.dpi == dpi)
+            .find(|entry| entry.sens == sens)
             .map(|entry| MotionCalibration {
                 px_per_count: entry.px_per_count,
                 latency_s: entry.latency_s,
             })
     }
 
-    pub fn put(&self, sens: f64, dpi: f64, calibration: MotionCalibration) {
+    pub fn put(&self, sens: f64, calibration: MotionCalibration) {
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
-        entries.retain(|entry| !(entry.sens == sens && entry.dpi == dpi));
+        entries.retain(|entry| entry.sens != sens);
         entries.push(SavedCalibration {
             sens,
-            dpi,
             px_per_count: calibration.px_per_count,
             latency_s: calibration.latency_s,
         });
@@ -987,7 +1034,6 @@ pub struct MovementTicker {
 impl MovementTicker {
     pub fn new(
         initial_sens: f64,
-        initial_dpi: f64,
         calibrations: Arc<CalibrationStore>,
         settings: Arc<dyn Fn() -> Option<MovementRuntimeSettings> + Send + Sync>,
         on_event: Arc<dyn Fn(MovementEvent) + Send + Sync>,
@@ -1003,9 +1049,9 @@ impl MovementTicker {
         let worker = thread::Builder::new()
             .name("sysx-movement-ticker".into())
             .spawn(move || {
-                let mut controller = MovementController::new(initial_sens, initial_dpi);
-                controller.load_calibration(calibrations.get(initial_sens, initial_dpi));
-                let mut calibration = (initial_sens, initial_dpi);
+                let mut controller = MovementController::new(initial_sens);
+                controller.load_calibration(calibrations.get(initial_sens));
+                let mut sens = initial_sens;
                 let mut saved: Option<(MotionCalibration, Instant)> = None;
                 let mut sent_invalid = false;
                 loop {
@@ -1052,11 +1098,10 @@ impl MovementTicker {
                             thread::sleep(Duration::from_millis(4));
                             continue;
                         }
-                        if calibration != (runtime.sens, runtime.dpi) {
-                            let _ = controller.set_calibration(runtime.sens, runtime.dpi);
-                            controller
-                                .load_calibration(calibrations.get(runtime.sens, runtime.dpi));
-                            calibration = (runtime.sens, runtime.dpi);
+                        if sens != runtime.sens {
+                            let _ = controller.set_sensitivity(runtime.sens);
+                            controller.load_calibration(calibrations.get(runtime.sens));
+                            sens = runtime.sens;
                             saved = None;
                         }
                         let now = monotonic_seconds();
@@ -1072,7 +1117,7 @@ impl MovementTicker {
                                     && calibration_changed(last, measured)
                             });
                             if due {
-                                calibrations.put(calibration.0, calibration.1, measured);
+                                calibrations.put(sens, measured);
                                 saved = Some((measured, Instant::now()));
                             }
                         }
@@ -1320,11 +1365,36 @@ mod tests {
     }
 
     #[test]
-    fn sensitivity_dpi_formula_matches_configured_conversion() {
-        let factor = 360.0 * 2.54 * 0.25 / (54.54 * 1600.0);
-        let (x, y) = image_to_mouse_scale(1.0, -1.0, 0.25, 1600.0);
-        assert!((x - factor).abs() < 1e-12);
-        assert!((y + factor).abs() < 1e-12);
+    fn uncalibrated_step_needs_fewer_counts_at_a_higher_sensitivity() {
+        // One count turns yaw × sens degrees: twice the sens, half the counts.
+        assert!(
+            (uncalibrated_counts_per_px(0.5) * 2.0 - uncalibrated_counts_per_px(0.25)).abs()
+                < 1e-12
+        );
+        assert!((uncalibrated_counts_per_px(0.25) - 0.014).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibrated_correction_converts_image_speed_with_the_measured_px_per_count() {
+        // Same error and shape, twice the px/count: half the counts.
+        let step = |px_per_count: f64| {
+            let mut controller = seeded(54);
+            controller.acquiring = false;
+            controller.calibration = Some(MotionCalibration {
+                px_per_count,
+                latency_s: 0.0,
+            });
+            let (x, y) = controller.shape(200.0, 0.0, 1.0, DEFAULT_TICK_S, false, 0.0);
+            x.hypot(y)
+        };
+        assert!((step(0.25) / step(0.5) - 2.0).abs() < 1e-9);
+        // Beyond the snap radius: 200 px closed at 1/τ, a bit under the cap.
+        let expected = 200.0 / CORRECTION_TAU_S * DEFAULT_TICK_S / 0.25;
+        assert!(
+            step(0.25) <= expected && step(0.25) > expected * 0.4,
+            "{}",
+            step(0.25)
+        );
     }
 
     #[test]
@@ -1391,15 +1461,6 @@ mod tests {
             crop_target_error((-1.9, -1.9), (0, 0), (0, 0), (0.0, 0.0)),
             (-1.0, -1.0)
         );
-    }
-
-    /// A higher correction gain (the former Sens/DPI defaults), for tests of
-    /// the step shape that need steps above the minimum step.
-    fn seeded_high_gain(seed: u64) -> MovementController {
-        let mut controller = seeded(seed);
-        controller.config.sens = 0.235;
-        controller.config.dpi = 800.0;
-        controller
     }
 
     fn seeded(seed: u64) -> MovementController {
@@ -1496,7 +1557,7 @@ mod tests {
 
     #[test]
     fn each_stroke_accelerates_from_rest() {
-        let outputs = run(&mut seeded_high_gain(4), (300.0, 0.0), 60);
+        let outputs = run(&mut seeded(4), (300.0, 0.0), 60);
         let first = outputs[0].0.abs();
         let settled_speed = outputs[50].0.abs();
         assert!(first <= 1, "{outputs:?}");
@@ -1577,6 +1638,10 @@ mod tests {
         peak_after_start: f64,
         calibration: Option<MotionCalibration>,
         first_calibrated: Option<f64>,
+        /// First time the true error fell under 4 px.
+        settled_at: Option<f64>,
+        /// Largest distance past the target along the initial error direction.
+        overshoot: f64,
     }
 
     fn simulate_run(
@@ -1594,8 +1659,14 @@ mod tests {
             )
         };
         let mut controller = seeded(seed);
-        controller.calibration = preset;
+        controller.load_calibration(preset);
         let (mut early_squared, mut early_samples, mut peak) = (0.0, 0, 0.0_f64);
+        let (mut settled_at, mut overshoot) = (None, 0.0_f64);
+        let initial = target(0.0);
+        let initial_direction = (
+            initial.0 / initial.0.hypot(initial.1),
+            initial.1 / initial.0.hypot(initial.1),
+        );
         let mut first_calibrated = None;
         let mut noise = StdRng::seed_from_u64(seed ^ 0x5eed);
         // Camera offset in px after each applied move, with the time applied.
@@ -1652,6 +1723,11 @@ mod tests {
                 if now >= 0.3 {
                     peak = peak.max(error);
                 }
+                if error < 4.0 && settled_at.is_none() {
+                    settled_at = Some(now);
+                }
+                let along = (tx - cx) * initial_direction.0 + (ty - cy) * initial_direction.1;
+                overshoot = overshoot.max(-along);
             }
             if now >= SECONDS / 2.0 {
                 let (tx, ty) = target(now);
@@ -1666,6 +1742,8 @@ mod tests {
             peak_after_start: peak,
             calibration: controller.motion_calibration(),
             first_calibrated,
+            settled_at,
+            overshoot,
         }
     }
 
@@ -1806,6 +1884,31 @@ mod tests {
                 latency_s: world.latency_s,
             });
             let preset = simulate_run(world, true, 400, saved);
+            let still = simulate_run(
+                World {
+                    strafe: 0.0,
+                    ..world
+                },
+                true,
+                400,
+                None,
+            );
+            let still_saved = simulate_run(
+                World {
+                    strafe: 0.0,
+                    ..world
+                },
+                true,
+                400,
+                saved,
+            );
+            eprintln!(
+                "SETTLE {name}: still target 63 px away reached 4 px after {:.2}s (saved {:.2}s), overshoot {:.1} px (saved {:.1})",
+                still.settled_at.unwrap_or(f64::INFINITY),
+                still_saved.settled_at.unwrap_or(f64::INFINITY),
+                still.overshoot,
+                still_saved.overshoot
+            );
             eprintln!(
                 "STARTUP {name}: on after median {:.2}s max {:.2}s | first 1 s RMS {early:.0} px (saved file: {:.0}) | later {late:.0} px | peak {peak:.0} px",
                 first[5], first[9], preset.early_rms
@@ -1950,6 +2053,65 @@ mod tests {
     }
 
     #[test]
+    fn a_still_target_is_reached_quickly_without_overshoot() {
+        let still = World {
+            strafe: 0.0,
+            ..GAME
+        };
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        // 63 px away; with a saved calibration the aim is there in ~0.3 s.
+        let run = simulate_run(still, true, 81, saved);
+        let reached = run.settled_at.expect("reached the target");
+        assert!(reached <= 0.4, "reached after {reached:.2} s");
+        assert!(run.overshoot <= 8.0, "overshoot {:.1} px", run.overshoot);
+        // Learning from scratch is a little slower but still overshoots little.
+        let run = simulate_run(still, true, 81, None);
+        assert!(
+            run.settled_at.is_some_and(|at| at <= 0.8),
+            "{:?}",
+            run.settled_at
+        );
+        assert!(run.overshoot <= 8.0, "overshoot {:.1} px", run.overshoot);
+    }
+
+    #[test]
+    fn a_wrong_first_latency_guess_is_corrected_instead_of_oscillating() {
+        // At 50 ms the first rough estimate tends to pick the wrong latency;
+        // caution and continuous updates keep the aim from swinging.
+        let slow = World {
+            strafe: 0.0,
+            latency_s: 0.05,
+            ..GAME
+        };
+        for seed in [400, 401, 402] {
+            let run = simulate_run(slow, true, seed, None);
+            assert!(run.overshoot <= 10.0, "overshoot {:.1} px", run.overshoot);
+            let calibration = run.calibration.expect("calibrated");
+            assert!(
+                (calibration.latency_s - 0.05).abs() <= 0.0041,
+                "{calibration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_counts_do_not_hunt_around_the_target() {
+        // One count is 12 px: the dead zone grows to about a count, so the aim
+        // stops next to the target instead of hopping across it.
+        let coarse = World {
+            px_per_count: 12.0,
+            strafe: 0.0,
+            ..GAME
+        };
+        let run = simulate_run(coarse, true, 91, None);
+        assert!(run.rms < 12.0, "RMS {:.1} px", run.rms);
+        assert!(run.overshoot <= 13.0, "overshoot {:.1} px", run.overshoot);
+    }
+
+    #[test]
     fn a_saved_calibration_tracks_from_the_first_frame() {
         let saved = Some(MotionCalibration {
             px_per_count: 0.25,
@@ -1985,13 +2147,13 @@ mod tests {
             latency_s: 0.028,
         };
         let store = CalibrationStore::load(&path);
-        assert_eq!(store.get(0.25, 1600.0), None);
-        store.put(0.25, 1600.0, calibration);
-        assert_eq!(store.get(0.25, 1600.0), Some(calibration));
-        assert_eq!(store.get(0.5, 1600.0), None, "another sensitivity");
+        assert_eq!(store.get(0.25), None);
+        store.put(0.25, calibration);
+        assert_eq!(store.get(0.25), Some(calibration));
+        assert_eq!(store.get(0.5), None, "another sensitivity");
         // Written on a background thread.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while CalibrationStore::load(&path).get(0.25, 1600.0).is_none() {
+        while CalibrationStore::load(&path).get(0.25).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "calibration file was not written"
@@ -2001,12 +2163,12 @@ mod tests {
         // A damaged or out-of-range file is ignored, not trusted.
         std::fs::write(
             &path,
-            b"[{\"sens\":0.25,\"dpi\":1600,\"px_per_count\":-1,\"latency_s\":0}]",
+            b"[{\"sens\":0.25,\"px_per_count\":-1,\"latency_s\":0}]",
         )
         .unwrap();
-        assert_eq!(CalibrationStore::load(&path).get(0.25, 1600.0), None);
+        assert_eq!(CalibrationStore::load(&path).get(0.25), None);
         std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(CalibrationStore::load(&path).get(0.25, 1600.0), None);
+        assert_eq!(CalibrationStore::load(&path).get(0.25), None);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2063,7 +2225,7 @@ mod tests {
     #[test]
     fn near_zone_response_rises_with_target_speed() {
         let step_at = |speed: f64| {
-            let mut controller = seeded_high_gain(53);
+            let mut controller = seeded(53);
             controller.calibration = Some(MotionCalibration {
                 px_per_count: 0.25,
                 latency_s: 0.0,
