@@ -2,6 +2,12 @@
 
 > **Trạng thái sử dụng:** Hiện chỉ **Pixel Seek dùng được**. **Object Detection, ONNX Runtime, OpenVINO và TensorRT chưa dùng được**; source/dependency được giữ cho phát triển. Thiết bị được hỗ trợ chỉ còn **Medius qua Rust SDK**; đã bỏ Ferrum và MAKCU.
 
+## Cập nhật — 2026-10-17
+
+- Thêm Motion **Always on**: khi bật, chuyển động theo target hợp lệ không cần giữ nút trigger; khi tắt, giữ nguyên cơ chế trigger như trước. Bật Always on sẽ vô hiệu hóa Auto trong UI và ở runtime; các thiết lập Auto vẫn được lưu để dùng lại khi Always on tắt. Target vẫn phải còn mới (≤100 ms) và Motion phải được bật.
+- Khôi phục điều kiện sẵn sàng Medius đầy đủ: `link_up`, `mouse_attached`, và `clone_configured` đều phải đúng trước khi nhận input hoặc gửi lệnh. Quá trình dò vẫn độc lập với clone enumeration, thử các cổng CH343 phù hợp và ghi nguyên nhân lỗi vào log.
+- Đã build release mới; 49 bài test native Rust đạt. Chưa xác minh trên thiết bị Medius/chuột thật.
+
 ## Cập nhật hiện tại — 2026-10-16
 
 - Đã hoàn thiện profile settings trong backend và Web Config: khởi đầu với `Default`, tối đa ba profile, tạo, clone, đổi tên, xoá và chọn profile. Mỗi profile giữ snapshot setting riêng trong `app-settings.json`; nút chuột giữa chỉ chuyển profile một lần theo rising edge.

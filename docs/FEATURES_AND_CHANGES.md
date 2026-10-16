@@ -2,7 +2,7 @@
 
 > **Trạng thái sử dụng:** Hiện chỉ **Pixel Seek dùng được**. **Object Detection, ONNX Runtime, OpenVINO và TensorRT chưa dùng được**; source/dependency được giữ cho phát triển. Thiết bị được hỗ trợ chỉ còn **Medius qua Rust SDK**; đã bỏ Ferrum và MAKCU.
 
-Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-10-15 → 2026-10-16, theo từng phần, kèm file code và mức độ đã kiểm chứng. Lịch sử commit đầy đủ nằm trong `git log` trên nhánh `main`.
+Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-10-15 → 2026-10-17, theo từng phần, kèm file code và mức độ đã kiểm chứng. Lịch sử commit đầy đủ nằm trong `git log` trên nhánh `main`.
 
 ## 1. Tổng quan kiến trúc
 
@@ -75,7 +75,7 @@ Các mục dưới đây mô tả source thử nghiệm; ONNX Runtime, OpenVINO 
 
 - **Làm mượt X/Y** (`ExponentialTargetSmoother`): alpha 0.01–1.0 cho từng trục; 1.0 = không làm mượt. Reset khi mất target hoặc đổi cấu hình.
 - **Backend** (`rust-backend/src/movement.rs`): bộ điều khiển NCAF ba vùng (snap 150 / near 50), dự đoán vận tốc; mỗi lượt di chuyển chọn một lần độ cong (giảm dần khi tới gần), thời gian tăng tốc, mức giảm tốc và đường cong Bézier cho độ lớn bước; nhiễu tương quan theo thời gian (Ornstein-Uhlenbeck, ngang hướng di chuyển và tốc độ) thay cho micro-correction ±1 độc lập, tắt dần khi gần đích; vùng dừng 2 px / chạy lại 4 px (hysteresis), không ép ±1 mà dùng bước tối thiểu theo vector cộng dồn phần lẻ; khi giữ trigger, tự hiệu chuẩn px/count và độ trễ bằng tín hiệu dò ±2 count (bám nhanh bật sau ~0,1 s ở 240 FPS, lưu vào `motion-calibration.json` theo sens để lần sau bám ngay) rồi tách chuyển động target khỏi chuyển động chuột, feedforward theo vận tốc target, tăng đáp ứng vùng gần khi target nhanh, không dừng khi target còn chạy, chỉ ramp khi bắt target mới; đổi pixel ra count bằng px/count đo được (sửa sai số theo px/s, hằng số thời gian 35 ms, chậm hơn khi ước lượng còn thô); trước khi đo xong dùng bước chậm 0,0035/sens count mỗi px — một count xoay camera yaw × sens độ nên sens cao cần ít count hơn, DPI không ảnh hưởng count gửi qua thiết bị (mặc định sens 0.25; không còn ô DPI — file cài đặt cũ có `dpi` vẫn đọc được và bỏ trường này ở lần lưu sau); offset X/Y cộng vào target. Ticker riêng chạy mỗi 4 ms với target mới nhất.
-- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms), chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ, cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius Rust SDK `move_rel`. Auto giữ state riêng: chỉ nhận pixel màu chạm tâm crosshair trong Auto FOV, Delay bắt đầu khi xác nhận pixel đó, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)`.
+- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms); mặc định chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ. Motion **Always on** bỏ yêu cầu giữ nút nhưng vẫn cần Motion bật và target còn hợp lệ/tươi; khi bật thì Auto bị khóa hiệu dụng, còn thiết lập Auto đã lưu được giữ nguyên. Cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius Rust SDK `move_rel`. Auto giữ state riêng: chỉ nhận pixel màu chạm tâm crosshair trong Auto FOV, Delay bắt đầu khi xác nhận pixel đó, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)`.
 - **Chưa kiểm chứng:** chưa có phần cứng Medius để thử.
 
 ## 7. Receiver UI (`rust-ui`)
@@ -95,7 +95,7 @@ Các mục dưới đây mô tả source thử nghiệm; ONNX Runtime, OpenVINO 
 
 ## 8. Host native và vòng đời (`src-tauri`)
 
-- Chỉ giữ Medius qua Rust SDK `medius 3.4.6`; quét CH343 control port, dùng `Device::open` handshake rồi mới đợi health clone chuột trước khi SysX gửi input; adapter `medius_device.rs` gọi API công khai. Bỏ Ferrum, không tích hợp MAKCU; không tự đóng gói Native wire. Đã sửa lỗi Apply Changes bị khóa do giữ mutex settings khi dựng ACK. Xem `MediusAPI.md`.
+- Chỉ giữ Medius qua Rust SDK `medius 3.4.6`; quét CH343 control port, dùng `Device::open` handshake rồi yêu cầu đủ `link_up`, `mouse_attached`, `clone_configured` trước khi SysX gửi input; adapter `medius_device.rs` gọi API công khai. Bỏ Ferrum, không tích hợp MAKCU; không tự đóng gói Native wire. Đã sửa lỗi Apply Changes bị khóa do giữ mutex settings khi dựng ACK. Xem `MediusAPI.md`.
 
 - **Một SysX duy nhất:** mutex `Local\SysX.Receiver.SingleInstance` (`single_instance.rs`). Mở lần hai → đưa cửa sổ monitor đang có lên trước (hoặc mở lại từ `%LOCALAPPDATA%\SysX\instance.json`) rồi thoát, không tạo backend thứ hai (trước đây gây lỗi 10048 trên UDP 4200).
 - **Đóng cửa sổ monitor → SysX tắt** sau 3 giây (60 giây nếu monitor không bao giờ kết nối).
