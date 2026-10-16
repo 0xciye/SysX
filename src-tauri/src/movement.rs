@@ -16,14 +16,21 @@ pub struct RecoilSettings {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct MovementTarget {
+    #[serde(default, alias = "configRevision")]
+    pub config_revision: u64,
+    #[serde(alias = "targetValid")]
     pub target_valid: bool,
     pub dx: i64,
     pub dy: i64,
+    #[serde(alias = "motionEnabled")]
     pub motion_enabled: bool,
+    #[serde(alias = "motionAlwaysOn")]
     pub motion_always_on: bool,
+    #[serde(alias = "triggerButton")]
     pub trigger_button: String,
+    #[serde(alias = "timestampMs")]
     pub timestamp_ms: u64,
     #[serde(alias = "nativeMotion", alias = "native_motion")]
     pub recoil: RecoilSettings,
@@ -64,7 +71,9 @@ impl MovementTarget {
     fn merge_pending(previous: Option<Self>, mut current: Self) -> Self {
         if current.target_valid {
             if let Some(previous) = previous.filter(|previous| {
-                previous.target_valid && previous.is_fresh_at(current.timestamp_ms)
+                previous.target_valid
+                    && previous.config_revision == current.config_revision
+                    && previous.is_fresh_at(current.timestamp_ms)
             }) {
                 current.dx = previous.dx.saturating_add(current.dx);
                 current.dy = previous.dy.saturating_add(current.dy);

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Controls and samples share this input, but a control event always has an
 /// invalid target and timestamp zero. Configuration never refreshes a sample.
+/// config_revision also gates queued Motion output across routing transitions.
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "snake_case")]
 pub(crate) struct AutoTargetEvent {
@@ -22,6 +23,16 @@ pub(crate) struct AutoTargetEvent {
 }
 
 impl AutoTargetEvent {
+    pub(crate) fn blocks_motion(&self, trigger_held: bool) -> bool {
+        // Routing follows the held feature, not a center hit or sample freshness.
+        // The backend publishes enabled=false while Motion Always-on has priority.
+        self.enabled && trigger_held
+    }
+
+    pub(crate) fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
     pub(crate) fn action(
         &self,
         state: &mut AutoState,

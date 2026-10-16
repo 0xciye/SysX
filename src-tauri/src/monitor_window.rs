@@ -273,20 +273,16 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
     app.set_image_y(rect.y as f32);
     app.set_image_width(rect.width as f32);
     app.set_image_height(rect.height as f32);
-    let fov = state
-        .map(|s| {
-            if s.effective_fov_degrees > 0 {
-                s.effective_fov_degrees
-            } else {
-                s.fov_degrees
-            }
-        })
-        .unwrap_or(36);
+    let fov = if meta.detection.fov_degrees > 0 {
+        meta.detection.fov_degrees
+    } else {
+        state.map(|s| s.fov_degrees).unwrap_or(36)
+    };
     let d = fov_diameter(rect, fov).unwrap_or(0.);
     app.set_fov_size(d as f32);
     app.set_fov_x((rect.x + (rect.width - d) / 2.) as f32);
     app.set_fov_y((rect.y + (rect.height - d) / 2.) as f32);
-    app.set_fov_ink(ink(if state.is_some_and(|s| s.auto_trigger_held) {
+    app.set_fov_ink(ink(if meta.detection.auto_active {
         0x4da7e8
     } else {
         0x43cfa0
@@ -328,7 +324,7 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
             last.borrow_mut().overlay = overlay;
         }
     }
-    let target = (!meta.detection.auto_target_valid)
+    let target = (!meta.detection.auto_active)
         .then_some(
             meta.detection
                 .smoothed_target_xy
@@ -403,7 +399,7 @@ fn overlay_svg(
             h - c
         );
     }
-    if !meta.detection.auto_target_valid {
+    if !meta.detection.auto_active {
         if let Some(t) = meta
             .detection
             .smoothed_target_xy
@@ -579,6 +575,36 @@ pub fn run(
     slint::run_event_loop_until_quit().map_err(|e| e.to_string())
 }
 thread_local! {static UPLOAD:RefCell<RenderCache>=const{RefCell::new(RenderCache{uploaded:None,overlay:String::new()})};}
+
+#[cfg(test)]
+mod overlay_routing_tests {
+    #[test]
+    fn auto_hides_reticle_through_center_loss_and_pending_delay() {
+        let mut meta: sysx_ui::protocol::LiveFrame = serde_json::from_value(serde_json::json!({
+            "frame_id":1, "source":"test", "source_width":64, "source_height":64,
+            "crop_x":0, "crop_y":0, "mode":"pixel_seek", "model_id":null,
+            "processing_fps":null, "source_fps":null, "dropped_input_frames":0,
+            "transport_dropped_frames":0,
+            "detection":{"frame_id":1,"timestamp_ns":0,"mode":"pixel_seek",
+                "model_id":null,"source_width":64,"source_height":64,
+                "processed_width":64,"processed_height":64,"objects":[],
+                "total_processing_ms":0,"target_xy":[48,32],"auto_active":true}
+        }))
+        .unwrap();
+        let rect = sysx_ui::layout::Rect {
+            x: 0.,
+            y: 0.,
+            width: 640.,
+            height: 640.,
+        };
+        for valid in [false, true, false] {
+            meta.detection.auto_target_valid = valid;
+            assert!(!super::overlay_svg(&meta, rect, 640., "red").contains("id=\"lead\""));
+        }
+        meta.detection.auto_active = false;
+        assert!(super::overlay_svg(&meta, rect, 640., "red").contains("id=\"lead\""));
+    }
+}
 
 #[cfg(test)]
 mod render_tests {

@@ -2,7 +2,7 @@ use crate::auto_target::has_center_pixel_in_fov;
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
-use crate::pixel_seek::{process_pixel_seek, PixelTargetColor};
+use crate::pixel_seek::{color_mask, process_pixel_seek, PixelSeekOutput, PixelTargetColor};
 use crate::receiver::SourceFrame;
 use crate::results::{DetectionMode, DetectionResult};
 use crate::storage::DetectionDataStore;
@@ -21,10 +21,12 @@ pub struct PipelineConfig {
     pub pixel_color: PixelTargetColor,
     pub crop_resolution: Option<u32>,
     pub fov_degrees: u16,
+    pub auto_fov_degrees: u16,
     /// True only while the enabled Auto trigger is held. In that state the
-    /// Pixel Seek mask also feeds Auto's center-crossing validity gate.
+    /// Pixel Seek mask feeds only Auto's center-crossing validity gate.
     pub auto_target_active: bool,
-    /// Control revision used to reject callbacks completed before an Auto edit.
+    /// Shared control/routing revision used to reject callbacks and Motion samples
+    /// completed before a configuration or Auto trigger transition.
     pub auto_config_revision: u64,
     pub smoothing_x: SmoothingRange,
     pub smoothing_y: SmoothingRange,
@@ -40,6 +42,7 @@ impl Default for PipelineConfig {
             pixel_color: PixelTargetColor::Yellow,
             crop_resolution: Some(640),
             fov_degrees: 36,
+            auto_fov_degrees: 36,
             auto_target_active: false,
             auto_config_revision: 0,
             smoothing_x: SmoothingRange::NONE,
@@ -399,6 +402,8 @@ fn process_frame(
             target_xy: None,
             smoothed_target_xy: None,
             auto_target_valid: false,
+            auto_active: false,
+            fov_degrees: config.fov_degrees,
         };
         let candidates = object_detection_candidates(&result, model.confidence);
         let selected_target = object_detection_target(
@@ -436,13 +441,23 @@ fn process_frame(
     let locked = previous_target
         .filter(|_| previous_is_fresh)
         .and_then(|previous| previous.bbox_xyxy);
-    let output = process_pixel_seek(
-        processed,
-        rect,
-        config.pixel_color,
-        config.fov_degrees,
-        locked,
-    );
+    // Auto owns this frame while active. Never run Motion selection or retain
+    // its coordinates/lock during Auto, even when no pixel touches the center.
+    let output = if config.auto_target_active {
+        PixelSeekOutput {
+            objects: Vec::new(),
+            target: None,
+            mask: color_mask(processed, config.pixel_color),
+        }
+    } else {
+        process_pixel_seek(
+            processed,
+            rect,
+            config.pixel_color,
+            config.fov_degrees,
+            locked,
+        )
+    };
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let auto_target_valid = config.auto_target_active
@@ -450,7 +465,7 @@ fn process_frame(
             &output.mask,
             processed.width(),
             processed.height(),
-            config.fov_degrees,
+            config.auto_fov_degrees,
         );
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
         x: point[0],
@@ -475,6 +490,12 @@ fn process_frame(
         target_xy,
         smoothed_target_xy: filtered.map(|point| [point.x, point.y]),
         auto_target_valid,
+        auto_active: config.auto_target_active,
+        fov_degrees: if config.auto_target_active {
+            config.auto_fov_degrees
+        } else {
+            config.fov_degrees
+        },
     };
     Ok(ProcessedFrame {
         auto_config_revision: config.auto_config_revision,
@@ -550,7 +571,7 @@ fn cached_runtime<'a>(
 }
 
 fn validate_config(config: &PipelineConfig) -> Result<(), &'static str> {
-    if !(1..=360).contains(&config.fov_degrees) {
+    if !(1..=360).contains(&config.fov_degrees) || !(1..=360).contains(&config.auto_fov_degrees) {
         return Err("FOV must be 1..360");
     }
     if !config.smoothing_x.is_valid() || !config.smoothing_y.is_valid() {
@@ -588,6 +609,53 @@ fn monotonic_ns() -> u64 {
 mod tests {
     use super::*;
     use crate::config::ModelArtifacts;
+
+    #[test]
+    fn auto_frames_never_publish_motion_targets_and_use_their_own_fov() {
+        let mut config = PipelineConfig {
+            pixel_color: PixelTargetColor::Red,
+            fov_degrees: 360,
+            auto_fov_degrees: 1,
+            ..PipelineConfig::default()
+        };
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut cache = None;
+        // Motion first, then Auto off-center, center crossing, target loss,
+        // and Motion again. Auto intent must survive target loss/delayed clicks.
+        for (id, auto, center) in [
+            (1, false, false),
+            (2, true, false),
+            (3, true, true),
+            (4, true, false),
+            (5, false, false),
+        ] {
+            config.auto_target_active = auto;
+            let mut image = image::RgbImage::new(64, 64);
+            image.put_pixel(40, 32, image::Rgb([255, 0, 0]));
+            if center {
+                image.put_pixel(32, 32, image::Rgb([255, 0, 0]));
+            }
+            let frame = SourceFrame {
+                frame_id: id,
+                timestamp_ns: 0,
+                image,
+                source: "test".into(),
+                jpeg: Default::default(),
+            };
+            let result = process_frame(frame, &config, &mut smoother, &mut cache, None, false)
+                .unwrap()
+                .result;
+            assert_eq!(result.auto_active, auto);
+            assert_eq!(result.auto_target_valid, auto && center);
+            assert_eq!(result.fov_degrees, if auto { 1 } else { 360 });
+            assert_eq!(result.target_xy.is_none(), auto);
+            assert_eq!(result.smoothed_target_xy.is_none(), auto);
+            if auto {
+                assert!(result.objects.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn processing_keeps_the_plugin_cropped_frame_without_recropping() {

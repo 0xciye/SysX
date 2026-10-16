@@ -54,6 +54,17 @@ impl AutoEvents {
         }
     }
 
+    /// Every routing/configuration boundary invalidates old frame callbacks and
+    /// queued Motion samples, including trigger release/press with unchanged settings.
+    fn reconfigure(&mut self, settings: &AutoSettings) {
+        let previous = self.revision;
+        self.configure(settings);
+        if self.revision == previous {
+            self.revision = self.revision.wrapping_add(1);
+            (self.emit)(self.event("auto_config", false, 0));
+        }
+    }
+
     fn event(&self, kind: &str, target_valid: bool, timestamp_ms: u64) -> Value {
         json!({
             "event": kind,
@@ -200,6 +211,7 @@ impl ReceiverService {
             pixel_color,
             crop_resolution: Some(app.crop_resolution),
             fov_degrees: app.fov_degrees,
+            auto_fov_degrees: app.auto.fov_degrees,
             auto_target_active: false,
             auto_config_revision: 0,
             smoothing_x: app.smoothing_x(),
@@ -215,12 +227,13 @@ impl ReceiverService {
         })));
         let device = Arc::new(Mutex::new(missing_device()));
         let auto_events = Arc::new(Mutex::new(AutoEvents {
-            settings: app.auto.clone(),
+            settings: routed_auto_settings(&app),
             revision: 0,
             emit: Arc::new(|event| println!("{event}")),
         }));
         let ticker_settings = Arc::clone(&settings);
         let ticker_device = Arc::clone(&device);
+        let ticker_auto = Arc::clone(&auto_events);
         let ticker_batcher = Arc::clone(&movement_batcher);
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
@@ -228,20 +241,20 @@ impl ReceiverService {
                 data_dir.join("motion-calibration.json"),
             )),
             Arc::new(move || {
-                let settings = ticker_settings.lock().ok()?.clone();
-                let trigger_held = ticker_device
-                    .lock()
-                    .ok()
-                    .is_some_and(|device| trigger_held(&device, &settings.trigger_button));
+                let settings = ticker_settings.lock().ok()?;
+                let device = ticker_device.lock().ok()?;
+                let trigger_held = trigger_held(&device, &settings.trigger_button);
+                let auto_active = effective_detection_settings(&settings, &device).2;
                 Some(MovementRuntimeSettings {
-                    motion_enabled: settings.motion_enabled,
+                    config_revision: ticker_auto.lock().ok()?.revision,
+                    motion_enabled: settings.motion_enabled && !auto_active,
                     motion_always_on: settings.motion_always_on,
                     trigger_held,
                     sens: settings.sens,
                     offset_x: settings.offset_x,
                     offset_y: settings.offset_y,
-                    trigger_button: settings.trigger_button,
-                    recoil: settings.recoil,
+                    trigger_button: settings.trigger_button.clone(),
+                    recoil: settings.recoil.clone(),
                 })
             }),
             Arc::new(move |event| ticker_batcher.submit(event)),
@@ -255,25 +268,35 @@ impl ReceiverService {
             // Wake every preview socket for this frame (no timer polling:
             // Windows timers tick at ~15.6 ms, which capped Preview near 60 FPS).
             preview_tx.send_replace(processed.published_ns);
-            let point = |point: [f32; 2]| (f64::from(point[0]), f64::from(point[1]));
-            callback_ticker.update(MovementTargetSample {
-                frame_id: processed.frame.frame_id,
-                target: processed.result.target_xy.map(point),
-                smoothing_alpha: (
-                    f64::from(processed.smoothing_alpha.0),
-                    f64::from(processed.smoothing_alpha.1),
-                ),
-                crop_origin: (processed.crop_x, processed.crop_y),
-                processed_size: (
-                    processed.result.processed_width,
-                    processed.result.processed_height,
-                ),
-                received_s: 0.0,
-            });
+            // Hold the same settings lock used by reconfigure until publication.
+            // The pipeline drops its lock before callbacks, so generation checks
+            // alone cannot reject a callback delayed across a mode change.
             if let (Ok(settings), Ok(device)) = (callback_settings.lock(), callback_device.lock()) {
-                let auto_active = !settings.motion_always_on && auto_trigger_active(&settings.auto, &device);
-                if let Ok(mut events) = callback_auto.lock() {
-                    events.configure(&settings.auto);
+                if let Ok(events) = callback_auto.lock() {
+                    if processed.auto_config_revision != events.revision {
+                        return;
+                    }
+                    let point = |point: [f32; 2]| (f64::from(point[0]), f64::from(point[1]));
+                    callback_ticker.update(MovementTargetSample {
+                        config_revision: processed.auto_config_revision,
+                        frame_id: processed.frame.frame_id,
+                        target: if processed.result.auto_active {
+                            None
+                        } else {
+                            processed.result.target_xy.map(point)
+                        },
+                        smoothing_alpha: (
+                            f64::from(processed.smoothing_alpha.0),
+                            f64::from(processed.smoothing_alpha.1),
+                        ),
+                        crop_origin: (processed.crop_x, processed.crop_y),
+                        processed_size: (
+                            processed.result.processed_width,
+                            processed.result.processed_height,
+                        ),
+                        received_s: 0.0,
+                    });
+                    let auto_active = effective_detection_settings(&settings, &device).2;
                     events.target(
                         processed.auto_config_revision,
                         auto_active && processed.result.auto_target_valid,
@@ -514,7 +537,7 @@ impl ReceiverService {
             .lock()
             .map_err(|_| "device lock poisoned")?
             .clone();
-        let (fov_degrees, pixel_color_name, auto_target_active) =
+        let (_, pixel_color_name, auto_target_active) =
             effective_detection_settings(settings, &device);
         let pixel_color =
             PixelTargetColor::parse(&pixel_color_name).ok_or("invalid Pixel Seek color")?;
@@ -532,7 +555,8 @@ impl ReceiverService {
             strategy,
             pixel_color,
             crop_resolution: Some(settings.crop_resolution),
-            fov_degrees,
+            fov_degrees: settings.fov_degrees,
+            auto_fov_degrees: settings.auto.fov_degrees,
             auto_target_active,
             auto_config_revision: 0, // filled atomically by reconfigure()
             smoothing_x: settings.smoothing_x(),
@@ -551,7 +575,7 @@ impl ReceiverService {
             .auto_events
             .lock()
             .map_err(|_| "Auto event lock poisoned")?;
-        events.configure(&settings.auto);
+        events.reconfigure(&routed_auto_settings(&settings));
         let revision = events.revision;
         drop(events);
         let mut config = self.pipeline_config(&settings)?;
@@ -1298,6 +1322,14 @@ fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bo
     auto.enabled && trigger_held(device, &auto.trigger_button)
 }
 
+// Always-on owns routing and must also cancel a delayed Auto click without
+// waiting for another video frame. Target loss alone does not cancel that delay.
+fn routed_auto_settings(settings: &AppSettings) -> AutoSettings {
+    let mut auto = settings.auto.clone();
+    auto.enabled &= !settings.motion_always_on;
+    auto
+}
+
 fn effective_detection_settings(settings: &AppSettings, device: &Value) -> (u16, String, bool) {
     let auto_active = !settings.motion_always_on && auto_trigger_active(&settings.auto, device);
     if auto_active {
@@ -1502,6 +1534,49 @@ mod tests {
     use crate::config::{save_settings, AppSettings};
     use crate::udp::encode_jpeg_frame;
     use std::net::UdpSocket;
+
+    #[test]
+    fn trigger_route_changes_invalidate_callbacks_even_with_unchanged_auto_settings() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let settings = AutoSettings {
+            enabled: true,
+            ..AutoSettings::default()
+        };
+        let mut events = AutoEvents {
+            settings: settings.clone(),
+            revision: 0,
+            emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
+        };
+        events.reconfigure(&settings); // release
+        events.reconfigure(&settings); // press
+        events.target(0, true); // delayed callback from the earlier hold
+        assert_eq!(output.lock().unwrap().len(), 2);
+        events.target(2, true);
+        let output = output.lock().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[2]["config_revision"], 2);
+    }
+
+    #[test]
+    fn always_on_publishes_auto_disabled_without_waiting_for_video() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let mut settings = AppSettings::default();
+        settings.auto.enabled = true;
+        let mut events = AutoEvents {
+            settings: settings.auto.clone(),
+            revision: 0,
+            emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
+        };
+        settings.motion_always_on = true;
+        events.reconfigure(&routed_auto_settings(&settings));
+        let output = output.lock().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["event"], "auto_config");
+        assert_eq!(output[0]["enabled"], false);
+        assert_eq!(output[0]["timestamp_ms"], 0);
+    }
 
     #[test]
     fn an_old_frame_callback_cannot_rearm_auto_after_a_control_edit() {
@@ -1720,6 +1795,12 @@ mod tests {
             super::effective_detection_settings(&settings, &held),
             (88, "yellow".into(), true)
         );
+        // Preserve the established Always-on priority when triggers overlap.
+        settings.motion_always_on = true;
+        assert_eq!(
+            super::effective_detection_settings(&settings, &held),
+            (42, "yellow".into(), false)
+        );
     }
 
     #[test]
@@ -1833,6 +1914,30 @@ mod tests {
         assert_eq!(response["state"]["auto"]["sleepMs"], 10);
         assert_eq!(response["state"]["trigger_button"], "right");
         assert_eq!(response["state"]["fov_degrees"], 36);
+
+        let mut settings = service.settings.lock().unwrap().clone();
+        settings.auto.enabled = true;
+        settings.motion_enabled = true;
+        *service.device.lock().unwrap() = json!({
+            "state":"connected", "buttons":[false,true,false,true,false]
+        });
+        let config = service.pipeline_config(&settings).unwrap();
+        assert!(
+            config.auto_target_active,
+            "Auto owns overlapping held triggers"
+        );
+        assert_eq!(
+            config.fov_degrees, 36,
+            "Motion FOV must not switch to Auto FOV"
+        );
+        assert_eq!(config.auto_fov_degrees, 72);
+        settings.motion_always_on = true;
+        let config = service.pipeline_config(&settings).unwrap();
+        assert!(
+            !config.auto_target_active,
+            "Always-on retains routing priority"
+        );
+        assert_eq!((config.fov_degrees, config.auto_fov_degrees), (36, 72));
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);

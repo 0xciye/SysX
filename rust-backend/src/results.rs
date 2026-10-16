@@ -39,6 +39,12 @@ pub struct DetectionResult {
     /// screen-center cell inside Auto FOV (the crosshair must touch it).
     #[serde(default)]
     pub auto_target_valid: bool,
+    /// Frame-level routing intent, independent of center-pixel validity.
+    #[serde(default)]
+    pub auto_active: bool,
+    /// FOV used for this frame's active feature and preview circle.
+    #[serde(default)]
+    pub fov_degrees: u16,
 }
 
 impl DetectionResult {

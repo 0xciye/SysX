@@ -965,7 +965,10 @@ fn round_ties_away(value: f64) -> i64 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct MovementEvent {
+    #[serde(default)]
+    pub config_revision: u64,
     pub event: String,
     pub frame_id: u64,
     pub target_valid: bool,
@@ -982,20 +985,28 @@ pub struct MovementEvent {
 
 #[derive(Clone, Debug)]
 pub struct MovementRuntimeSettings {
+    pub config_revision: u64,
     pub motion_enabled: bool,
     pub motion_always_on: bool,
     pub sens: f64,
     pub offset_x: f64,
     pub offset_y: f64,
     pub trigger_button: String,
-    /// The selected physical trigger is held (from the host's device status),
-    /// so moves sent now are applied and can be used for calibration.
+    /// The selected physical trigger is held (from the host's device status).
+    /// Calibration accounts for either this gate or Motion Always-on.
     pub trigger_held: bool,
     pub recoil: RecoilSettings,
 }
 
+impl MovementRuntimeSettings {
+    fn output_active(&self) -> bool {
+        self.motion_enabled && (self.motion_always_on || self.trigger_held)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MovementTargetSample {
+    pub config_revision: u64,
     pub frame_id: u64,
     /// The selected target, unsmoothed.
     pub target: Option<(f64, f64)>,
@@ -1154,10 +1165,13 @@ impl MovementTicker {
                             thread::sleep(Duration::from_millis(4));
                             continue;
                         };
-                        if !runtime.motion_enabled {
+                        if !runtime.motion_enabled
+                            || sample.config_revision != runtime.config_revision
+                        {
                             controller.reset();
                             if !sent_invalid {
                                 on_event(MovementEvent {
+                                    config_revision: runtime.config_revision,
                                     event: "movement_target".into(),
                                     frame_id: sample.frame_id,
                                     target_valid: false,
@@ -1178,6 +1192,7 @@ impl MovementTicker {
                             controller.reset();
                             if !sent_invalid {
                                 on_event(MovementEvent {
+                                    config_revision: runtime.config_revision,
                                     event: "movement_target".into(),
                                     frame_id: sample.frame_id,
                                     target_valid: false,
@@ -1205,7 +1220,7 @@ impl MovementTicker {
                             &sample,
                             (runtime.offset_x, runtime.offset_y),
                             now,
-                            runtime.trigger_held,
+                            runtime.output_active(),
                         );
                         if let Some(measured) = controller.saveable_calibration() {
                             let due = saved.is_none_or(|(last, at)| {
@@ -1218,6 +1233,7 @@ impl MovementTicker {
                             }
                         }
                         on_event(MovementEvent {
+                            config_revision: runtime.config_revision,
                             event: "movement_target".into(),
                             frame_id: sample.frame_id,
                             target_valid: sample.target.is_some(),
@@ -1234,6 +1250,7 @@ impl MovementTicker {
                         controller.reset();
                         if let Some(runtime) = settings() {
                             on_event(MovementEvent {
+                                config_revision: runtime.config_revision,
                                 event: "movement_target".into(),
                                 frame_id: sample.frame_id,
                                 target_valid: false,
@@ -1317,9 +1334,11 @@ pub fn merge_movement_events(
     mut current: MovementEvent,
 ) -> MovementEvent {
     if current.target_valid {
-        if let Some(previous) =
-            previous.filter(|previous| previous.target_valid && !is_stale(previous))
-        {
+        if let Some(previous) = previous.filter(|previous| {
+            previous.target_valid
+                && previous.config_revision == current.config_revision
+                && !is_stale(previous)
+        }) {
             current.dx = previous.dx.saturating_add(current.dx);
             current.dy = previous.dy.saturating_add(current.dy);
         }
@@ -1453,16 +1472,90 @@ mod tests {
         timestamp_ms: u64,
     ) -> MovementEvent {
         MovementEvent {
+            config_revision: 0,
             event: "movement_target".into(),
             frame_id,
             target_valid: true,
             dx,
             dy,
             motion_enabled: true,
+            motion_always_on: false,
             trigger_button: trigger_button.into(),
             timestamp_ms,
             recoil: RecoilSettings::default(),
         }
+    }
+
+    fn runtime(always_on: bool, held: bool) -> MovementRuntimeSettings {
+        MovementRuntimeSettings {
+            config_revision: 2,
+            motion_enabled: true,
+            motion_always_on: always_on,
+            sens: 0.25,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            trigger_button: "right".into(),
+            trigger_held: held,
+            recoil: RecoilSettings::default(),
+        }
+    }
+
+    fn sample(revision: u64) -> MovementTargetSample {
+        MovementTargetSample {
+            config_revision: revision,
+            frame_id: 1,
+            target: Some((1000.0, 32.0)),
+            smoothing_alpha: (1.0, 1.0),
+            crop_origin: (0, 0),
+            processed_size: (64, 64),
+            received_s: 1.0,
+        }
+    }
+
+    #[test]
+    fn always_on_without_physical_trigger_records_applied_moves() {
+        for (always_on, held) in [(true, false), (false, true), (false, false)] {
+            let mut controller = seeded(54);
+            let runtime = runtime(always_on, held);
+            controller.delta(&sample(2), (0.0, 0.0), 1.0, runtime.output_active());
+            assert_eq!(!controller.move_log.is_empty(), always_on || held);
+        }
+    }
+
+    #[test]
+    fn ticker_rejects_a_previous_modes_sample_until_a_current_frame_arrives() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = std::env::temp_dir().join(format!("sysx-unused-calibration-{}", unix_ms()));
+        let ticker = MovementTicker::new(
+            0.25,
+            Arc::new(CalibrationStore::load(path)),
+            Arc::new(|| Some(runtime(false, true))),
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        );
+        ticker.update(sample(1));
+        let invalid = rx.recv_timeout(Duration::from_secs(2));
+        ticker.update(sample(2));
+        let valid = rx.recv_timeout(Duration::from_secs(2));
+        assert!(ticker.close(Duration::from_secs(1)));
+        let invalid = invalid.unwrap();
+        assert_eq!(invalid.config_revision, 2);
+        assert!(!invalid.target_valid);
+        assert_eq!((invalid.dx, invalid.dy), (0, 0));
+        let valid = valid.unwrap();
+        assert!(valid.target_valid);
+        assert_eq!(valid.config_revision, 2);
+    }
+
+    #[test]
+    fn batches_do_not_sum_motion_across_control_revisions() {
+        let first = event(1, 12, -7, "right", unix_ms());
+        let mut next = event(2, 3, 4, "right", unix_ms());
+        next.config_revision = 1;
+        let merged = merge_movement_events(Some(first), next);
+        assert_eq!((merged.dx, merged.dy), (3, 4));
+        assert_eq!(merged.config_revision, 1);
     }
 
     #[test]

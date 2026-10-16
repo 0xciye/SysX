@@ -153,3 +153,39 @@ The Windows runner passed backend 89/4 ignored, UI 11 and host 39 tests, UDP fix
 ### Receiver bootstrap validation
 
 - Keep Trunk `inject_scripts = true` for the browser settings page. After Wasm stripping, `scripts/finalize-ui-bundle.ps1` rejects missing config bootstrap/assets and refreshes SRI. Native receiver startup/rendering must not depend on WASM or the config HTTP server.
+
+
+### Pixel Seek Motion / Auto contract correction (2026-10-16)
+
+Source changes based on `2fe571eca08bcd7fbf9f9301b15ef6c52368de06`:
+Movement IPC uses snake_case on both ends; the host also accepts explicit legacy
+camelCase aliases and rejects missing required movement fields. Recoil/config
+remain camelCase. The wire regression serializes the actual backend MovementEvent
+and feeds the actual host parser, pending queue and trigger/Always-on gates.
+
+Motion Always-on retains priority over Auto. Otherwise an enabled, held Auto
+trigger owns Pixel Seek processing: only the shared color mask feeds center
+validity; no Motion target, smoothed coordinates or reticle are published. The
+movement ticker independently gates Motion while Auto owns routing. Each frame
+carries Auto active intent and its selected FOV, so the native circle/reticle do
+not depend on the center-valid flag or a newer state snapshot. Motion and Auto
+FOVs remain separate pipeline inputs. Auto still fires only at center crossings;
+its FOV circle does not authorize clicks elsewhere in the circle. Always-on moves
+now use the same applied-move calibration bookkeeping as held-trigger moves.
+
+Follow-up source review also fixed the base commit's incomplete MovementEvent
+unit-test helper. A shared control revision now rejects callbacks, samples and
+queued deltas across routing changes; both batching stages avoid summing across
+revisions. The host checks the current control revision and physical Auto trigger
+before allowing Motion. Always-on publishes Auto disabled immediately, cancelling
+pending delayed Auto clicks even without another frame.
+
+Local Linux x86_64 validation with Rust 1.99.1: backend 97 unit tests passed
+(4 existing diagnostic/report tests ignored), plus 26 integration tests; UI 11
+tests passed. The host compiled locally and its native SVG overlay routing test
+passed (one test, no window/device launch). Linux libudev development metadata was
+provided outside the repository for this check. The integration set includes the
+real backend serializer and host movement/Auto modules. The settings-to-pipeline FOV/overlap regression also passed
+separately. These checks do not validate Windows, OBS, physical Medius behavior,
+calibration accuracy on hardware or production performance. Validation did not dispatch a build workflow, merge changes or issue device
+commands.

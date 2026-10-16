@@ -635,7 +635,11 @@ fn monitor_medius(
                         .any(|usage| usage.id == button)
                 },
             );
-            let motion_active = crate::movement::should_apply_target(&target, held);
+            // Control events advance the shared routing revision before new
+            // frames arrive. Never apply a batch queued by the previous mode.
+            let motion_active = target.config_revision == auto_input.config_revision()
+                && !auto_input.blocks_motion(auto_held)
+                && crate::movement::should_apply_target(&target, held);
             let recoil = vertical_adjustment.sample(
                 motion_active,
                 &target.recoil,

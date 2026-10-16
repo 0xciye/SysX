@@ -316,3 +316,39 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 147. [x] Replaced the receiver WebView with native Slint while retaining the current design. Removed Wry/Tao, browser-monitor fallback, WASM monitor/preview components and the config boot preview. Added bounded native IPC/JPEG workers, Slint overlays/HUD/button state, native close/reopen lifecycle, config-only HTTP regression, native IPC fixture and headless wait/live/narrow captures. The separate browser config and persistence remain. No Windows build was dispatched; cross-target compilation and headless tests do not validate Windows GPU performance or physical devices.
 
 148. [x] Updated the sole device SDK to Medius 3.4.6 after reviewing the official Rust API. Discovery uses the SDK's CH343 scan and `Device::open` handshake before waiting for mouse-clone health, so reconnect detection does not depend on clone enumeration timing. SysX gates input/output on `query_health()` reporting link, mouse and clone readiness. Kept public `input_events`, `move_rel`, and press/release injection calls. Mock-backed host tests cover the readiness gate; physical Windows hardware remains unvalidated.
+
+
+### Pixel Seek Motion / Auto contract correction (2026-10-16)
+
+Source changes based on `2fe571eca08bcd7fbf9f9301b15ef6c52368de06`:
+Movement IPC uses snake_case on both ends; the host also accepts explicit legacy
+camelCase aliases and rejects missing required movement fields. Recoil/config
+remain camelCase. The wire regression serializes the actual backend MovementEvent
+and feeds the actual host parser, pending queue and trigger/Always-on gates.
+
+Motion Always-on retains priority over Auto. Otherwise an enabled, held Auto
+trigger owns Pixel Seek processing: only the shared color mask feeds center
+validity; no Motion target, smoothed coordinates or reticle are published. The
+movement ticker independently gates Motion while Auto owns routing. Each frame
+carries Auto active intent and its selected FOV, so the native circle/reticle do
+not depend on the center-valid flag or a newer state snapshot. Motion and Auto
+FOVs remain separate pipeline inputs. Auto still fires only at center crossings;
+its FOV circle does not authorize clicks elsewhere in the circle. Always-on moves
+now use the same applied-move calibration bookkeeping as held-trigger moves.
+
+Follow-up source review also fixed the base commit's incomplete MovementEvent
+unit-test helper. A shared control revision now rejects callbacks, samples and
+queued deltas across routing changes; both batching stages avoid summing across
+revisions. The host checks the current control revision and physical Auto trigger
+before allowing Motion. Always-on publishes Auto disabled immediately, cancelling
+pending delayed Auto clicks even without another frame.
+
+Local Linux x86_64 validation with Rust 1.99.1: backend 97 unit tests passed
+(4 existing diagnostic/report tests ignored), plus 26 integration tests; UI 11
+tests passed. The host compiled locally and its native SVG overlay routing test
+passed (one test, no window/device launch). Linux libudev development metadata was
+provided outside the repository for this check. The integration set includes the
+real backend serializer and host movement/Auto modules. The settings-to-pipeline FOV/overlap regression also passed
+separately. These checks do not validate Windows, OBS, physical Medius behavior,
+calibration accuracy on hardware or production performance. Validation did not dispatch a build workflow, merge changes or issue device
+commands.

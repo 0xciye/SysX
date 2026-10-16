@@ -38,6 +38,18 @@ mod tests {
     use super::has_center_pixel_in_fov;
 
     #[test]
+    fn fov_size_preserves_center_crossing_semantics() {
+        let mut center = vec![0; 8 * 8];
+        center[4 * 8 + 4] = 1;
+        let mut off_center = vec![0; 8 * 8];
+        off_center[4 * 8 + 5] = 1;
+        for degrees in [1, 36, 90, 180, 360] {
+            assert!(has_center_pixel_in_fov(&center, 8, 8, degrees));
+            assert!(!has_center_pixel_in_fov(&off_center, 8, 8, degrees));
+        }
+    }
+
+    #[test]
     fn accepts_a_matching_pixel_at_the_center() {
         let mut mask = vec![0; 8 * 8];
         mask[4 * 8 + 4] = 1;
