@@ -1924,7 +1924,7 @@ mod tests {
         ] {
             let run = simulate_run(world, true, 61, None);
             let on = run.first_calibrated.expect("calibrated");
-            assert!(on <= 0.6, "on after {on:.2} s");
+            assert!(on <= 0.3, "on after {on:.2} s");
             // Far below the runaway errors of an under-estimated px/count.
             assert!(run.peak_after_start < 300.0, "{}", run.peak_after_start);
         }
@@ -1944,8 +1944,10 @@ mod tests {
             assert!(run.first_calibrated.is_some_and(|on| on <= 0.03));
             loaded += run.early_rms;
         }
+        // A fresh start learns within ~0.1 s, so the saved file's edge is that
+        // first tenth of a second.
         assert!(
-            loaded < fresh * 0.7,
+            loaded < fresh * 0.8,
             "loaded {loaded:.0} vs fresh {fresh:.0}"
         );
     }
