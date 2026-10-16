@@ -30,6 +30,8 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 half = "2"
+# Object Detection dependencies: retained for development, not ready for use.
+# Pixel Seek is the only currently available detection engine.
 openvino = { version = "0.11.1", features = ["runtime-linking"] }
 ort = "2.0.0-rc.14"
 rand = "0.9"
@@ -41,5 +43,6 @@ subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["fs"] }
+# TensorRT development adapter is also unavailable for use.
 baracuda-driver = { version = "0.0.1-alpha.94", optional = true }
 baracuda-tensorrt = { version = "0.0.1-alpha.94", optional = true }

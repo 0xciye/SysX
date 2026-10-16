@@ -1,5 +1,7 @@
 # SysX — tính năng và những gì đã làm
 
+> **Trạng thái sử dụng:** Hiện chỉ **Pixel Seek dùng được**. **Object Detection, ONNX Runtime, OpenVINO và TensorRT chưa dùng được**; source/dependency được giữ cho phát triển. Thiết bị được hỗ trợ chỉ còn **Medius qua Rust SDK**; đã bỏ Ferrum và MAKCU.
+
 Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-10-15 → 2026-10-16, theo từng phần, kèm file code và mức độ đã kiểm chứng. Lịch sử commit đầy đủ nằm trong `git log` trên nhánh `main`.
 
 ## 1. Tổng quan kiến trúc
@@ -9,15 +11,15 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
   sysx-canvas-sender.dll   ◀──SYSCFG──   (Rust, nhúng trong SysX.exe)  ──▶ config  /config.html
                                               ▲   │ movement_target / auto_target (stdout)
                                               │   ▼
-                                         SysX.exe (host native) ──▶ Medius / Ferrum (chuột)
+                                         SysX.exe (host native) ──▶ Medius (chuột)
 ```
 
 | Thành phần | Thư mục | Vai trò |
 |---|---|---|
 | OBS plugin | `obs-plugin/sysx-canvas-sender` | Crop canvas OBS trên GPU, nén JPEG, gửi UDP |
-| Backend | `rust-backend` | Nhận UDP, giải mã, Pixel Seek / Object Detection, chọn target, tính chuyển động, Auto target gate, profile state, web server loopback |
+| Backend | `rust-backend` | Nhận UDP, giải mã, Pixel Seek (Object Detection chưa dùng được), chọn target, tính chuyển động, Auto target gate, profile state, web server loopback |
 | Web UI | `rust-ui` (Leptos/WASM) | Trang monitor (receiver) và trang config |
-| Host native | `src-tauri` | Chạy backend, đọc thiết bị Medius/Ferrum, gửi chuyển động chuột, mở cửa sổ monitor |
+| Host native | `src-tauri` | Chạy backend, đọc thiết bị Medius, gửi chuyển động chuột, mở cửa sổ monitor |
 
 ## 2. OBS plugin (`sysx_canvas_sender.cpp`)
 
@@ -59,7 +61,9 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
   - Mục tiêu cũ biến mất / ra khỏi FOV / khoá quá 100 ms → chọn lại pixel cao nhất trong toàn FOV.
 - Test: `only_the_topmost_blob_inside_fov_becomes_the_single_target`, `blobs_outside_the_fov_are_masked_but_never_targeted`, `a_locked_target_is_kept_when_another_higher_target_is_in_the_fov`, `a_locked_target_still_climbs_to_higher_pixels_next_to_it`, `a_lost_lock_falls_back_to_the_topmost_target_in_the_fov`, `pixel_seek_keeps_climbing_to_each_newly_visible_higher_pixel`.
 
-## 5. Object Detection (`inference.rs`, `targeting.rs`)
+## 5. Object Detection — CHƯA DÙNG ĐƯỢC (`inference.rs`, `targeting.rs`)
+
+Các mục dưới đây mô tả source thử nghiệm; ONNX Runtime, OpenVINO và TensorRT chưa sẵn sàng. UI khóa Object Detection và control model/runtime.
 
 - Một bundle model gồm ONNX, TensorRT `.engine/.plan` và OpenVINO `.xml/.bin`; Backend chọn artifact, Compute chọn thiết bị (ONNX Runtime chỉ CPU; OpenVINO CPU/GPU/NPU; TensorRT cần GPU và bản build có TensorRT).
 - Giải mã output YOLOv8 thô `[1, 4+classes, anchors]` hoặc `[1, anchors, 4+classes]`, lọc theo Min confidence, NMS theo từng class. Crop phải đúng kích thước input của model (không resize).
@@ -71,8 +75,8 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 
 - **Làm mượt X/Y** (`ExponentialTargetSmoother`): alpha 0.01–1.0 cho từng trục; 1.0 = không làm mượt. Reset khi mất target hoặc đổi cấu hình.
 - **Backend** (`rust-backend/src/movement.rs`): bộ điều khiển NCAF ba vùng (snap 150 / near 50), dự đoán vận tốc; mỗi lượt di chuyển chọn một lần độ cong (giảm dần khi tới gần), thời gian tăng tốc, mức giảm tốc và đường cong Bézier cho độ lớn bước; nhiễu tương quan theo thời gian (Ornstein-Uhlenbeck, ngang hướng di chuyển và tốc độ) thay cho micro-correction ±1 độc lập, tắt dần khi gần đích; vùng dừng 2 px / chạy lại 4 px (hysteresis), không ép ±1 mà dùng bước tối thiểu theo vector cộng dồn phần lẻ; khi giữ trigger, tự hiệu chuẩn px/count và độ trễ bằng tín hiệu dò ±2 count (bám nhanh bật sau ~0,1 s ở 240 FPS, lưu vào `motion-calibration.json` theo sens để lần sau bám ngay) rồi tách chuyển động target khỏi chuyển động chuột, feedforward theo vận tốc target, tăng đáp ứng vùng gần khi target nhanh, không dừng khi target còn chạy, chỉ ramp khi bắt target mới; đổi pixel ra count bằng px/count đo được (sửa sai số theo px/s, hằng số thời gian 35 ms, chậm hơn khi ước lượng còn thô); trước khi đo xong dùng bước chậm 0,0035/sens count mỗi px — một count xoay camera yaw × sens độ nên sens cao cần ít count hơn, DPI không ảnh hưởng count gửi qua thiết bị (mặc định sens 0.25; không còn ô DPI — file cài đặt cũ có `dpi` vẫn đọc được và bỏ trường này ở lần lưu sau); offset X/Y cộng vào target. Ticker riêng chạy mỗi 4 ms với target mới nhất.
-- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms), chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ, cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius `move_rel` hoặc Ferrum `km.move`. Auto giữ state riêng: chỉ nhận pixel màu chạm tâm crosshair trong Auto FOV, Delay bắt đầu khi xác nhận pixel đó, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)` hoặc Ferrum `km.click()`.
-- **Chưa kiểm chứng:** chưa có phần cứng Medius/Ferrum để thử.
+- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms), chỉ di chuyển khi nút trigger (Right/Middle/M4/M5) đang giữ, cộng recoil vào trục Y, kẹp ±32 mỗi lệnh; gửi qua Medius Rust SDK `move_rel`. Auto giữ state riêng: chỉ nhận pixel màu chạm tâm crosshair trong Auto FOV, Delay bắt đầu khi xác nhận pixel đó, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)`.
+- **Chưa kiểm chứng:** chưa có phần cứng Medius để thử.
 
 ## 7. Receiver UI (`rust-ui`)
 
@@ -90,6 +94,8 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 - Ảnh kiểm tra: `design-review/receiver-monitor-web-*.png`.
 
 ## 8. Host native và vòng đời (`src-tauri`)
+
+- Chỉ giữ Medius qua Rust SDK `medius 3.4.3`; adapter `medius_device.rs` gọi API công khai. Bỏ Ferrum, không tích hợp MAKCU; không tự đóng gói Native wire. Đã sửa lỗi Apply Changes bị khóa do giữ mutex settings khi dựng ACK. Xem `MediusAPI.md`.
 
 - **Một SysX duy nhất:** mutex `Local\SysX.Receiver.SingleInstance` (`single_instance.rs`). Mở lần hai → đưa cửa sổ monitor đang có lên trước (hoặc mở lại từ `%LOCALAPPDATA%\SysX\instance.json`) rồi thoát, không tạo backend thứ hai (trước đây gây lỗi 10048 trên UDP 4200).
 - **Đóng cửa sổ monitor → SysX tắt** sau 3 giây (60 giây nếu monitor không bao giờ kết nối).
@@ -118,12 +124,12 @@ Chi tiết: `docs/OBS_RECEIVER_PROTOCOL.md` mục 7. **Chưa thử trên hai má
 ## 11. Build và test
 
 - `scripts/build-windows.ps1` (không cần Node): Trunk UI → backend → test cả 3 crate → `src-tauri/target/release/SysX.exe` → smoke UDP 4200. `-AppSmoke` (mở cửa sổ) là tuỳ chọn.
-- Test hiện tại trên workspace: backend 76 pass / 4 ignored, UI 9 pass, native host 22 pass.
+- Kiểm tra thay đổi Medius-only (Linux): backend 79 pass / 4 ignored (`ort/load-dynamic`), UI 10 pass, harness gọi trực tiếp module Medius/Auto/serial 15 pass. `cargo check --tests --target x86_64-pc-windows-msvc` qua; chưa chạy app Windows hoặc thiết bị thật. Headless Chromium xác minh Apply Changes/khôi phục config, profile Object Detection cũ chuyển về Pixel Seek, không tràn ngang hoặc chồng card ở 1440/980/480 px và không có page error.
 - Plugin: build bằng CMake + MSVC (xem `obs-plugin/sysx-canvas-sender/README.md`), kèm `sysx-sender-selftest` và `sysx-obs-host-check`.
 
 ## 12. Chưa làm / chưa kiểm chứng
 
 - LAN giữa hai máy thật.
 - Model Object Detection thật, TensorRT/OpenVINO trên GPU/NPU.
-- Phần cứng Medius/Ferrum (chuyển động chuột và trạng thái nút).
+- Phần cứng Medius (chuyển động chuột và trạng thái nút).
 - `scripts/build-windows.ps1 -AppSmoke` (mở cửa sổ) chưa chạy trọn vẹn.

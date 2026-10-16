@@ -1,3 +1,8 @@
+//! Unavailable Object Detection adapters retained for development.
+//! ONNX Runtime, OpenVINO and TensorRT are not ready for use; Pixel Seek is
+//! the only currently available detection engine. Unit tests do not establish
+//! real-model or target-runtime readiness.
+
 use crate::config::ModelDefinition;
 use crate::results::DetectionObject;
 use image::RgbImage;
