@@ -149,7 +149,10 @@ impl UdpDecodedFrameSource {
         loop {
             self.reassembler.expire(monotonic_ns());
             if let Some(frame) = self.reassembler.take_latest() {
-                return decode_udp_frame(frame).map(Some);
+                match decode_udp_frame(frame) {
+                    Ok(frame) => return Ok(Some(frame)),
+                    Err(_) => self.reassembler.reject_decoded_frame(),
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -164,6 +167,9 @@ impl UdpDecodedFrameSource {
                     // Only a real RCVR sender may become the crop recipient;
                     // stray LAN datagrams must not redirect SYSCFG.
                     if self.datagram[..length].starts_with(b"RCVR") {
+                        if self.sender != Some(sender) {
+                            self.reassembler.reset_session();
+                        }
                         let resend_due = self
                             .config_sent_at
                             .is_none_or(|sent| sent.elapsed() >= CROP_CONFIG_RESEND);
@@ -188,6 +194,7 @@ impl UdpDecodedFrameSource {
         self.socket = None;
         self.sender = None;
         self.config_sent_at = None;
+        self.reassembler.reset_session();
     }
 
     fn send_crop_config(&mut self) {
@@ -212,6 +219,61 @@ fn monotonic_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_jpeg_and_dimension_mismatch_do_not_interrupt_the_listener() {
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.port = 0;
+        source.open().unwrap();
+        let address = source.local_addr().unwrap().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
+        for (id, size, bytes) in [
+            (1, 192, b"\xff\xd8invalid\xff\xd9".as_slice()),
+            (2, 1, jpeg.as_slice()),
+            (3, 192, jpeg.as_slice()),
+        ] {
+            for packet in crate::udp::encode_jpeg_frame(id, size, size, id, bytes).unwrap() {
+                sender.send_to(&packet, address).unwrap();
+            }
+        }
+        let frame = source
+            .read(Duration::from_millis(500))
+            .unwrap()
+            .expect("valid frame after two corrupt frames");
+        assert_eq!(frame.frame_id, 3);
+        assert_eq!(source.local_addr().unwrap(), Some(address));
+        assert_eq!(source.stats().invalid_frames, 2);
+        assert_eq!(source.stats().dropped_frames, 2);
+        assert!(
+            UdpSocket::bind(address).is_err(),
+            "listener must remain bound"
+        );
+    }
+
+    #[test]
+    fn a_new_sender_endpoint_can_restart_its_clock_and_frame_counter() {
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.port = 0;
+        source.open().unwrap();
+        let address = source.local_addr().unwrap().unwrap();
+        let old_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let new_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
+        for (sender, id) in [(&old_sender, 100), (&new_sender, 1)] {
+            for packet in crate::udp::encode_jpeg_frame(id, 192, 192, id, jpeg).unwrap() {
+                sender.send_to(&packet, address).unwrap();
+            }
+            assert_eq!(
+                source
+                    .read(Duration::from_millis(500))
+                    .unwrap()
+                    .unwrap()
+                    .frame_id,
+                id
+            );
+        }
+    }
 
     #[test]
     fn decoded_frame_keeps_the_sender_jpeg_for_preview() {

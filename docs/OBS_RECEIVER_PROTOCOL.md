@@ -46,7 +46,7 @@ When the receiver sees datagrams from a new sender address, and again whenever C
 SYSCFG 1 CROP <resolution>
 ```
 
-ASCII, no terminator, `<resolution>` in 1–8192. The plugin accepts it only from its configured receiver address/port, ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged and is not retransmitted; a sender that never receives it keeps its `default_crop`.
+ASCII, no terminator, `<resolution>` in 1–8192. The plugin accepts it only from its configured receiver address/port, ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged; while the sender streams, the receiver repeats it every second; a sender that never receives it keeps its `default_crop`.
 
 ### Chunking rules
 
@@ -60,7 +60,7 @@ ASCII, no terminator, `<resolution>` in 1–8192. The plugin accepts it only fro
 - A frame must have dimensions from 1 through 8,192 pixels per side, with at most 33,554,432 pixels total.
 - The dimensions in the header must exactly match the dimensions decoded from the JPEG. Do not crop or resize the image after setting the header. Each side must be at least the receiver's Crop Resolution, or the receiver rejects the frame.
 
-Use a monotonically increasing `frame_id` per sender session and avoid reusing IDs while frames may still be in flight. The current Receiver uses the ID to associate chunks; it does not enforce monotonic ordering between completed frames.
+Use a monotonically increasing `frame_id` per sender session and avoid reusing IDs while frames may still be in flight. Completed frames must be newer than the last accepted `(timestamp_ns, frame_id)` pair, compared in that order. Late old frames and completed duplicates are discarded even if they finish after a newer frame. Monotonic capture time allows the frame counter to restart without regressing the stream. A changed sender endpoint or at least one second without valid chunks starts a new ordering session and clears partial assemblies, allowing a restarted sender clock. UDP v1 has no session ID; simultaneous senders remain unsupported.
 
 `timestamp_ns` is carried into the frame and detection record. Use a monotonic capture timestamp if available. Sender and Receiver clocks are not synchronized, so this value is **not** a valid one-way network latency measurement. Current UI latency is processing latency, not sender-to-receiver latency.
 
@@ -79,7 +79,7 @@ Current safety limits and behavior:
 | Aggregate reassembly memory | At most 128 MiB |
 | Per-frame encoded JPEG | At most 64 MiB |
 | Completed frame waiting to be read | Keeps the newest completed frame; replacing a waiting frame counts as dropped |
-| Missing JPEG SOI/EOI, non-JPEG, incomplete JPEG, or decoded-size mismatch | Rejects an invalid boundary chunk before retaining it; completed frames must have JPEG SOI/EOI markers and decoded dimensions matching the header |
+| Missing JPEG SOI/EOI, non-JPEG, incomplete JPEG, or decoded-size mismatch | Rejects invalid boundary chunks before retaining them; corrupt completed frames are dropped and counted in `invalid_frames` and transport drops without closing the UDP listener |
 | Processing falls behind | A bounded latest-frame pipeline replaces stale pending work and counts dropped input frames |
 
 There are no retransmissions or per-frame acknowledgements. Send each frame once; do not block OBS rendering while waiting for UDP delivery. A partial frame expires and is dropped. Prefer a fresh frame over retransmitting stale video.

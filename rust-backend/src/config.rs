@@ -234,6 +234,12 @@ impl AppSettings {
             return Err(SettingsError::Invalid("profile does not exist"));
         }
         self.sync_active_profile();
+        self.load_profile(index)
+    }
+
+    /// Load a snapshot without saving the current top-level values. In
+    /// particular, a deleted profile must never be saved into its successor.
+    fn load_profile(&mut self, index: usize) -> Result<(), SettingsError> {
         let mut next: AppSettings =
             serde_json::from_value(self.profiles[index].settings.clone())
                 .map_err(|_| SettingsError::Invalid("profile settings are invalid"))?;
@@ -318,7 +324,7 @@ impl AppSettings {
         } else {
             previous_active.min(self.profiles.len() - 1)
         };
-        self.activate_profile(next_index)
+        self.load_profile(next_index)
     }
 
     pub fn smoothing_x(&self) -> SmoothingRange {
@@ -708,6 +714,47 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_any_profile_preserves_every_surviving_snapshot() {
+        for active in 0..3 {
+            for deleted in 0..3 {
+                let mut settings = AppSettings::default();
+                settings.normalize_profiles();
+                for index in 0..3 {
+                    if index > 0 {
+                        settings
+                            .create_profile(Some(&format!("Profile {index}")), false)
+                            .unwrap();
+                    }
+                    settings.sens = [0.23, 0.75, 1.25][index];
+                    settings.auto.delay_ms = 10 + index as u32;
+                    settings.sync_active_profile();
+                }
+                settings.activate_profile(active).unwrap();
+                let expected: Vec<_> = settings
+                    .profiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != deleted)
+                    .map(|(_, slot)| slot.clone())
+                    .collect();
+                settings.delete_profile(deleted).unwrap();
+                assert_eq!(
+                    settings.profiles, expected,
+                    "active={active}, deleted={deleted}"
+                );
+                let selected: AppSettings = serde_json::from_value(
+                    expected[usize::from(settings.active_profile)]
+                        .settings
+                        .clone(),
+                )
+                .unwrap();
+                assert_eq!(settings.sens, selected.sens);
+                assert_eq!(settings.auto, selected.auto);
+            }
+        }
+    }
 
     #[test]
     fn settings_have_three_independent_profile_slots() {

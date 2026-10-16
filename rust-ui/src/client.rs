@@ -203,15 +203,20 @@ pub async fn save_local_settings<T: Serialize>(settings: &T) -> Result<(), Strin
         .map_err(|error| error.to_string())?
         .send()
         .await;
-    if matches!(api_result, Ok(ref response) if response.ok()) {
-        let _ = write_cached_settings(&payload);
-        return Ok(());
-    }
-    write_cached_settings(&payload).map_err(|error| {
-        format!(
-            "Local settings could not be saved while the configuration service is offline: {error}"
-        )
-    })
+    let response = api_result.map_err(|error| {
+        format!("Settings were not saved. The local configuration service is unavailable: {error}")
+    })?;
+    let status = response.status();
+    let message = if response.ok() {
+        String::new()
+    } else {
+        response.text().await.unwrap_or_default()
+    };
+    crate::settings::require_settings_saved(status, &message)?;
+    // Cache only a confirmed disk save. A browser draft is not a durable save
+    // and would be overwritten by the next successful GET of the old file.
+    let _ = write_cached_settings(&payload);
+    Ok(())
 }
 
 fn settings_storage() -> Option<web_sys::Storage> {
