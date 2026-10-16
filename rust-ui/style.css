@@ -62,6 +62,12 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .general-settings { min-width: 0; }
 
 .settings-panel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 22px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); scrollbar-color: #425660 transparent; scrollbar-width: thin; box-shadow: 0 18px 45px rgb(0 0 0 / 16%); }
+.config-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; padding: 28px 2px 13px; border-bottom: 1px solid #2c3d45; }
+.config-section-heading > div { display: grid; gap: 4px; }
+.config-section-heading h2 { margin: 0; color: #f0f7f7; font-size: 18px; font-weight: 650; letter-spacing: -.025em; }
+.config-section-heading p { max-width: 330px; margin: 0 0 2px; color: var(--dim); font-size: 10px; line-height: 1.4; text-align: right; }
+.config-section-kicker { color: var(--accent); font: 9px Consolas, monospace; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.config-section-heading + .settings-row { border-top: 0; }
 .settings-row { min-height: 102px; display: grid; grid-template-columns: minmax(170px, .7fr) minmax(280px, 1.5fr); align-items: center; gap: 28px; padding: 21px 2px; border-bottom: 1px solid #22313a; }
 .settings-row:last-of-type { border-bottom: 0; }
 .setting-description h2 { margin: 0; color: var(--text); font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
@@ -170,6 +176,8 @@ body:has(.config-window) { overflow: auto; }
   .settings-row, .config-general .settings-row { grid-template-columns: 1fr; gap: 14px; padding-block: 20px; }
   .settings-fields, .config-general .settings-fields { max-width: none; }
   .strategy-picker { grid-template-columns: 1fr; }
+  .config-section-heading { align-items: start; flex-direction: column; gap: 7px; }
+  .config-section-heading p { max-width: none; text-align: left; }
 }
 
 /* ── Receiver monitor (/monitor.html) ─────────────────────────────────────

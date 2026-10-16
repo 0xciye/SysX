@@ -300,6 +300,10 @@ pub fn ConfigApp() -> impl IntoView {
                     </div>
                     <div class="general-page config-general">
                         <div class="settings-panel general-settings">
+                            <div class="config-section-heading">
+                                <div><span class="config-section-kicker">"01 / Settings"</span><h2>"Connection & canvas"</h2></div>
+                                <p>"Choose how SysX receives and displays the source."</p>
+                            </div>
                             <div class="settings-row preview-options-row">
                                 <div class="setting-description"><h2>"Preview"</h2></div>
                                 <div class="settings-fields">
@@ -323,12 +327,11 @@ pub fn ConfigApp() -> impl IntoView {
                                     <label class="field"><span class="field-label">"Crop resolution"</span>
                                         <input class="text-input" type="number" min="1" max="8192" step="1" prop:value=crop_draft on:input=move |event| { crop_draft.set(event_target_value(&event)); apply_message.set(String::new()); }/>
                                     </label>
-                                    <label class="field settings-wide"><span class="field-label">"Trigger button"</span>
-                                        <select prop:value=move || settings.get().trigger_button on:change=move |event| settings.update(|value| value.trigger_button = event_target_value(&event))>
-                                            <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
-                                        </select>
-                                    </label>
                                 </div>
+                            </div>
+                            <div class="config-section-heading">
+                                <div><span class="config-section-kicker">"02 / Main"</span><h2>"Detection engine"</h2></div>
+                                <p>"Select the target source and model pipeline."</p>
                             </div>
                             <div class="settings-row">
                                 <div class="setting-description"><h2>"Detection Engine"</h2></div>
@@ -414,9 +417,18 @@ pub fn ConfigApp() -> impl IntoView {
                                     </Show>
                                 </div>
                             </div>
+                            <div class="config-section-heading">
+                                <div><span class="config-section-kicker">"03 / Motion"</span><h2>"Aim behavior"</h2></div>
+                                <p>"Shape how the cursor follows a live target."</p>
+                            </div>
                             <div class="settings-row target-offset-row">
                                 <div class="setting-description"><h2>"Target Offset"</h2></div>
                                 <div class="settings-fields target-offset-fields">
+                                    <label class="field settings-wide"><span class="field-label">"Trigger button"</span>
+                                        <select prop:value=move || settings.get().trigger_button on:change=move |event| settings.update(|value| value.trigger_button = event_target_value(&event))>
+                                            <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
+                                        </select>
+                                    </label>
                                     <label class="field"><span class="field-label">"X Offset (px)"</span><input class="text-input" type="number" step="1" prop:value=offset_x_draft on:input=move |event| { offset_x_draft.set(event_target_value(&event)); apply_message.set(String::new()); }/></label>
                                     <label class="field"><span class="field-label">"Y Offset (px)"</span><input class="text-input" type="number" step="1" prop:value=offset_y_draft on:input=move |event| { offset_y_draft.set(event_target_value(&event)); apply_message.set(String::new()); }/></label>
                                     <div class="target-offset-map settings-wide" role="img" aria-label=move || format!("Target offset preview: X {}, Y {} pixels", offset_x_draft.get(), offset_y_draft.get())>
@@ -451,6 +463,18 @@ pub fn ConfigApp() -> impl IntoView {
                                     <p class="smoothing-hint settings-wide">"Your in-game sensitivity. SysX measures how far one count turns the view and saves it per sensitivity; mouse DPI does not affect sent counts."</p>
                                 </div>
                             </div>
+                            <div class="settings-row fov-settings-row">
+                                <div class="setting-description"><h2>"FOV"</h2></div>
+                                <div class="settings-fields">
+                                    <label class="field fov-size settings-wide"><span class="range-heading"><span class="field-label">"Size"</span><output>{move || format!("{}°", settings.get().fov_degrees)}</output></span>
+                                        <input type="range" min="1" max="360" step="1" prop:value=move || settings.get().fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.fov_degrees = value) } aria-label="FOV size in degrees"/>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="config-section-heading">
+                                <div><span class="config-section-kicker">"04 / Recoil"</span><h2>"Vertical adjustment"</h2></div>
+                                <p>"Apply a timed Y-axis profile while the trigger is held."</p>
+                            </div>
                             <div class="settings-row">
                                 <div class="setting-description"><h2>"Vertical Adjustment"</h2></div>
                                 <div class="settings-fields">
@@ -463,14 +487,6 @@ pub fn ConfigApp() -> impl IntoView {
                                     </label>
                                     <label class="motion-toggle"><span>"Allow early resampling"</span><input type="checkbox" prop:checked=move || settings.get().recoil.recoil_allow_early_resample on:change=move |_| settings.update(|value| value.recoil.recoil_allow_early_resample = !value.recoil.recoil_allow_early_resample)/></label>
                                     <p class="smoothing-hint settings-wide">"The selected physical trigger starts the elapsed-time profile. Values are sampled by level and added to the Y delta."</p>
-                                </div>
-                            </div>
-                            <div class="settings-row fov-settings-row">
-                                <div class="setting-description"><h2>"FOV"</h2></div>
-                                <div class="settings-fields">
-                                    <label class="field fov-size settings-wide"><span class="range-heading"><span class="field-label">"Size"</span><output>{move || format!("{}°", settings.get().fov_degrees)}</output></span>
-                                        <input type="range" min="1" max="360" step="1" prop:value=move || settings.get().fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.fov_degrees = value) } aria-label="FOV size in degrees"/>
-                                    </label>
                                 </div>
                             </div>
                         </div>
