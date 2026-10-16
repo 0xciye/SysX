@@ -34,7 +34,6 @@ pub struct MovementConfig {
     pub max_step: f64,
     pub min_speed_multiplier: f64,
     pub max_speed_multiplier: f64,
-    pub prediction_interval: f64,
     pub x_speed: f64,
     pub y_speed: f64,
     pub sens: f64,
@@ -52,7 +51,6 @@ impl Default for MovementConfig {
             max_step: 50.0,
             min_speed_multiplier: 0.01,
             max_speed_multiplier: 10.0,
-            prediction_interval: 0.016,
             x_speed: 3.0,
             y_speed: 3.0,
             sens: 0.235,
@@ -210,12 +208,14 @@ const LATENCY_STEP_S: f64 = 0.004;
 const MOVE_LOG_S: f64 = 0.4;
 /// Exponential forgetting per frame, so the estimate follows a sens change.
 const CALIBRATION_FORGET: f64 = 0.999;
-const CALIBRATION_MIN_WEIGHT: f64 = 60.0;
+const CALIBRATION_MIN_WEIGHT: f64 = 10.0;
 /// Calibration switches on when the standard error falls below this fraction
-/// of the estimate, and stays on (following the latest estimate) until it
-/// rises above the second one.
-const CALIBRATION_ENTER_REL_ERROR: f64 = 0.15;
-const CALIBRATION_KEEP_REL_ERROR: f64 = 0.3;
+/// of the estimate (the safety margin below covers the rest), then follows
+/// every estimate up to the second fraction.
+const CALIBRATION_ENTER_REL_ERROR: f64 = 0.4;
+const CALIBRATION_KEEP_REL_ERROR: f64 = 0.6;
+/// Saved to disk only once this tight.
+const CALIBRATION_SAVE_REL_ERROR: f64 = 0.15;
 /// Rates for calibration are taken over this span rather than between two
 /// frames: whole-pixel detections make single-frame rates far too noisy.
 const CALIBRATION_SPAN_S: f64 = 0.016;
@@ -235,8 +235,19 @@ const FEEDFORWARD_GAIN: f64 = 0.9;
 /// once calibrated, enough to follow changes). The controller's own moves
 /// react to detection noise, which would bias a closed-loop estimate; the
 /// probe does not.
-const PROBE_PROBABILITY: f64 = 0.7;
+const PROBE_COUNTS: i64 = 2;
+const PROBE_PROBABILITY: f64 = 1.0;
 const PROBE_PROBABILITY_CALIBRATED: f64 = 0.2;
+/// Before the first estimate: the frame error with this short velocity lead
+/// (the original uncompensated behaviour, stable for any game).
+const UNCALIBRATED_LEAD_S: f64 = 0.016;
+/// Until the estimate is tight, use px/count raised by this many standard
+/// errors: too high only slows tracking a little, too low can make the loop
+/// oscillate, so the uncertainty is spent on the safe side.
+const CALIBRATION_SAFETY_SIGMAS: f64 = 1.5;
+/// A loaded calibration is kept until this much new evidence (a few seconds
+/// of held trigger) has been gathered; a calibration is only dropped then too.
+const CALIBRATION_TRUST_WEIGHT: f64 = 400.0;
 
 type LatencyRates = [(f64, f64); LATENCY_STEPS];
 
@@ -348,6 +359,8 @@ pub struct MovementController {
     target_velocity: (f64, f64),
     calibrator: MotionCalibrator,
     calibration: Option<MotionCalibration>,
+    /// Relative standard error of `calibration` (0 for a loaded one).
+    calibration_error: f64,
     /// Applied moves in device counts, newest last.
     move_log: VecDeque<AppliedMove>,
     last_tick_s: Option<f64>,
@@ -383,6 +396,7 @@ impl MovementController {
             target_velocity: (0.0, 0.0),
             calibrator: MotionCalibrator::default(),
             calibration: None,
+            calibration_error: 0.0,
             move_log: VecDeque::new(),
             last_tick_s: None,
             residual: (0.0, 0.0),
@@ -424,12 +438,26 @@ impl MovementController {
         // A new in-game sensitivity changes pixels per count: measure again.
         self.calibrator = MotionCalibrator::default();
         self.calibration = None;
+        self.calibration_error = 0.0;
         self.reset();
         Ok(())
     }
+    /// The measured (or loaded) calibration, if any.
     pub fn motion_calibration(&self) -> Option<MotionCalibration> {
         self.calibration
     }
+    /// Start from a saved calibration (from an earlier session).
+    pub fn load_calibration(&mut self, calibration: Option<MotionCalibration>) {
+        self.calibration = calibration;
+        self.calibration_error = 0.0;
+    }
+    /// The calibration once it is tight enough to save for later sessions.
+    pub fn saveable_calibration(&self) -> Option<MotionCalibration> {
+        self.calibration
+            .filter(|_| self.calibrator.weight >= CALIBRATION_TRUST_WEIGHT)
+            .filter(|_| self.calibration_error <= CALIBRATION_SAVE_REL_ERROR)
+    }
+
     pub fn delta(
         &mut self,
         sample: &MovementTargetSample,
@@ -479,6 +507,8 @@ impl MovementController {
         self.last_tick_s = Some(now);
         let (px, py) = self.estimated_error(now);
         let target_speed = self.target_velocity.0.hypot(self.target_velocity.1);
+        // Before calibration the speed is the apparent one (it includes our own
+        // moves), so only a calibrated speed may keep the aim from settling.
         let moving = self.calibration.is_some() && target_speed >= MOVING_TARGET_PX_S;
         let (mut vx, mut vy) = self.shape(px, py, now, tick_s, moving, target_speed);
 
@@ -540,9 +570,9 @@ impl MovementController {
         if self.rng.random::<f64>() >= probability {
             0
         } else if self.rng.random::<bool>() {
-            1
+            PROBE_COUNTS
         } else {
-            -1
+            -PROBE_COUNTS
         }
     }
 
@@ -659,40 +689,44 @@ impl MovementController {
         }
         let weight = (frame_dt / CALIBRATION_SPAN_S).min(1.0);
         self.calibrator.add(y, &xs, &zs, weight);
-        let threshold = if self.calibration.is_some() {
-            CALIBRATION_KEEP_REL_ERROR
-        } else {
-            CALIBRATION_ENTER_REL_ERROR
+        let Some((estimate, relative_error)) = self.calibrator.estimate() else {
+            return;
         };
-        match self.calibrator.estimate() {
-            Some((estimate, relative_error)) if relative_error <= threshold => {
-                self.calibration = Some(estimate);
-            }
-            Some(_) => self.calibration = None,
-            None => {}
+        let trusted = self.calibrator.weight >= CALIBRATION_TRUST_WEIGHT;
+        let accept = match self.calibration {
+            None => relative_error <= CALIBRATION_ENTER_REL_ERROR,
+            // A loaded (or tighter) value is not traded for a rougher one
+            // until enough new evidence exists.
+            Some(_) if !trusted => relative_error <= self.calibration_error,
+            Some(_) => relative_error <= CALIBRATION_KEEP_REL_ERROR,
+        };
+        if accept {
+            self.calibration = Some(MotionCalibration {
+                px_per_count: estimate.px_per_count
+                    * (1.0 + CALIBRATION_SAFETY_SIGMAS * relative_error),
+                ..estimate
+            });
+            self.calibration_error = relative_error;
+        } else if trusted && self.calibration.is_some() {
+            // Plenty of new evidence and it no longer fits: measure afresh.
+            self.calibration = None;
         }
     }
 
     /// Error expected at `now`. Calibrated: the frame shows the scene from
     /// `latency` ago, so add the target's motion since then and remove the
-    /// moves applied since then. Before calibration: the frame error with a
-    /// short velocity lead, as before.
+    /// moves applied since then.
     fn estimated_error(&self, now: f64) -> (f64, f64) {
         let (ex, ey) = self.frame_error;
         let (vx, vy) = self.target_velocity;
-        match self.calibration {
-            Some(calibration) => {
-                let seen_at = self.frame_received_s - calibration.latency_s;
-                let elapsed = (now - seen_at).max(0.0);
-                let ((mx, my), _) = self.moved_between(seen_at, now);
-                let k = calibration.px_per_count;
-                (ex + vx * elapsed - k * mx, ey + vy * elapsed - k * my)
-            }
-            None => {
-                let lead = self.config.prediction_interval;
-                (ex + vx * lead, ey + vy * lead)
-            }
-        }
+        let Some(calibration) = self.calibration else {
+            return (ex + vx * UNCALIBRATED_LEAD_S, ey + vy * UNCALIBRATED_LEAD_S);
+        };
+        let seen_at = self.frame_received_s - calibration.latency_s;
+        let elapsed = (now - seen_at).max(0.0);
+        let ((mx, my), _) = self.moved_between(seen_at, now);
+        let k = calibration.px_per_count;
+        (ex + vx * elapsed - k * mx, ey + vy * elapsed - k * my)
     }
 
     /// Error-correcting step (device counts, unrounded) for the estimated error.
@@ -837,6 +871,92 @@ pub struct MovementTargetSample {
     pub received_s: f64,
 }
 
+const CALIBRATION_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+const SAVED_CALIBRATIONS: usize = 16;
+
+fn calibration_changed(old: MotionCalibration, new: MotionCalibration) -> bool {
+    (new.px_per_count / old.px_per_count - 1.0).abs() > 0.03
+        || (new.latency_s - old.latency_s).abs() > LATENCY_STEP_S / 2.0
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct SavedCalibration {
+    sens: f64,
+    dpi: f64,
+    px_per_count: f64,
+    latency_s: f64,
+}
+
+/// Measured calibrations per Sens/DPI pair, kept in a small JSON file in the
+/// app data directory so later sessions track at full speed from the start.
+/// Writes happen on a short-lived background thread.
+pub struct CalibrationStore {
+    path: std::path::PathBuf,
+    entries: Arc<Mutex<Vec<SavedCalibration>>>,
+}
+
+impl CalibrationStore {
+    pub fn load(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let entries = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<SavedCalibration>>(&bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                (PX_PER_COUNT_RANGE.0..=PX_PER_COUNT_RANGE.1).contains(&entry.px_per_count)
+                    && (0.0..=LATENCY_STEP_S * (LATENCY_STEPS - 1) as f64)
+                        .contains(&entry.latency_s)
+            })
+            .collect();
+        Self {
+            path,
+            entries: Arc::new(Mutex::new(entries)),
+        }
+    }
+
+    pub fn get(&self, sens: f64, dpi: f64) -> Option<MotionCalibration> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .iter()
+            .find(|entry| entry.sens == sens && entry.dpi == dpi)
+            .map(|entry| MotionCalibration {
+                px_per_count: entry.px_per_count,
+                latency_s: entry.latency_s,
+            })
+    }
+
+    pub fn put(&self, sens: f64, dpi: f64, calibration: MotionCalibration) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        entries.retain(|entry| !(entry.sens == sens && entry.dpi == dpi));
+        entries.push(SavedCalibration {
+            sens,
+            dpi,
+            px_per_count: calibration.px_per_count,
+            latency_s: calibration.latency_s,
+        });
+        let excess = entries.len().saturating_sub(SAVED_CALIBRATIONS);
+        entries.drain(..excess);
+        let path = self.path.clone();
+        let Ok(bytes) = serde_json::to_vec_pretty(&*entries) else {
+            return;
+        };
+        drop(entries);
+        let _ = thread::Builder::new()
+            .name("sysx-calibration-save".into())
+            .spawn(move || {
+                let temporary = path.with_extension("json.tmp");
+                let result = std::fs::write(&temporary, bytes)
+                    .and_then(|()| std::fs::rename(&temporary, &path));
+                if let Err(error) = result {
+                    eprintln!("Could not save motion calibration: {error}");
+                }
+            });
+    }
+}
+
 struct TickerState {
     latest: Option<(MovementTargetSample, Instant)>,
     stopping: bool,
@@ -853,6 +973,7 @@ impl MovementTicker {
     pub fn new(
         initial_sens: f64,
         initial_dpi: f64,
+        calibrations: Arc<CalibrationStore>,
         settings: Arc<dyn Fn() -> Option<MovementRuntimeSettings> + Send + Sync>,
         on_event: Arc<dyn Fn(MovementEvent) + Send + Sync>,
     ) -> Self {
@@ -868,7 +989,9 @@ impl MovementTicker {
             .name("sysx-movement-ticker".into())
             .spawn(move || {
                 let mut controller = MovementController::new(initial_sens, initial_dpi);
+                controller.load_calibration(calibrations.get(initial_sens, initial_dpi));
                 let mut calibration = (initial_sens, initial_dpi);
+                let mut saved: Option<(MotionCalibration, Instant)> = None;
                 let mut sent_invalid = false;
                 loop {
                     let (sample, updated_at) = {
@@ -916,7 +1039,10 @@ impl MovementTicker {
                         }
                         if calibration != (runtime.sens, runtime.dpi) {
                             let _ = controller.set_calibration(runtime.sens, runtime.dpi);
+                            controller
+                                .load_calibration(calibrations.get(runtime.sens, runtime.dpi));
                             calibration = (runtime.sens, runtime.dpi);
+                            saved = None;
                         }
                         let now = monotonic_seconds();
                         let (dx, dy) = controller.delta(
@@ -925,6 +1051,16 @@ impl MovementTicker {
                             now,
                             runtime.trigger_held,
                         );
+                        if let Some(measured) = controller.saveable_calibration() {
+                            let due = saved.is_none_or(|(last, at)| {
+                                at.elapsed() >= CALIBRATION_SAVE_INTERVAL
+                                    && calibration_changed(last, measured)
+                            });
+                            if due {
+                                calibrations.put(calibration.0, calibration.1, measured);
+                                saved = Some((measured, Instant::now()));
+                            }
+                        }
                         on_event(MovementEvent {
                             event: "movement_target".into(),
                             frame_id: sample.frame_id,
@@ -1392,6 +1528,39 @@ mod tests {
     }
 
     fn simulate_in(world: World, aware: bool, seed: u64) -> (f64, Option<MotionCalibration>) {
+        let (rms, calibration, _) = simulate_timed(world, aware, seed, None);
+        (rms, calibration)
+    }
+
+    /// Also returns when calibration first switched on. `preset` starts the
+    /// controller with a saved calibration.
+    fn simulate_timed(
+        world: World,
+        aware: bool,
+        seed: u64,
+        preset: Option<MotionCalibration>,
+    ) -> (f64, Option<MotionCalibration>, Option<f64>) {
+        let run = simulate_run(world, aware, seed, preset);
+        (run.rms, run.calibration, run.first_calibrated)
+    }
+
+    struct SimRun {
+        /// RMS true error over the second half.
+        rms: f64,
+        /// RMS true error over the first second (before or while learning).
+        early_rms: f64,
+        /// Largest true error after the first 0.3 s (overshoot/instability).
+        peak_after_start: f64,
+        calibration: Option<MotionCalibration>,
+        first_calibrated: Option<f64>,
+    }
+
+    fn simulate_run(
+        world: World,
+        aware: bool,
+        seed: u64,
+        preset: Option<MotionCalibration>,
+    ) -> SimRun {
         const SECONDS: f64 = 10.0;
         let frame_s = 1.0 / world.fps;
         let target = |t: f64| {
@@ -1401,6 +1570,9 @@ mod tests {
             )
         };
         let mut controller = seeded(seed);
+        controller.calibration = preset;
+        let (mut early_squared, mut early_samples, mut peak) = (0.0, 0, 0.0_f64);
+        let mut first_calibrated = None;
         let mut noise = StdRng::seed_from_u64(seed ^ 0x5eed);
         // Camera offset in px after each applied move, with the time applied.
         let mut camera = vec![(0.0_f64, (0.0_f64, 0.0_f64))];
@@ -1434,6 +1606,9 @@ mod tests {
             }
             let Some(current) = frame else { continue };
             let (dx, dy) = controller.track(current, now, aware);
+            if first_calibrated.is_none() && controller.calibration.is_some() {
+                first_calibrated = Some(now);
+            }
             let (cx, cy) = camera.last().expect("camera").1;
             camera.push((
                 now,
@@ -1442,6 +1617,18 @@ mod tests {
                     cy + dy.clamp(-32, 32) as f64 * world.px_per_count,
                 ),
             ));
+            {
+                let (tx, ty) = target(now);
+                let (cx, cy) = camera.last().expect("camera").1;
+                let error = (tx - cx).hypot(ty - cy);
+                if now <= 1.0 {
+                    early_squared += error * error;
+                    early_samples += 1;
+                }
+                if now >= 0.3 {
+                    peak = peak.max(error);
+                }
+            }
             if now >= SECONDS / 2.0 {
                 let (tx, ty) = target(now);
                 let (cx, cy) = camera.last().expect("camera").1;
@@ -1449,10 +1636,13 @@ mod tests {
                 samples += 1;
             }
         }
-        (
-            (squared / samples as f64).sqrt(),
-            controller.motion_calibration(),
-        )
+        SimRun {
+            rms: (squared / samples as f64).sqrt(),
+            early_rms: (early_squared / early_samples.max(1) as f64).sqrt(),
+            peak_after_start: peak,
+            calibration: controller.motion_calibration(),
+            first_calibrated,
+        }
     }
 
     /// Report over many seeds and worlds (not a pass/fail test):
@@ -1512,6 +1702,121 @@ mod tests {
         }
     }
 
+    /// Start-up behaviour across games, from no calibration:
+    /// `cargo test --release --lib -- startup_report --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn startup_report() {
+        let worlds = [
+            (
+                "k0.05",
+                World {
+                    px_per_count: 0.05,
+                    ..GAME
+                },
+            ),
+            ("k0.25", GAME),
+            (
+                "k0.25 still",
+                World {
+                    strafe: 0.0,
+                    ..GAME
+                },
+            ),
+            (
+                "k0.6",
+                World {
+                    px_per_count: 0.6,
+                    ..GAME
+                },
+            ),
+            (
+                "k2",
+                World {
+                    px_per_count: 2.0,
+                    ..GAME
+                },
+            ),
+            (
+                "k4",
+                World {
+                    px_per_count: 4.0,
+                    ..GAME
+                },
+            ),
+            (
+                "k12",
+                World {
+                    px_per_count: 12.0,
+                    ..GAME
+                },
+            ),
+            (
+                "lat50",
+                World {
+                    latency_s: 0.05,
+                    ..GAME
+                },
+            ),
+            (
+                "60fps",
+                World {
+                    fps: 60.0,
+                    latency_s: 0.04,
+                    ..GAME
+                },
+            ),
+        ];
+        for (name, world) in worlds {
+            let (mut early, mut late, mut peak, mut first) = (0.0, 0.0, 0.0_f64, Vec::new());
+            for seed in 400..410 {
+                let run = simulate_run(world, true, seed, None);
+                early += run.early_rms / 10.0;
+                late += run.rms / 10.0;
+                peak = peak.max(run.peak_after_start);
+                first.push(run.first_calibrated.unwrap_or(f64::INFINITY));
+            }
+            first.sort_by(f64::total_cmp);
+            let saved = Some(MotionCalibration {
+                px_per_count: world.px_per_count,
+                latency_s: world.latency_s,
+            });
+            let preset = simulate_run(world, true, 400, saved);
+            eprintln!(
+                "STARTUP {name}: on after median {:.2}s max {:.2}s | first 1 s RMS {early:.0} px (saved file: {:.0}) | later {late:.0} px | peak {peak:.0} px",
+                first[5], first[9], preset.early_rms
+            );
+        }
+    }
+
+    /// `cargo test --release --lib -- calibration_timing_report --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn calibration_timing_report() {
+        for (name, strafe) in [
+            ("60 px/s", 12.7),
+            ("240 px/s", 50.9),
+            ("480 px/s", 101.9),
+            ("750 px/s", 150.0),
+        ] {
+            let mut times = Vec::new();
+            let mut worst: f64 = 0.0;
+            for seed in 300..330 {
+                let (_, calibration, first) =
+                    simulate_timed(World { strafe, ..GAME }, true, seed, None);
+                times.push(first.unwrap_or(f64::INFINITY));
+                if let Some(c) = calibration {
+                    worst = worst.max((c.px_per_count - 0.25).abs() / 0.25);
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "TIMING {name}: first calibrated median {:.2}s p90 {:.2}s max {:.2}s; worst final px/count error {:.0}%",
+                times[15], times[27], times[29], worst * 100.0
+            );
+        }
+    }
+
     #[test]
     fn calibration_recovers_pixels_per_count_and_latency_while_tracking() {
         for seed in [21, 22, 23] {
@@ -1563,17 +1868,22 @@ mod tests {
     }
 
     #[test]
-    fn without_a_usable_calibration_tracking_is_no_worse_and_a_still_target_stays_steady() {
-        // ±1 count moves 0.05 px here: below detection, so no calibration.
+    fn sub_pixel_probes_are_no_worse_on_average_and_a_still_target_stays_steady() {
+        // ±2 counts move 0.1 px here: below detection, so the estimate is rough
+        // (biased high, the safe side). On average no worse, and never unstable.
         let fine = World {
             px_per_count: 0.05,
             ..GAME
         };
-        let (aware, calibration) = simulate_in(fine, true, 41);
-        let (blind, _) = simulate_in(fine, false, 41);
-        assert!(calibration.is_none());
+        let (mut aware, mut blind) = (0.0, 0.0);
+        for seed in 41..47 {
+            let run = simulate_run(fine, true, seed, None);
+            assert!(run.peak_after_start < 400.0, "{}", run.peak_after_start);
+            aware += run.rms;
+            blind += simulate_in(fine, false, seed).0;
+        }
         assert!(
-            aware <= blind * 1.05,
+            aware <= blind * 1.1,
             "aware {aware:.1} px vs blind {blind:.1} px"
         );
         // The probe does not visibly shake a still target.
@@ -1587,6 +1897,91 @@ mod tests {
             aware <= blind + 1.0,
             "aware {aware:.1} px vs blind {blind:.1} px"
         );
+    }
+
+    #[test]
+    fn fast_tracking_starts_within_a_fraction_of_a_second_and_stays_stable() {
+        for world in [
+            GAME,
+            World {
+                px_per_count: 2.0,
+                ..GAME
+            },
+            World {
+                px_per_count: 12.0,
+                ..GAME
+            },
+            World {
+                fps: 60.0,
+                latency_s: 0.04,
+                ..GAME
+            },
+        ] {
+            let run = simulate_run(world, true, 61, None);
+            let on = run.first_calibrated.expect("calibrated");
+            assert!(on <= 0.6, "on after {on:.2} s");
+            // Far below the runaway errors of an under-estimated px/count.
+            assert!(run.peak_after_start < 300.0, "{}", run.peak_after_start);
+        }
+    }
+
+    #[test]
+    fn a_saved_calibration_tracks_from_the_first_frame() {
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        let (mut fresh, mut loaded) = (0.0, 0.0);
+        for seed in 71..74 {
+            fresh += simulate_run(GAME, true, seed, None).early_rms;
+            let run = simulate_run(GAME, true, seed, saved);
+            // On from the first received frame (it arrives one latency in).
+            assert!(run.first_calibrated.is_some_and(|on| on <= 0.03));
+            loaded += run.early_rms;
+        }
+        assert!(
+            loaded < fresh * 0.7,
+            "loaded {loaded:.0} vs fresh {fresh:.0}"
+        );
+    }
+
+    #[test]
+    fn calibrations_are_saved_per_sens_and_dpi_and_reloaded() {
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-calibration-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("motion-calibration.json");
+        let calibration = MotionCalibration {
+            px_per_count: 0.31,
+            latency_s: 0.028,
+        };
+        let store = CalibrationStore::load(&path);
+        assert_eq!(store.get(0.235, 800.0), None);
+        store.put(0.235, 800.0, calibration);
+        assert_eq!(store.get(0.235, 800.0), Some(calibration));
+        assert_eq!(store.get(0.5, 800.0), None, "another sensitivity");
+        // Written on a background thread.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while CalibrationStore::load(&path).get(0.235, 800.0).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "calibration file was not written"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A damaged or out-of-range file is ignored, not trusted.
+        std::fs::write(
+            &path,
+            b"[{\"sens\":0.235,\"dpi\":800,\"px_per_count\":-1,\"latency_s\":0}]",
+        )
+        .unwrap();
+        assert_eq!(CalibrationStore::load(&path).get(0.235, 800.0), None);
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(CalibrationStore::load(&path).get(0.235, 800.0), None);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

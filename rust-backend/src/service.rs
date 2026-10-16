@@ -2,7 +2,8 @@ use crate::config::{
     load_settings, save_settings, AppSettings, ModelDefinition, ModelRegistry, RecoilSettings,
 };
 use crate::movement::{
-    MovementBatcher, MovementRuntimeSettings, MovementTargetSample, MovementTicker,
+    CalibrationStore, MovementBatcher, MovementRuntimeSettings, MovementTargetSample,
+    MovementTicker,
 };
 use crate::pipeline::{LatestFramePipeline, PipelineConfig, ProcessedFrame};
 use crate::pixel_seek::PixelTargetColor;
@@ -169,6 +170,9 @@ impl ReceiverService {
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
             f64::from(app.dpi),
+            Arc::new(CalibrationStore::load(
+                data_dir.join("motion-calibration.json"),
+            )),
             Arc::new(move || {
                 let settings = ticker_settings.lock().ok()?.clone();
                 let trigger_held = ticker_device
