@@ -148,7 +148,7 @@ The Legacy API is a small KM-style command set for platforms that cannot use Fer
 
 ### Detector-to-mouse control
 
-`km.move(dx,dy)` is relative movement. SysX converts the filtered target from original frame/crop coordinates using saved offsets and Sensitivity/DPI, batches deltas, checks trigger state and 100 ms freshness, and clamps each command to ±32 per axis. It sends `km.move` only while the selected Right/Middle/M4/M5 physical trigger is held. This path has not been validated on Ferrum hardware or Windows; device-count calibration and disconnect behavior still need hardware testing. The reconstructed KM serial queue is isolated behind a Rust writer interface and is not attached to this Legacy writer path.
+`km.move(dx,dy)` is relative movement. SysX converts the filtered target from original frame/crop coordinates using saved offsets and Sensitivity/DPI, batches deltas, checks trigger state and 100 ms freshness, and clamps each command to ±32 per axis. It sends `km.move` only while the selected Right/Middle/M4/M5 physical trigger is held. This path has not been validated on Ferrum hardware or Windows; device-count calibration and disconnect behavior still need hardware testing. Moves are written through the type-0 serial queue on a dedicated writer thread (cloned port handle, 100 ms per-command write budget), so `km.buttons` telemetry is never blocked by a write.
 
 ## 9. Official references
 

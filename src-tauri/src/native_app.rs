@@ -432,6 +432,20 @@ fn monitor_medius(
         },
     );
 
+    // Moves run on the queue's writer thread through a clone of the device handle
+    // (the crate shares one link), so a slow move never delays button events.
+    let move_device = device.clone();
+    let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
+        let (dx, dy) = crate::serial_queue::decode_medius_move(bytes)
+            .ok_or_else(|| "unsupported Medius command".to_string())?;
+        move_device
+            .move_rel(dx, dy)
+            .map_err(|error| error.to_string())
+    }) else {
+        return false;
+    };
+    let mut serial = crate::serial_queue::SerialCommandQueue::new(writer);
+    let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     let mut movement_error = false;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
     loop {
@@ -455,6 +469,25 @@ fn monitor_medius(
                 }
             }
         }
+        if !events.is_connected() {
+            break;
+        }
+        serial.pump();
+        if let Some(completion) = &move_completion {
+            match completion.try_recv() {
+                Ok(Ok(())) => move_completion = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    movement_error = true;
+                    break;
+                }
+            }
+        }
+        // While a move is in flight, new targets keep summing in MovementState
+        // (and expire after 100 ms) instead of queueing up behind it.
+        if !serial.is_idle() {
+            continue;
+        }
         if let Some(target) = crate::movement::take_target(movement_state) {
             let held = crate::movement::trigger_button_index(&target.trigger_button).is_some_and(
                 |button| {
@@ -469,16 +502,21 @@ fn monitor_medius(
                 &target.recoil,
                 std::time::Instant::now(),
             );
-            if held && target.target_valid && events.is_connected() {
+            if held && target.target_valid {
                 let (dx, dy) = target.device_delta(recoil);
-                if (dx != 0 || dy != 0) && device.move_rel(dx, dy).is_err() {
-                    movement_error = true;
-                    break;
+                if dx != 0 || dy != 0 {
+                    match serial.submit_medius_move(dx, dy) {
+                        Ok(completion) => {
+                            move_completion = Some(completion);
+                            serial.pump();
+                        }
+                        Err(_) => {
+                            movement_error = true;
+                            break;
+                        }
+                    }
                 }
             }
-        }
-        if !events.is_connected() {
-            break;
         }
     }
     set_device_status(
@@ -555,6 +593,16 @@ fn monitor_ferrum(
     if connection.write_all(b"km.buttons(1)\n").is_err() {
         return false;
     }
+    // Moves are written on their own thread so a slow driver write never stalls
+    // button telemetry; the read loop keeps the original handle.
+    let Ok(write_port) = connection.try_clone() else {
+        return false;
+    };
+    let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::for_port(write_port) else {
+        return false;
+    };
+    let mut serial = crate::serial_queue::SerialCommandQueue::new(writer);
+    let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     set_device_status(
         device_state,
         DeviceStatus {
@@ -586,6 +634,22 @@ fn monitor_ferrum(
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => break,
         }
+        serial.pump();
+        if let Some(completion) = &move_completion {
+            match completion.try_recv() {
+                Ok(Ok(())) => move_completion = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    movement_error = true;
+                    break;
+                }
+            }
+        }
+        // While a move is still being written, leave new targets in MovementState:
+        // they keep summing there and expire after 100 ms instead of queueing up.
+        if !serial.is_idle() {
+            continue;
+        }
         if let Some(target) = crate::movement::take_target(movement_state) {
             let held = crate::movement::trigger_button_index(&target.trigger_button)
                 .is_some_and(|button| last_mask & (1 << button) != 0);
@@ -596,13 +660,17 @@ fn monitor_ferrum(
             );
             if held && target.target_valid {
                 let (dx, dy) = target.device_delta(recoil);
-                if (dx != 0 || dy != 0)
-                    && connection
-                        .write_all(format!("km.move({dx},{dy})\n").as_bytes())
-                        .is_err()
-                {
-                    movement_error = true;
-                    break;
+                if dx != 0 || dy != 0 {
+                    match serial.submit_move(dx.into(), dy.into()) {
+                        Ok(completion) => {
+                            move_completion = Some(completion);
+                            serial.pump();
+                        }
+                        Err(_) => {
+                            movement_error = true;
+                            break;
+                        }
+                    }
                 }
             }
         }

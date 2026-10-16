@@ -19,7 +19,7 @@ The files in `~/Downloads/CapkfaPlus-logic-and-reconstructions (1)` are analyst 
 | `FrameTimingAverage.cpp` | `rust-backend/src/movement.rs`, `pipeline.rs`, `service.rs` | Ports the 30-sample average helper. Live telemetry continues to use SysX's one-second source/processing windows. |
 | `TargetOutputBackend.cpp` | `src-tauri/src/movement.rs`, `MediusAPI.md`, `FerrumAPI.md` | Sends relative motion through the documented Medius client or Ferrum KM API. |
 | `PreviewRgbToRgba.cpp` | `rust-ui/src/preview.rs` | Converts/paints RGB frame data in the Rust preview path. |
-| `SerialMoveQueueSubmit.cpp`, `SerialQueuedCommandApi.cpp`, `SerialQueuedCommandConsumer.cpp` | `src-tauri/src/serial_queue.rs` | Ports type-0 queueing and completion ownership behind an async writer interface. Command bytes stay alive until completion; `request_ms` is not treated as a deadline. The queue is not connected to hardware, and nonzero kinds remain unsupported. |
+| `SerialMoveQueueSubmit.cpp`, `SerialQueuedCommandApi.cpp`, `SerialQueuedCommandConsumer.cpp` | `src-tauri/src/serial_queue.rs` | Ports type-0 queueing and completion ownership behind an async writer interface. Command bytes stay alive until completion; `request_ms` is the writer's per-command write budget, not an end-to-end deadline. Wired to Ferrum (`km.move` on a cloned port) and Medius (`move_rel` on a cloned `Device`) through `ThreadedSerialWriter`; not validated on hardware. Nonzero kinds remain unsupported. |
 
 ## Explicit movement state
 
@@ -33,4 +33,4 @@ The files in `~/Downloads/CapkfaPlus-logic-and-reconstructions (1)` are analyst 
 
 ## Verification limits
 
-Rust unit tests cover the translated pure algorithms and the serial queue's fake writer lifecycle. They do not validate the C++ reconstructions against the original binary, a real model, a Medius/Ferrum device, Windows, or hardware movement. See [`DEVELOPMENT.md`](../DEVELOPMENT.md) for current build and runtime evidence.
+Rust unit tests cover the translated pure algorithms and the serial queue's fake writer lifecycle and its threaded writer (timeout retry, partial writes, budget expiry, Medius record round trip). They do not validate the C++ reconstructions against the original binary, a real model, a Medius/Ferrum device, Windows, or hardware movement. See [`DEVELOPMENT.md`](../DEVELOPMENT.md) for current build and runtime evidence.

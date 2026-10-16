@@ -3,6 +3,7 @@
 mod monitor_window;
 mod movement;
 mod native_app;
+mod serial_queue;
 mod single_instance;
 
 fn main() {
