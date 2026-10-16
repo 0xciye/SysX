@@ -206,7 +206,7 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .config-window { height: auto; min-height: 100vh; }
 body:has(.config-window) { overflow: auto; }
 .config-window .settings-workspace { min-height: calc(100vh - 64px); display: block; }
-.config-window .settings-panel { overflow: visible; padding: 0; border: 0; background: transparent; box-shadow: none; }
+.config-window .settings-panel { max-height: none; overflow: visible; padding: 0; border: 0; background: transparent; box-shadow: none; }
 .config-general .general-settings {
   width: min(100%, 1240px);
   margin-inline: auto;
@@ -336,3 +336,13 @@ body:has(.config-window) { overflow: auto; }
   .monitor-profile { max-width: 38vw; }
   .monitor-profile-label { display: none; }
 }
+
+/* Object Detection is retained for development, unavailable in the current UI. */
+.strategy-option.unavailable, .strategy-option.unavailable:hover { cursor: not-allowed; border-color: var(--border); background: var(--control); transform: none; }
+.strategy-option.unavailable .strategy-copy strong { color: var(--muted); }
+.strategy-copy small { margin-top: 4px; color: #d9b763; font-size: 10px; }
+.engine-availability { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+
+.unavailable-model-controls { display: contents; }
+
+.model-config[disabled] { min-width: 0; margin: 0; padding-inline: 0; border: 0; }

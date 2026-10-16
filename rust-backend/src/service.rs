@@ -78,7 +78,7 @@ pub struct ReceiverService {
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<JoinHandle<()>>>,
     session_id: String,
-    /// Latest Medius/Ferrum status reported by the native host
+    /// Latest Medius status reported by the native host
     /// (`device_status` command); forwarded to the monitor page in `state`.
     device: Arc<Mutex<Value>>,
     /// Open `role=monitor` WebSocket clients.
@@ -694,6 +694,7 @@ impl ReceiverService {
                 if let Some(enabled) = command.get("motion_enabled").and_then(Value::as_bool) {
                     settings.motion_enabled = enabled;
                 }
+                drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_smoothing_config" => {
@@ -1643,6 +1644,28 @@ mod tests {
         assert_eq!(service.state()["recoil"]["recoilEnabled"], true);
 
         drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn movement_settings_acknowledge_without_relocking_the_settings_guard() {
+        let (service, data_dir) = test_service("movement-settings-ack");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let worker_service = Arc::clone(&service);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_service.dispatch(json!({"version":1,"type":"apply_settings",
+                "commands":[{"version":1,"type":"set_movement_calibration","sens":0.23,"motion_enabled":true}]}));
+            let _ = tx.send(result);
+        });
+        let response = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("settings command must not deadlock")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(response["state"]["sens"], 0.23);
+        assert_eq!(response["state"]["motion_enabled"], true);
+        drop(guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

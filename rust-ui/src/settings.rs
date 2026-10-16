@@ -240,8 +240,8 @@ impl AppSettings {
         if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
             return Err("Choose Right, Middle, M4, or M5 for the trigger button.");
         }
-        if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
-            return Err("Choose a supported detection engine.");
+        if self.strategy != "pixel_seek" {
+            return Err("Choose Pixel Seek. Object Detection is not available yet.");
         }
         if !(1..=360).contains(&self.fov_degrees) {
             return Err("FOV must be from 1 to 360 degrees.");
@@ -289,6 +289,15 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::{format_recoil_levels, parse_recoil_levels, AppSettings, AutoSettings};
+
+    #[test]
+    fn unavailable_object_detection_cannot_be_applied_from_the_ui() {
+        let mut settings = super::AppSettings::default();
+        settings.strategy = "object_detection".into();
+        assert!(settings.validate().unwrap_err().contains("not available"));
+        settings.strategy = "pixel_seek".into();
+        assert!(settings.validate().is_ok());
+    }
 
     #[test]
     fn auto_defaults_are_valid_and_separate_from_motion_settings() {

@@ -1,11 +1,19 @@
 # Tổng hợp công việc — 2026-10-15
 
+> **Trạng thái sử dụng:** Hiện chỉ **Pixel Seek dùng được**. **Object Detection, ONNX Runtime, OpenVINO và TensorRT chưa dùng được**; source/dependency được giữ cho phát triển. Thiết bị được hỗ trợ chỉ còn **Medius qua Rust SDK**; đã bỏ Ferrum và MAKCU.
+
 ## Cập nhật hiện tại — 2026-10-16
 
 - Đã hoàn thiện profile settings trong backend và Web Config: khởi đầu với `Default`, tối đa ba profile, tạo, clone, đổi tên, xoá và chọn profile. Mỗi profile giữ snapshot setting riêng trong `app-settings.json`; nút chuột giữa chỉ chuyển profile một lần theo rising edge.
 - Receiver monitor hiện hiển thị tên profile đang chọn trong header. Tên và index lấy từ state WebSocket (`profile_index`/`profiles`), vì vậy Receiver tự đổi theo thao tác trên Web Config hoặc lần chuyển profile bằng chuột giữa mà không cần khởi động lại.
-- Auto target gate dùng mask HSV chung với Motion, chỉ báo target hợp lệ khi pixel màu chạm tâm crosshair trong Auto FOV; pixel màu ở chỗ khác không kích hoạt, không chọn target chuyển động và không vẽ line/ring tới pixel Auto. Auto state machine bắt đầu Delay từ lần thấy pixel chạm tâm, bắt đầu Cooldown khi phát lệnh click, dùng Sleep làm nhịp polling riêng, rồi gửi left-click qua Medius/Ferrum khi đủ điều kiện.
-- Đã cập nhật README, AGENTS, DEVELOPMENT và `docs/FEATURES_AND_CHANGES.md` theo source hiện tại. Kiểm thử cuối được ghi ở commit mới; Windows, OBS LAN và thiết bị Medius/Ferrum thật vẫn chưa được xác thực trong môi trường macOS.
+- Auto target gate dùng mask HSV chung với Motion, chỉ báo target hợp lệ khi pixel màu chạm tâm crosshair trong Auto FOV; pixel màu ở chỗ khác không kích hoạt, không chọn target chuyển động và không vẽ line/ring tới pixel Auto. Auto state machine bắt đầu Delay từ lần thấy pixel chạm tâm, bắt đầu Cooldown khi phát lệnh click, dùng Sleep làm nhịp polling riêng, rồi gửi left-click qua Medius khi đủ điều kiện.
+- Đã cập nhật README, AGENTS, DEVELOPMENT và `docs/FEATURES_AND_CHANGES.md` theo source hiện tại. Kiểm thử cuối được ghi ở commit mới; Windows, OBS LAN và thiết bị Medius thật vẫn chưa được xác thực trong môi trường macOS.
+
+## Cập nhật thiết bị và trạng thái tính năng
+
+- Chỉ còn Medius qua Rust SDK `medius 3.4.3`; chuẩn hóa adapter output, thay tài liệu Native wire bằng Rust library, bỏ Ferrum và không tích hợp MAKCU. Thuật toán tracking và Delay/Cooldown/Sleep không đổi.
+- Pixel Seek là chế độ dùng được duy nhất. Object Detection và ONNX Runtime/OpenVINO/TensorRT được đánh dấu chưa dùng được; UI khóa các lựa chọn đó.
+- Sửa lỗi Apply Changes bị deadlock trong lệnh cấu hình sensitivity/motion. Windows và thiết bị thật vẫn cần kiểm tra.
 
 ## 1. Skill
 
@@ -14,7 +22,7 @@
 
 ## 2. Receiver UI — bỏ egui, chuyển sang web monitor
 
-- Xoá cửa sổ `eframe/egui`. Host native (`src-tauri`) giờ chỉ làm phần bắt buộc phải native: chạy backend nhúng, đọc Medius/Ferrum, gửi chuyển động chuột.
+- Xoá cửa sổ `eframe/egui`. Host native (`src-tauri`) giờ chỉ làm phần bắt buộc phải native: chạy backend nhúng, đọc Medius, gửi chuyển động chuột.
 - Receiver là trang `/monitor.html` (Leptos/WASM), host mở bằng Edge `--app` (cửa sổ không thanh địa chỉ, profile riêng tại `%LOCALAPPDATA%\SysX\monitor-window`, cỡ mặc định 550 × 620). Không có Edge thì mở bằng trình duyệt mặc định.
 - Đóng cửa sổ monitor → SysX tự tắt sau 3 giây (đã kiểm tra trên máy: backend tắt, UDP 4200 được giải phóng). Thêm retry khi xoá thư mục runtime vì Windows có lúc để lại thư mục rỗng.
 - Trạng thái thiết bị và 5 nút chuột: host → backend (`device_status`, có kiểm tra hợp lệ) → `state.device` → trang monitor.

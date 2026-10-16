@@ -1,5 +1,5 @@
 //! Native SysX host. It owns everything that must stay native â€” the embedded
-//! backend process, Medius/Ferrum device I/O and movement output â€” and shows
+//! backend process, Medius device I/O and movement output â€” and shows
 //! the receiver UI as the web monitor page (`/monitor.html`) in a chromeless
 //! browser app window. The host exits once the monitor and configuration
 //! clients have both closed.
@@ -424,8 +424,6 @@ fn client_counts(text: &str) -> Option<(usize, usize)> {
     Some((monitor, config))
 }
 
-const FERRUM_LEGACY_BAUD_RATE: u32 = 115_200;
-
 fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
     if let Ok(mut current) = state.lock() {
         *current = status;
@@ -484,30 +482,9 @@ fn inspect_devices(
         }
     }
 
-    let mut ferrum_candidate = false;
-    for port in serialport::available_ports().unwrap_or_default() {
-        let serialport::SerialPortType::UsbPort(usb) = &port.port_type else {
-            continue;
-        };
-        let is_cp210x = usb.vid == 0x10c4
-            && usb
-                .product
-                .as_deref()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .contains("cp210");
-        if !is_cp210x {
-            continue;
-        }
-        ferrum_candidate = true;
-        if monitor_ferrum(movement_state, auto_target, device_state, &port.port_name) {
-            return true;
-        }
-    }
-
     set_device_status(
         device_state,
-        if ferrum_candidate || !medius_ports.is_empty() {
+        if !medius_ports.is_empty() {
             DeviceStatus::error()
         } else {
             DeviceStatus::missing()
@@ -560,18 +537,7 @@ fn monitor_medius(
     // (the crate shares one link), so a slow move never delays button events.
     let move_device = device.clone();
     let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
-        if crate::serial_queue::is_medius_left_click(bytes) {
-            move_device
-                .press(Button::LEFT)
-                .and_then(|_| move_device.release(Button::LEFT))
-                .map_err(|error| error.to_string())
-        } else {
-            let (dx, dy) = crate::serial_queue::decode_medius_move(bytes)
-                .ok_or_else(|| "unsupported Medius command".to_string())?;
-            move_device
-                .move_rel(dx, dy)
-                .map_err(|error| error.to_string())
-        }
+        crate::medius_device::dispatch(&move_device, bytes)
     }) else {
         return false;
     };
@@ -664,185 +630,6 @@ fn monitor_medius(
                 let (dx, dy) = target.device_delta(recoil);
                 if dx != 0 || dy != 0 {
                     match serial.submit_medius_move(dx, dy) {
-                        Ok(completion) => {
-                            move_completion = Some(completion);
-                            serial.pump();
-                        }
-                        Err(_) => {
-                            movement_error = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    set_device_status(
-        device_state,
-        if movement_error {
-            DeviceStatus::error()
-        } else {
-            DeviceStatus::missing()
-        },
-    );
-    true
-}
-
-fn ferrum_device_name(response: &str) -> Option<String> {
-    response
-        .lines()
-        .map(str::trim)
-        .find(|line| line.eq_ignore_ascii_case("kmbox: ferrum"))
-        .map(|_| "Ferrum".to_string())
-}
-
-fn parse_ferrum_button_mask(bytes: &[u8]) -> Option<u8> {
-    let prefix = b"km.";
-    for found in bytes
-        .windows(prefix.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == prefix).then_some(index))
-    {
-        let start = found + prefix.len();
-        let Some(&mask) = bytes.get(start) else {
-            continue;
-        };
-        if mask <= 0b1_1111 && bytes.get(start + 1..start + 3) == Some(b"\r\n") {
-            return Some(mask);
-        }
-    }
-    None
-}
-
-fn monitor_ferrum(
-    movement_state: &crate::movement::MovementState,
-    auto_target: &Arc<Mutex<AutoTargetEvent>>,
-    device_state: &Arc<Mutex<DeviceStatus>>,
-    port_name: &str,
-) -> bool {
-    use std::io::{Read, Write};
-
-    let Ok(mut connection) = serialport::new(port_name, FERRUM_LEGACY_BAUD_RATE)
-        .timeout(Duration::from_millis(2))
-        .open()
-    else {
-        return false;
-    };
-    if connection.write_all(b"km.version()\n").is_err() {
-        return false;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    let mut response = Vec::with_capacity(256);
-    let mut chunk = [0_u8; 128];
-    while std::time::Instant::now() < deadline && response.len() < 1024 {
-        match connection.read(&mut chunk) {
-            Ok(count) => {
-                response.extend_from_slice(&chunk[..count]);
-                if ferrum_device_name(&String::from_utf8_lossy(&response)).is_some() {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => return false,
-        }
-    }
-    let Some(name) = ferrum_device_name(&String::from_utf8_lossy(&response)) else {
-        return false;
-    };
-    if connection.write_all(b"km.buttons(1)\n").is_err() {
-        return false;
-    }
-    // Moves are written on their own thread so a slow driver write never stalls
-    // button telemetry; the read loop keeps the original handle.
-    let Ok(write_port) = connection.try_clone() else {
-        return false;
-    };
-    let Ok(writer) = crate::serial_queue::ThreadedSerialWriter::for_port(write_port) else {
-        return false;
-    };
-    let mut serial = crate::serial_queue::SerialCommandQueue::new(writer);
-    let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
-    set_device_status(
-        device_state,
-        DeviceStatus {
-            state: DeviceState::Connected,
-            name: Some(name),
-            buttons: [None; 5],
-        },
-    );
-    let mut buffered = Vec::with_capacity(128);
-    let mut last_mask = 0_u8;
-    let mut movement_error = false;
-    let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
-    let mut auto_state = crate::auto::AutoState::new();
-    loop {
-        match connection.read(&mut chunk) {
-            Ok(count) => {
-                buffered.extend_from_slice(&chunk[..count]);
-                if let Some(mask) = parse_ferrum_button_mask(&buffered) {
-                    last_mask = mask;
-                    let buttons = std::array::from_fn(|index| Some(mask & (1 << index) != 0));
-                    if let Ok(mut current) = device_state.lock() {
-                        current.buttons = buttons;
-                    }
-                    buffered.clear();
-                } else if buffered.len() > 256 {
-                    let keep = buffered.split_off(buffered.len() - 8);
-                    buffered = keep;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        serial.pump();
-        if let Some(completion) = &move_completion {
-            match completion.try_recv() {
-                Ok(Ok(())) => move_completion = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    movement_error = true;
-                    break;
-                }
-            }
-        }
-        // While a move is still being written, leave new targets in MovementState:
-        // they keep summing there and expire after 100 ms instead of queueing up.
-        if !serial.is_idle() {
-            continue;
-        }
-        let auto_input = auto_target
-            .lock()
-            .map(|input| input.clone())
-            .unwrap_or_default();
-        let auto_held = auto_trigger_held(&auto_input, |button| last_mask & (1 << button) != 0);
-        if let Some(crate::auto::AutoAction::LeftClick) =
-            auto_action(&mut auto_state, &auto_input, auto_held, Instant::now())
-        {
-            match serial.submit_left_click() {
-                Ok(completion) => {
-                    move_completion = Some(completion);
-                    serial.pump();
-                    continue;
-                }
-                Err(_) => {
-                    movement_error = true;
-                    break;
-                }
-            }
-        }
-        if let Some(target) = crate::movement::take_target(movement_state) {
-            let held = crate::movement::trigger_button_index(&target.trigger_button)
-                .is_some_and(|button| last_mask & (1 << button) != 0);
-            let motion_active = crate::movement::should_apply_target(&target, held);
-            let recoil = vertical_adjustment.sample(
-                motion_active,
-                &target.recoil,
-                std::time::Instant::now(),
-            );
-            if motion_active {
-                let (dx, dy) = target.device_delta(recoil);
-                if dx != 0 || dy != 0 {
-                    match serial.submit_move(dx.into(), dy.into()) {
                         Ok(completion) => {
                             move_completion = Some(completion);
                             serial.pump();

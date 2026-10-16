@@ -393,9 +393,9 @@ pub fn ConfigApp() -> impl IntoView {
                                             <input type="radio" name="detection-engine" value="pixel_seek" prop:checked=move || settings.get().strategy == "pixel_seek" on:change=move |_| settings.update(|value| value.strategy = "pixel_seek".into())/>
                                             <span class="strategy-radio" aria-hidden="true"/><span class="strategy-copy"><strong>"Pixel Seek"</strong></span>
                                         </label>
-                                        <label class=move || format!("strategy-option{}", if settings.get().strategy == "object_detection" { " selected" } else { "" })>
-                                            <input type="radio" name="detection-engine" value="object_detection" prop:checked=move || settings.get().strategy == "object_detection" on:change=move |_| settings.update(|value| value.strategy = "object_detection".into())/>
-                                            <span class="strategy-radio" aria-hidden="true"/><span class="strategy-copy"><strong>"Object Detection"</strong></span>
+                                        <label class="strategy-option unavailable" title="Object Detection is not available yet" aria-disabled="true">
+                                            <input type="radio" name="detection-engine" value="object_detection" disabled prop:checked=move || settings.get().strategy == "object_detection"/>
+                                            <span class="strategy-radio" aria-hidden="true"/><span class="strategy-copy"><strong>"Object Detection"</strong><small>"Unavailable"</small></span>
                                         </label>
                                     </div>
                                     <Show when=move || settings.get().strategy == "pixel_seek">
@@ -414,8 +414,10 @@ pub fn ConfigApp() -> impl IntoView {
                                             </div>
                                         </div>
                                     </Show>
+                                    <p class="engine-availability settings-wide" role="note">"Only Pixel Seek is available. Object Detection and ONNX Runtime / OpenVINO / TensorRT are not ready for use."</p>
                                     <Show when=move || settings.get().strategy == "object_detection">
-                                        <>
+                                        <fieldset disabled class="unavailable-model-controls">
+                                            <p class="engine-availability settings-wide">"This saved profile uses an unavailable engine. Select Pixel Seek and apply changes."</p>
                                             <label class="field settings-wide model-confidence">
                                                 <span class="range-heading"><span class="field-label">"Min confidence"</span><output>{move || format!("{:.2}", parse_float(&settings.get().model_confidence).unwrap_or(0.5))}</output></span>
                                                 <input type="range" min="0" max="1" step="0.01" prop:value=move || settings.get().model_confidence on:input=move |event| settings.update(|value| value.model_confidence = event_target_value(&event)) aria-label="Minimum confidence" on:change=move |_| update_active_model(command_sender, settings, "confidence")/>
@@ -456,16 +458,16 @@ pub fn ConfigApp() -> impl IntoView {
                                                     <option value="cpu">"CPU"</option><option value="gpu">"GPU"</option><option value="npu">"NPU"</option>
                                                 </select>
                                             </label>
-                                        </>
+                                        </fieldset>
                                     </Show>
                                     <Show when=move || active_model().is_some() && settings.get().strategy == "object_detection">
-                                        <div class="model-config settings-wide">
+                                        <fieldset disabled class="model-config settings-wide">
                                             <label class="field"><span class="field-label">"Input width"</span><input class="text-input" inputmode="numeric" prop:value=move || settings.get().model_width on:input=move |event| settings.update(|value| value.model_width = event_target_value(&event)) on:blur=move |_| update_active_model(command_sender, settings, "input_width")/></label>
                                             <label class="field"><span class="field-label">"Input height"</span><input class="text-input" inputmode="numeric" prop:value=move || settings.get().model_height on:input=move |event| settings.update(|value| value.model_height = event_target_value(&event)) on:blur=move |_| update_active_model(command_sender, settings, "input_height")/></label>
                                             <label class="field"><span class="field-label">"IoU"</span><input class="text-input" type="number" min="0" max="1" step="0.01" prop:value=move || settings.get().model_iou on:input=move |event| settings.update(|value| value.model_iou = event_target_value(&event)) on:blur=move |_| update_active_model(command_sender, settings, "iou")/></label>
                                             <span class="readout settings-wide model-path">{move || active_model().map(|model| selected_artifact_path(&model, &settings.get().model_backend)).unwrap_or_default()}</span>
                                             <button type="button" class="text-button remove-model settings-wide" on:click=move |_| remove_active_model(command_sender, settings)>"Remove model from registry"</button>
-                                        </div>
+                                        </fieldset>
                                     </Show>
                                 </div>
                             </div>

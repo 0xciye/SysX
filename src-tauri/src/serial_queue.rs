@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const MOVE_REQUEST_MS: u32 = 100;
 const MAX_QUEUED_COMMANDS: usize = 256;
@@ -18,8 +17,8 @@ pub trait AsyncSerialWriter {
     type Ticket;
 
     // The consumer keeps `bytes` alive until `poll_completion` reports a result.
-    // `request_ms` bounds how long the writer may spend getting the bytes into the
-    // port; it is not an end-to-end deadline (the device never acknowledges moves).
+    // `request_ms` is a writer hint, not an end-to-end deadline. The Medius
+    // adapter uses SDK-managed I/O timeouts; this queue cannot cancel SDK calls.
     fn submit(&mut self, bytes: &[u8], request_ms: u32) -> Result<Self::Ticket, String>;
     fn poll_completion(&mut self, ticket: &mut Self::Ticket) -> Option<Result<(), String>>;
 }
@@ -76,30 +75,8 @@ impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
         Ok(receiver)
     }
 
-    pub fn submit_move(
-        &mut self,
-        dx: i32,
-        dy: i32,
-    ) -> Result<Receiver<Result<(), String>>, String> {
-        // Same line ending as the Ferrum handshake and button commands.
-        let bytes = format!("km.move({dx},{dy})\n").into_bytes();
-        self.submit(QueuedSerialCommand {
-            kind: 0,
-            bytes,
-            request_ms: MOVE_REQUEST_MS,
-        })
-    }
-
-    pub fn submit_left_click(&mut self) -> Result<Receiver<Result<(), String>>, String> {
-        self.submit(QueuedSerialCommand {
-            kind: 0,
-            bytes: b"km.click()\n".to_vec(),
-            request_ms: MOVE_REQUEST_MS,
-        })
-    }
-
     // Advance at most one request. `request_ms` is handed to the writer as its
-    // per-command write budget.
+    // writer hint.
     pub fn pump(&mut self) {
         if let Some(in_flight) = self.in_flight.as_mut() {
             let Some(result) = self.writer.poll_completion(&mut in_flight.ticket) else {
@@ -173,7 +150,7 @@ struct WriteJob {
 
 /// Runs queued commands on a dedicated thread, so the caller's read/telemetry
 /// loop never blocks on the device driver. `sink` receives each command's
-/// retained bytes and its `request_ms` budget.
+/// retained bytes and its `request_ms` writer hint (Medius uses SDK timeouts).
 pub struct ThreadedSerialWriter {
     jobs: Sender<WriteJob>,
 }
@@ -194,18 +171,12 @@ impl ThreadedSerialWriter {
             .map_err(|error| format!("serial writer thread failed to start: {error}"))?;
         Ok(Self { jobs })
     }
-
-    /// Ferrum: write the text command to the port, retrying port write timeouts
-    /// until the budget is spent and resuming partial writes.
-    pub fn for_port<P: Write + Send + 'static>(mut port: P) -> Result<Self, String> {
-        Self::spawn(move |bytes, budget| write_within(&mut port, bytes, budget))
-    }
 }
 
 const MEDIUS_MOVE_TAG: u8 = b'M';
 
-/// Medius moves go through the vendor crate's binary protocol, so the queue
-/// retains a compact `[tag, dx_le, dy_le]` record that the Medius sink decodes.
+/// Internal work record, never a device wire packet. The Medius sink decodes
+/// `[tag, dx_le, dy_le]` and invokes the Rust SDK's public `move_rel` method.
 pub fn encode_medius_move(dx: i16, dy: i16) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(5);
     bytes.push(MEDIUS_MOVE_TAG);
@@ -242,27 +213,6 @@ impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
     }
 }
 
-fn write_within<P: Write>(port: &mut P, bytes: &[u8], budget: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
-    let mut written = 0;
-    while written < bytes.len() {
-        match port.write(&bytes[written..]) {
-            Ok(0) => return Err("serial port accepted no bytes".into()),
-            Ok(count) => written += count,
-            Err(error)
-                if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted)
-                    && Instant::now() < deadline => {}
-            Err(error) => {
-                return Err(format!(
-                    "serial write failed after {written}/{} bytes: {error}",
-                    bytes.len()
-                ))
-            }
-        }
-    }
-    Ok(())
-}
-
 impl AsyncSerialWriter for ThreadedSerialWriter {
     type Ticket = Receiver<Result<(), String>>;
 
@@ -290,11 +240,10 @@ impl AsyncSerialWriter for ThreadedSerialWriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_medius_move, encode_medius_move, write_within, AsyncSerialWriter,
-        QueuedSerialCommand, SerialCommandQueue, ThreadedSerialWriter, MOVE_REQUEST_MS,
+        decode_medius_move, encode_medius_move, AsyncSerialWriter, QueuedSerialCommand,
+        SerialCommandQueue, ThreadedSerialWriter, MOVE_REQUEST_MS,
     };
     use std::collections::VecDeque;
-    use std::io::{self, ErrorKind, Write};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -321,13 +270,13 @@ mod tests {
     #[test]
     fn retains_command_bytes_and_advances_only_after_writer_completion() {
         let mut queue = SerialCommandQueue::new(FakeWriter::default());
-        let first = queue.submit_move(12, -7).unwrap();
-        let second = queue.submit_move(-3, 5).unwrap();
+        let first = queue.submit_medius_move(12, -7).unwrap();
+        let second = queue.submit_medius_move(-3, 5).unwrap();
         queue.pump();
 
         assert_eq!(
             queue.in_flight_bytes(),
-            Some(b"km.move(12,-7)\n".as_slice())
+            Some(encode_medius_move(12, -7).as_slice())
         );
         assert_eq!(queue.in_flight_request_ms(), Some(MOVE_REQUEST_MS));
         assert_eq!(queue.queued_len(), 1);
@@ -338,7 +287,10 @@ mod tests {
         queue.pump();
         assert_eq!(first.try_recv().unwrap(), Ok(()));
         assert_eq!(queue.writer.submitted.len(), 2);
-        assert_eq!(queue.in_flight_bytes(), Some(b"km.move(-3,5)\n".as_slice()));
+        assert_eq!(
+            queue.in_flight_bytes(),
+            Some(encode_medius_move(-3, 5).as_slice())
+        );
         assert!(second.try_recv().is_err());
     }
 
@@ -363,7 +315,7 @@ mod tests {
                 request_ms: 100,
             })
             .is_err());
-        let result = queue.submit_move(1, 2).unwrap();
+        let result = queue.submit_medius_move(1, 2).unwrap();
         queue.pump();
         assert_eq!(
             result.try_recv().unwrap(),
@@ -371,74 +323,20 @@ mod tests {
         );
     }
 
-    /// Accepts at most `chunk` bytes per call and times out on every other call.
-    struct SlowPort {
-        written: Arc<Mutex<Vec<u8>>>,
-        chunk: usize,
-        calls: usize,
-    }
-
-    impl Write for SlowPort {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.calls += 1;
-            if self.calls % 2 == 1 {
-                return Err(io::Error::new(ErrorKind::TimedOut, "busy"));
-            }
-            let count = bytes.len().min(self.chunk);
-            self.written
-                .lock()
-                .unwrap()
-                .extend_from_slice(&bytes[..count]);
-            Ok(count)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn write_retries_timeouts_and_resumes_partial_writes_within_budget() {
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let mut port = SlowPort {
-            written: written.clone(),
-            chunk: 3,
-            calls: 0,
-        };
-        write_within(&mut port, b"km.move(1,2)\n", Duration::from_millis(100)).unwrap();
-        assert_eq!(written.lock().unwrap().as_slice(), b"km.move(1,2)\n");
-    }
-
-    #[test]
-    fn write_fails_once_the_request_budget_is_spent() {
-        struct StuckPort;
-        impl Write for StuckPort {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                std::thread::sleep(Duration::from_millis(2));
-                Err(io::Error::new(ErrorKind::TimedOut, "stuck"))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let started = Instant::now();
-        let error =
-            write_within(&mut StuckPort, b"km.move(1,2)\n", Duration::from_millis(20)).unwrap_err();
-        assert!(error.contains("0/13 bytes"), "{error}");
-        assert!(started.elapsed() < Duration::from_millis(500));
-    }
-
     #[test]
     fn threaded_writer_delivers_moves_in_order_and_reports_completion() {
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let port = SlowPort {
-            written: written.clone(),
-            chunk: 4,
-            calls: 0,
-        };
-        let mut queue = SerialCommandQueue::new(ThreadedSerialWriter::for_port(port).unwrap());
-        let first = queue.submit_move(5, -6).unwrap();
-        let second = queue.submit_move(-32, 32).unwrap();
+        let moves = Arc::new(Mutex::new(Vec::new()));
+        let seen = moves.clone();
+        let writer = ThreadedSerialWriter::spawn(move |bytes, _| {
+            seen.lock()
+                .unwrap()
+                .push(decode_medius_move(bytes).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        let mut queue = SerialCommandQueue::new(writer);
+        let first = queue.submit_medius_move(5, -6).unwrap();
+        let second = queue.submit_medius_move(-32, 32).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !queue.is_idle() && Instant::now() < deadline {
             queue.pump();
@@ -447,10 +345,7 @@ mod tests {
         assert!(queue.is_idle());
         assert_eq!(first.try_recv().unwrap(), Ok(()));
         assert_eq!(second.try_recv().unwrap(), Ok(()));
-        assert_eq!(
-            written.lock().unwrap().as_slice(),
-            b"km.move(5,-6)\nkm.move(-32,32)\n"
-        );
+        assert_eq!(moves.lock().unwrap().as_slice(), &[(5, -6), (-32, 32)]);
     }
 
     #[test]
@@ -461,12 +356,12 @@ mod tests {
                 Some((dx, dy))
             );
         }
-        assert_eq!(decode_medius_move(b"km.move(1,2)\n"), None);
+        assert_eq!(decode_medius_move(b"unsupported"), None);
         assert_eq!(decode_medius_move(&[b'M', 1, 0, 2]), None);
         assert!(super::is_medius_left_click(
             &super::encode_medius_left_click()
         ));
-        assert!(!super::is_medius_left_click(b"km.click()\n"));
+        assert!(!super::is_medius_left_click(b"unsupported"));
 
         let moves = Arc::new(Mutex::new(Vec::new()));
         let seen = moves.clone();
@@ -478,7 +373,13 @@ mod tests {
         .unwrap();
         let mut queue = SerialCommandQueue::new(writer);
         let first = queue.submit_medius_move(7, -3).unwrap();
-        let wrong = queue.submit_move(1, 1).unwrap();
+        let wrong = queue
+            .submit(QueuedSerialCommand {
+                kind: 0,
+                bytes: b"unsupported".to_vec(),
+                request_ms: MOVE_REQUEST_MS,
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !queue.is_idle() && Instant::now() < deadline {
             queue.pump();
@@ -490,11 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn ferrum_left_click_uses_the_documented_km_command() {
+    fn medius_click_record_is_retained_until_completion() {
         let mut queue = SerialCommandQueue::new(FakeWriter::default());
-        let completion = queue.submit_left_click().unwrap();
+        let completion = queue.submit_medius_left_click().unwrap();
         queue.pump();
-        assert_eq!(queue.in_flight_bytes(), Some(b"km.click()\n".as_slice()));
+        assert_eq!(queue.in_flight_bytes(), Some(b"C".as_slice()));
         queue.writer.completions[0] = Some(Ok(()));
         queue.pump();
         assert_eq!(completion.try_recv().unwrap(), Ok(()));
