@@ -46,3 +46,6 @@ tower-http = { version = "0.6", features = ["fs"] }
 # TensorRT development adapter is also unavailable for use.
 baracuda-driver = { version = "0.0.1-alpha.94", optional = true }
 baracuda-tensorrt = { version = "0.0.1-alpha.94", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

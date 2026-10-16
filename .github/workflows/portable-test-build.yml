@@ -33,6 +33,13 @@ jobs:
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
           if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $expected) { throw 'Trunk checksum mismatch' }
           Expand-Archive $zip -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
+      - name: Windows occupied-port regression checks
+        shell: pwsh
+        run: |
+          cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic recovered_port_error_does_not_reappear_from_diagnostic_history
+          if ($LASTEXITCODE -ne 0) { throw 'Port recovery regression failed' }
+          cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic wildcard_listener_cannot_share_a_bound_loopback_port
+          if ($LASTEXITCODE -ne 0) { throw 'Exclusive UDP binding regression failed' }
       - name: Build, unit test and Windows UDP smoke
         shell: pwsh
         run: ./scripts/build-windows.ps1
@@ -44,7 +51,7 @@ jobs:
         run: |
           ./scripts/package-windows.ps1 -SkipBuild
           $note = @'
-          SysX Windows x64 test build. Based on application source eec8692fee0af7373ddf77dbf8435ba89bb8aec1, with backend build/tests using ort/load-dynamic.
+          SysX Windows x64 build. Based on eec8692 with portable build fixes and exclusive UDP port ownership on Windows.
           Built-in release hardening and runtime integrity are enabled. VMProtect has NOT been applied.
           Only Pixel Seek is usable; Object Detection is unavailable. Only Medius is supported.
           Windows unit, UDP and application lifecycle smoke checks ran on a hosted runner.
@@ -53,6 +60,7 @@ jobs:
           OBS sender plugin is built separately and is not included in this receiver package.
           '@
           $note | Set-Content dist-package/SysX/BUILD-INFO.txt -Encoding utf8
+          "Build commit: $env:GITHUB_SHA" | Add-Content dist-package/SysX/BUILD-INFO.txt -Encoding utf8
           Compress-Archive -Path dist-package/SysX -DestinationPath dist-package/SysX-eec8692-windows-x64-test.zip -Force
           $zip = Get-Item dist-package/SysX-eec8692-windows-x64-test.zip
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()

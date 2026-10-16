@@ -126,6 +126,29 @@ impl UdpDecodedFrameSource {
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )?;
+            // Winsock otherwise permits a wildcard listener and a listener
+            // on a specific interface to claim the same port simultaneously.
+            // Reserve this unicast receiver exclusively before binding.
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                use windows_sys::Win32::Networking::WinSock::{
+                    setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                };
+                let exclusive: i32 = 1;
+                let result = unsafe {
+                    setsockopt(
+                        socket.as_raw_socket() as usize,
+                        SOL_SOCKET,
+                        SO_EXCLUSIVEADDRUSE,
+                        (&exclusive as *const i32).cast(),
+                        std::mem::size_of_val(&exclusive) as i32,
+                    )
+                };
+                if result == SOCKET_ERROR {
+                    return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+                }
+            }
             // Over a LAN a whole frame (~100 datagrams) arrives in a burst
             // while this thread may still be decoding the previous JPEG; the
             // small default Windows buffer would drop chunks and whole frames.
@@ -219,6 +242,23 @@ fn monotonic_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcard_listener_cannot_share_a_bound_loopback_port() {
+        let busy = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let mut source = UdpDecodedFrameSource::new("0.0.0.0", port).unwrap();
+        assert!(
+            source.open().is_err(),
+            "an occupied interface must block wildcard binding"
+        );
+        drop(busy);
+        source.open().unwrap();
+        assert!(
+            UdpSocket::bind(("127.0.0.1", port)).is_err(),
+            "the wildcard receiver must own its port"
+        );
+    }
 
     #[test]
     fn bad_jpeg_and_dimension_mismatch_do_not_interrupt_the_listener() {
