@@ -1,14 +1,13 @@
 //! Release-only process hardening.
 //!
-//! VMProtect remains the authoritative anti-tamper/anti-debug layer for a
-//! shipped build. This guard is deliberately small and disabled for debug and
+//! Optional VMProtect processing is managed separately by the user. This guard is deliberately small and disabled for debug and
 //! test builds so development and automated tests keep their normal behavior.
 
 /// Refuse to run under a user-mode Windows debugger in release builds.
 ///
 /// A local administrator can still patch or replace a native executable, so
-/// this is a speed bump rather than a security boundary. VMProtect must also
-/// protect the backend binary before it is embedded by the host.
+/// this is a speed bump rather than a security boundary. Optional protection
+/// of the backend must happen before it is embedded by the host.
 pub fn start_release_guard() {
     #[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
     {
@@ -61,6 +60,7 @@ fn enable_process_mitigations() {
 /// debuggable receiver alive after the release guard trips.
 #[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
 fn terminate_process_tree() -> ! {
+    crate::diagnostics::record("security guard terminated the process tree");
     let pid = unsafe { GetCurrentProcessId() };
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])

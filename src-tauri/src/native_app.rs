@@ -105,6 +105,7 @@ pub fn run() {
         match start_backend(Arc::clone(&movement_state), Arc::clone(&auto_target)) {
             Ok(value) => value,
             Err(error) => {
+                crate::diagnostics::record(&format!("SysX could not start: {error}"));
                 eprintln!("SysX could not start: {error}");
                 return;
             }
@@ -117,6 +118,7 @@ pub fn run() {
     let (event_tx, event_rx) = mpsc::channel();
     start_host_client(port, token, Arc::clone(&device_state), event_tx);
     let Some(config_port) = config_port else {
+        crate::diagnostics::record("local web server did not start");
         eprintln!("SysX local web server did not start; no receiver window can be shown");
         return;
     };
@@ -266,6 +268,10 @@ fn start_backend(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    match crate::diagnostics::backend_stderr() {
+        Ok(file) => { command.stderr(file); }
+        Err(error) => crate::diagnostics::record(&format!("could not capture backend stderr: {error}")),
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

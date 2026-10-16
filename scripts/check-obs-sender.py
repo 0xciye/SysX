@@ -8,12 +8,13 @@ import subprocess
 import sys
 
 dll, selftest = map(lambda value: Path(value).resolve(), sys.argv[1:3])
+receiver_ip = sys.argv[3] if len(sys.argv) > 3 else '192.168.88.59'
 module = ctypes.WinDLL(str(dll))
 module.obs_module_name.restype = ctypes.c_char_p
 assert module.obs_module_name() == b"SysX Canvas Sender"
 assert callable(module.obs_module_load)
 assert callable(module.obs_module_unload)
-assert b"192.168.88.59" in dll.read_bytes()
+assert receiver_ip.encode('ascii') in dll.read_bytes()
 
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
     receiver.bind(("127.0.0.1", 0))
@@ -52,5 +53,5 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             process.communicate()
 
 print(json.dumps({"dll_exports": "PASS", "packetization_and_crop_reply": "PASS",
-                  "frames": list(complete.values()), "compiled_destination": "192.168.88.59:4200",
+                  "frames": list(complete.values()), "compiled_destination": f"{receiver_ip}:4200",
                   "scope": "headless loopback; not OBS graphics or LAN delivery"}))

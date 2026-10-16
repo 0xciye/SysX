@@ -10,8 +10,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
-debug = 0
+strip = "none"
+debug = 2
+debug-assertions = false
 incremental = false
 
 [build-dependencies]
@@ -30,3 +31,6 @@ sha2 = "0.11"
 
 [dev-dependencies]
 medius = { version = "3.4.3", features = ["mock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Threading"] }

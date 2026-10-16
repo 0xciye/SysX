@@ -1,7 +1,6 @@
 //! Release-only process hardening.
 //!
-//! The shipped binaries should additionally be protected with the user's
-//! VMProtect project. This small guard is disabled in debug/test builds and
+//! Optional VMProtect processing is managed separately by the user. This small guard is disabled in debug/test builds and
 //! does not change application logic.
 
 /// Refuse to run under a user-mode Windows debugger in release builds.
@@ -57,6 +56,7 @@ fn enable_process_mitigations() {
 /// `BackendRuntime::Drop` and could leave the extracted receiver alive.
 #[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
 fn terminate_process_tree() -> ! {
+    crate::diagnostics::record("security guard terminated the process tree");
     let pid = unsafe { GetCurrentProcessId() };
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])

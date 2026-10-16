@@ -48,7 +48,10 @@ constexpr int kSendBufferBytes = 8 * 1024 * 1024;
 
 // ---- Sender configuration: edit these and rebuild the DLL. ----
 // SysX receiver IPv4 address (or hostname) and UDP port.
-constexpr char kReceiverHost[] = "192.168.88.59";
+#ifndef SYSX_RECEIVER_HOST
+#define SYSX_RECEIVER_HOST "192.168.88.59"
+#endif
+constexpr char kReceiverHost[] = SYSX_RECEIVER_HOST;
 constexpr uint16_t kReceiverPort = 4200;
 // JPEG quality 1-100.
 constexpr int kJpegQuality = 80;
