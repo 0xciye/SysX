@@ -92,8 +92,6 @@ pub fn ConfigApp() -> impl IntoView {
                         });
                     }
                 }
-                // The backend sends no frames to the config page.
-                BackendEvent::Frame(..) => {}
                 BackendEvent::CommandResponse {
                     request_id,
                     command_type,
@@ -356,7 +354,7 @@ pub fn ConfigApp() -> impl IntoView {
                                 <div><span class="config-section-kicker">"05"</span><h2 id="settings-section-title">"Settings"</h2></div>
                             </div>
                             <div class="settings-row preview-options-row">
-                                <div class="setting-description"><h2>"Preview"</h2></div>
+                                <div class="setting-description"><h2>"Display"</h2></div>
                                 <div class="settings-fields">
                                     <label class="field settings-wide"><span class="field-label">"Scaling"</span>
                                         <select prop:value=move || settings.get().scale on:change=move |event| settings.update(|value| value.scale = event_target_value(&event))>

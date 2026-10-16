@@ -6,7 +6,7 @@ use std::path::Path;
 const INSTANCE_FILE: &str = "instance.json";
 
 /// Remembers the running instance's loopback web port so a second launch can
-/// reopen its monitor page.
+/// locate its separate config page.
 pub fn record_config_port(data_dir: &Path, config_port: u16) {
     let _ = std::fs::write(
         data_dir.join(INSTANCE_FILE),
@@ -18,6 +18,7 @@ pub fn clear_config_port(data_dir: &Path) {
     let _ = std::fs::remove_file(data_dir.join(INSTANCE_FILE));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn running_config_port(data_dir: &Path) -> Option<u16> {
     let text = std::fs::read_to_string(data_dir.join(INSTANCE_FILE)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -39,12 +40,22 @@ mod win {
         ) -> *mut c_void;
         fn GetLastError() -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn CreateEventW(
+            attributes: *mut c_void,
+            manual: i32,
+            initial: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+        fn SetEvent(handle: *mut c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     }
 
     #[link(name = "user32")]
     extern "system" {
         fn FindWindowW(class_name: *const u16, window_name: *const u16) -> *mut c_void;
         fn IsIconic(window: *mut c_void) -> i32;
+        fn IsWindowVisible(window: *mut c_void) -> i32;
         fn ShowWindow(window: *mut c_void, command: i32) -> i32;
         fn SetForegroundWindow(window: *mut c_void) -> i32;
     }
@@ -68,6 +79,43 @@ mod win {
         }
     }
 
+    pub struct MonitorSignal(*mut c_void);
+    impl MonitorSignal {
+        pub fn new() -> Self {
+            Self(unsafe {
+                CreateEventW(
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    wide("Local\\SysX.NativeMonitor.Show").as_ptr(),
+                )
+            })
+        }
+        pub fn requested(&self) -> bool {
+            !self.0.is_null() && unsafe { WaitForSingleObject(self.0, 0) } == 0
+        }
+    }
+    impl Drop for MonitorSignal {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    pub fn request_monitor() -> bool {
+        let handle = unsafe { OpenEventW(2, 0, wide("Local\\SysX.NativeMonitor.Show").as_ptr()) };
+        if handle.is_null() {
+            return false;
+        }
+        let result = unsafe { SetEvent(handle) } != 0;
+        unsafe {
+            CloseHandle(handle);
+        }
+        result
+    }
+
     /// `None` when another SysX already holds the instance mutex.
     pub fn acquire() -> Option<InstanceGuard> {
         let name = wide("Local\\SysX.Receiver.SingleInstance");
@@ -86,12 +134,12 @@ mod win {
     }
 
     /// Focuses the receiver window titled exactly "SysX" (the native app
-    /// window, or the Edge app-window fallback). Browser tabs carry a
+    /// window). Browser tabs carry a
     /// " - Microsoft Edge" style suffix, so they never match.
     pub fn focus_monitor_window() -> bool {
         let title = wide("SysX");
         let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-        if window.is_null() {
+        if window.is_null() || unsafe { IsWindowVisible(window) } == 0 {
             return false;
         }
         unsafe {
@@ -105,7 +153,7 @@ mod win {
 }
 
 #[cfg(target_os = "windows")]
-pub use win::{acquire, focus_monitor_window};
+pub use win::{acquire, focus_monitor_window, request_monitor, MonitorSignal};
 
 #[cfg(not(target_os = "windows"))]
 pub struct InstanceGuard;
@@ -117,6 +165,22 @@ pub fn acquire() -> Option<InstanceGuard> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn focus_monitor_window() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct MonitorSignal;
+#[cfg(not(target_os = "windows"))]
+impl MonitorSignal {
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn requested(&self) -> bool {
+        false
+    }
+}
+#[cfg(not(target_os = "windows"))]
+pub fn request_monitor() -> bool {
     false
 }
 

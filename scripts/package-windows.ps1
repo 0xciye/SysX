@@ -75,9 +75,7 @@ SysX - huong dan cai dat tren may khac
 Yeu cau (nguoi dung tu cai):
   1. Microsoft Visual C++ Redistributable 2015-2022 (x64):
      https://aka.ms/vs/17/release/vc_redist.x64.exe
-  2. Microsoft Edge WebView2 Runtime (Windows 11 co san; Windows 10 thuong
-     da co qua Edge). Neu thieu: https://go.microsoft.com/fwlink/p/?LinkId=2124703
-     Khong co WebView2 thi SysX tu mo receiver bang cua so Edge thay the.
+  Receiver native Slint khong can WebView2; trinh duyet chi dung cho trang Config.
 
 Chay SysX:
   - Chay SysX.exe. Cua so receiver/preview mo ra, trang config tu mo

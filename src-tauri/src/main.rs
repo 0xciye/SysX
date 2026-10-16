@@ -7,6 +7,7 @@ mod diagnostics;
 mod integrity;
 mod medius_device;
 mod monitor_window;
+mod native_monitor;
 mod movement;
 mod native_app;
 mod security;
