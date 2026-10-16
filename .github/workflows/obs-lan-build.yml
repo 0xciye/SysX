@@ -35,9 +35,7 @@ jobs:
         shell: pwsh
         run: |
           $headers = (Get-ChildItem work/obs-source -Recurse -Filter obs-module.h | Select-Object -First 1).DirectoryName
-          ./scripts/build-obs-plugin.ps1 -ObsInclude "$headers;$PWD/work/obs-config"
-          cmake --build work/obs-build-release --target sysx-sender-selftest
-          if ($LASTEXITCODE -ne 0) { throw 'Sender self-test build failed' }
+          ./scripts/build-obs-plugin.ps1 -ObsInclude "$headers;$PWD/work/obs-config" -BuildSelfTest
       - name: Check exports, packets, crop reply and Windows DLL imports
         shell: pwsh
         run: |

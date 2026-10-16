@@ -2,7 +2,8 @@ param(
     # libobs headers (OBS source release) plus the folder containing obsconfig.h.
     [string] $ObsInclude = "work/obs-source/obs-studio-32.2.2/libobs;work/obs-config",
     [string] $JpegInclude = "C:/libjpeg-turbo64/include",
-    [string] $JpegLibrary = "C:/libjpeg-turbo64/lib/jpeg-static.lib"
+    [string] $JpegLibrary = "C:/libjpeg-turbo64/lib/jpeg-static.lib",
+    [switch] $BuildSelfTest
 )
 # Builds the OBS sender plugin on its own (separate from the SysX package) and
 # copies the DLL to dist-package\OBS-plugin\. The receiver IP/port are
@@ -28,7 +29,8 @@ try {
     $configure = "`"$cmake`" -S `"$source`" -B `"$build`" -G `"NMake Makefiles`" -DCMAKE_BUILD_TYPE=Release " +
         "-DOBS_INCLUDE_DIR=`"$ObsInclude`" " +
         "-DJPEG_INCLUDE_DIR=`"$JpegInclude`" -DJPEG_LIBRARY=`"$JpegLibrary`""
-    cmd.exe /c "`"$vcvars`" >nul 2>nul && $configure && `"$cmake`" --build `"$build`" --target sysx-canvas-sender"
+    $targets = if ($BuildSelfTest) { 'sysx-canvas-sender sysx-sender-selftest' } else { 'sysx-canvas-sender' }
+    cmd.exe /c "`"$vcvars`" >nul 2>nul && $configure && `"$cmake`" --build `"$build`" --target $targets"
     if ($LASTEXITCODE -ne 0) { throw "OBS plugin build failed with code $LASTEXITCODE" }
 } finally {
     Pop-Location
