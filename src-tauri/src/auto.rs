@@ -70,7 +70,10 @@ impl AutoState {
     /// Advances Auto using the latest trigger and target state.
     ///
     /// `delay_ms` starts when a valid center-crossing target is first observed while the
-    /// trigger is held. `cooldown_ms` starts when the click action is emitted
+    /// trigger is held. Once started, the delay survives target loss; releasing
+    /// the trigger or disabling Auto cancels it. Further crossings while a
+    /// delay is pending do not restart it or schedule additional clicks.
+    /// `cooldown_ms` starts when the click action is emitted
     /// and is the minimum interval between two clicks. `sleep_ms` only spaces
     /// state evaluations to keep an idle loop from running continuously; it
     /// does not extend the cooldown. With a zero cooldown, one action is
@@ -82,7 +85,14 @@ impl AutoState {
         target_valid: bool,
         now: Instant,
     ) -> Option<AutoAction> {
-        if !self.enabled || !trigger_held || !target_valid {
+        if !self.enabled || !trigger_held {
+            self.reset();
+            return None;
+        }
+
+        // A center crossing arms one delayed click. The target need not stay
+        // at the center until it fires; target loss only rearms other phases.
+        if !target_valid && self.phase != AutoPhase::WaitingDelay {
             self.reset();
             return None;
         }
@@ -235,6 +245,128 @@ mod tests {
         assert_eq!(
             state.update(true, true, start + Duration::from_millis(50)),
             Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn brief_center_crossing_fires_once_after_delay_even_without_target() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 90,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), None);
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(89)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(90)),
+            Some(AutoAction::LeftClick)
+        );
+        for ms in 91..=200 {
+            assert_eq!(
+                state.update(true, false, start + Duration::from_millis(ms)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn further_crossings_preserve_the_first_deadline() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 90,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        for (ms, valid) in [(0, true), (10, false), (40, true), (89, true)] {
+            assert_eq!(
+                state.update(true, valid, start + Duration::from_millis(ms)),
+                None
+            );
+        }
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(90)),
+            Some(AutoAction::LeftClick)
+        );
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(200)),
+            None
+        );
+        // Target loss after the click permits the next crossing to arm again.
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(201)),
+            None
+        );
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(202)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(292)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn trigger_release_cancels_a_pending_delay() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 90,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), None);
+        assert_eq!(
+            state.update(false, false, start + Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(90)),
+            None
+        );
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(190)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn disabling_auto_cancels_a_pending_delay() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 90,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), None);
+        state.set_enabled(false);
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(90)),
+            None
+        );
+        state.set_enabled(true);
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(100)),
+            None
         );
     }
 
