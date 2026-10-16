@@ -351,6 +351,13 @@ fn client_counts(text: &str) -> Option<(usize, usize)> {
 
 fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
     if let Ok(mut current) = state.lock() {
+        if current.state != status.state || current.name != status.name {
+            crate::diagnostics::record(&format!(
+                "Medius mouse status: {:?}, name={}",
+                status.state,
+                status.name.as_deref().unwrap_or("none")
+            ));
+        }
         *current = status;
     }
 }
@@ -406,11 +413,22 @@ fn injection_ready(health: medius::Health) -> bool {
 fn wait_for_injection_ready(device: &medius::Device) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if device.query_health().is_ok_and(injection_ready) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
+        match device.query_health() {
+            Ok(health) if injection_ready(health) => return true,
+            Ok(health) if Instant::now() >= deadline => {
+                crate::diagnostics::record(&format!(
+                    "Medius mouse not ready after 3s: link_up={} mouse_attached={} clone_configured={}",
+                    health.link_up, health.mouse_attached, health.clone_configured
+                ));
+                return false;
+            }
+            Err(error) if Instant::now() >= deadline => {
+                crate::diagnostics::record(&format!(
+                    "Medius mouse health check failed after 3s: {error}"
+                ));
+                return false;
+            }
+            _ => {}
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -498,7 +516,17 @@ fn monitor_medius(
         }
         if Instant::now() >= next_health_check {
             next_health_check = Instant::now() + Duration::from_millis(250);
-            if !device.query_health().is_ok_and(injection_ready) {
+            let health = device.query_health();
+            if !health.as_ref().is_ok_and(|health| injection_ready(*health)) {
+                match health {
+                    Ok(health) => crate::diagnostics::record(&format!(
+                        "Medius mouse disconnected: link_up={} mouse_attached={} clone_configured={}",
+                        health.link_up, health.mouse_attached, health.clone_configured
+                    )),
+                    Err(error) => crate::diagnostics::record(&format!(
+                        "Medius mouse health check failed: {error}"
+                    )),
+                }
                 movement_error = true;
                 break;
             }
