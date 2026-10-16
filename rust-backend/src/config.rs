@@ -522,13 +522,14 @@ mod tests {
         assert!(saved.get("smoothingAlphaX").is_none());
 
         // Out of range or reversed ranges are rejected.
-        let mut invalid = AppSettings::default();
-        invalid.smoothing_x_min = 6.0;
-        invalid.smoothing_x_max = 3.0;
-        assert!(invalid.validate().is_err());
-        invalid.smoothing_x_min = 0.5;
-        invalid.smoothing_x_max = 3.0;
-        assert!(invalid.validate().is_err());
+        for (min, max) in [(6.0, 3.0), (0.5, 3.0), (1.0, 51.0)] {
+            let mut invalid = AppSettings {
+                smoothing_x_min: min,
+                smoothing_x_max: max,
+                ..AppSettings::default()
+            };
+            assert!(invalid.validate().is_err(), "{min}..{max}");
+        }
         let _ = fs::remove_dir_all(directory);
     }
 
