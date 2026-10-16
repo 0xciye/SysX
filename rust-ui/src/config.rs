@@ -24,8 +24,8 @@ pub fn ConfigApp() -> impl IntoView {
     let crop_draft = RwSignal::new("640".to_string());
     let offset_x_draft = RwSignal::new("0".to_string());
     let offset_y_draft = RwSignal::new("0".to_string());
-    let sens_draft = RwSignal::new("0.235".to_string());
-    let dpi_draft = RwSignal::new("800".to_string());
+    let sens_draft = RwSignal::new("0.25".to_string());
+    let dpi_draft = RwSignal::new("1600".to_string());
     let recoil_levels_draft = RwSignal::new(String::new());
     let command_sender = RwSignal::new(None);
     let last_applied = RwSignal::new(String::new());

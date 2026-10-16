@@ -53,8 +53,8 @@ impl Default for MovementConfig {
             max_speed_multiplier: 10.0,
             x_speed: 3.0,
             y_speed: 3.0,
-            sens: 0.235,
-            dpi: 800.0,
+            sens: 0.25,
+            dpi: 1600.0,
             clip_speed: 1000.0,
         }
     }
@@ -216,6 +216,10 @@ const CALIBRATION_ENTER_REL_ERROR: f64 = 0.4;
 const CALIBRATION_KEEP_REL_ERROR: f64 = 0.6;
 /// Saved to disk only once this tight.
 const CALIBRATION_SAVE_REL_ERROR: f64 = 0.15;
+/// A probe that moves the image less than this is below whole-pixel
+/// detection; such estimates are rough, so they must be as tight as a
+/// saveable one before they switch on.
+const PROBE_VISIBLE_PX: f64 = 0.3;
 /// Rates for calibration are taken over this span (2 frames at the intended
 /// 240 FPS) rather than between two frames: whole-pixel detections make
 /// single-frame rates too noisy. At lower frame rates a span is one frame.
@@ -698,8 +702,14 @@ impl MovementController {
             return;
         };
         let trusted = self.calibrator.weight >= CALIBRATION_TRUST_WEIGHT;
+        let probe_px = estimate.px_per_count * PROBE_COUNTS as f64;
+        let enter = if probe_px < PROBE_VISIBLE_PX {
+            CALIBRATION_SAVE_REL_ERROR
+        } else {
+            CALIBRATION_ENTER_REL_ERROR
+        };
         let accept = match self.calibration {
-            None => relative_error <= CALIBRATION_ENTER_REL_ERROR,
+            None => relative_error <= enter,
             // A loaded (or tighter) value is not traded for a rougher one
             // until enough new evidence exists.
             Some(_) if !trusted => relative_error <= self.calibration_error,
@@ -1311,8 +1321,8 @@ mod tests {
 
     #[test]
     fn sensitivity_dpi_formula_matches_configured_conversion() {
-        let factor = 360.0 * 2.54 * 0.235 / (54.54 * 800.0);
-        let (x, y) = image_to_mouse_scale(1.0, -1.0, 0.235, 800.0);
+        let factor = 360.0 * 2.54 * 0.25 / (54.54 * 1600.0);
+        let (x, y) = image_to_mouse_scale(1.0, -1.0, 0.25, 1600.0);
         assert!((x - factor).abs() < 1e-12);
         assert!((y + factor).abs() < 1e-12);
     }
@@ -1381,6 +1391,15 @@ mod tests {
             crop_target_error((-1.9, -1.9), (0, 0), (0, 0), (0.0, 0.0)),
             (-1.0, -1.0)
         );
+    }
+
+    /// A higher correction gain (the former Sens/DPI defaults), for tests of
+    /// the step shape that need steps above the minimum step.
+    fn seeded_high_gain(seed: u64) -> MovementController {
+        let mut controller = seeded(seed);
+        controller.config.sens = 0.235;
+        controller.config.dpi = 800.0;
+        controller
     }
 
     fn seeded(seed: u64) -> MovementController {
@@ -1477,7 +1496,7 @@ mod tests {
 
     #[test]
     fn each_stroke_accelerates_from_rest() {
-        let outputs = run(&mut seeded(4), (300.0, 0.0), 60);
+        let outputs = run(&mut seeded_high_gain(4), (300.0, 0.0), 60);
         let first = outputs[0].0.abs();
         let settled_speed = outputs[50].0.abs();
         assert!(first <= 1, "{outputs:?}");
@@ -1966,13 +1985,13 @@ mod tests {
             latency_s: 0.028,
         };
         let store = CalibrationStore::load(&path);
-        assert_eq!(store.get(0.235, 800.0), None);
-        store.put(0.235, 800.0, calibration);
-        assert_eq!(store.get(0.235, 800.0), Some(calibration));
-        assert_eq!(store.get(0.5, 800.0), None, "another sensitivity");
+        assert_eq!(store.get(0.25, 1600.0), None);
+        store.put(0.25, 1600.0, calibration);
+        assert_eq!(store.get(0.25, 1600.0), Some(calibration));
+        assert_eq!(store.get(0.5, 1600.0), None, "another sensitivity");
         // Written on a background thread.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while CalibrationStore::load(&path).get(0.235, 800.0).is_none() {
+        while CalibrationStore::load(&path).get(0.25, 1600.0).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "calibration file was not written"
@@ -1982,12 +2001,12 @@ mod tests {
         // A damaged or out-of-range file is ignored, not trusted.
         std::fs::write(
             &path,
-            b"[{\"sens\":0.235,\"dpi\":800,\"px_per_count\":-1,\"latency_s\":0}]",
+            b"[{\"sens\":0.25,\"dpi\":1600,\"px_per_count\":-1,\"latency_s\":0}]",
         )
         .unwrap();
-        assert_eq!(CalibrationStore::load(&path).get(0.235, 800.0), None);
+        assert_eq!(CalibrationStore::load(&path).get(0.25, 1600.0), None);
         std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(CalibrationStore::load(&path).get(0.235, 800.0), None);
+        assert_eq!(CalibrationStore::load(&path).get(0.25, 1600.0), None);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -2044,7 +2063,7 @@ mod tests {
     #[test]
     fn near_zone_response_rises_with_target_speed() {
         let step_at = |speed: f64| {
-            let mut controller = seeded(53);
+            let mut controller = seeded_high_gain(53);
             controller.calibration = Some(MotionCalibration {
                 px_per_count: 0.25,
                 latency_s: 0.0,
