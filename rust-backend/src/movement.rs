@@ -367,8 +367,20 @@ impl MotionCalibrator {
 pub struct FrameError {
     pub frame_id: u64,
     pub received_s: f64,
-    pub control: (f64, f64),
+    /// Unsmoothed error of the selected target (crop px).
     pub raw: (f64, f64),
+    /// Smoothing factor per axis for this track (1 = none).
+    pub smoothing_alpha: (f64, f64),
+}
+
+/// Smoothed control error. Calibrated, it is carried from frame to frame by
+/// the camera motion our own moves caused, so smoothing only slows the
+/// target's own motion — never the aim's — and cannot make the aim overshoot.
+#[derive(Clone, Copy, Debug)]
+struct SmoothedError {
+    value: (f64, f64),
+    /// When the frame it belongs to was captured.
+    seen_at: f64,
 }
 
 pub struct MovementController {
@@ -378,6 +390,7 @@ pub struct MovementController {
     track: VecDeque<(f64, (f64, f64))>,
     frame_error: (f64, f64),
     frame_received_s: f64,
+    smoothed: Option<SmoothedError>,
     /// Target velocity in crop px/s: its own motion once calibrated, the
     /// apparent (target minus camera) motion before that.
     target_velocity: (f64, f64),
@@ -418,6 +431,7 @@ impl MovementController {
             track: VecDeque::new(),
             frame_error: (0.0, 0.0),
             frame_received_s: 0.0,
+            smoothed: None,
             target_velocity: (0.0, 0.0),
             calibrator: MotionCalibrator::default(),
             calibration: None,
@@ -439,6 +453,7 @@ impl MovementController {
     pub fn reset(&mut self) {
         self.last_frame_id = None;
         self.track.clear();
+        self.smoothed = None;
         self.target_velocity = (0.0, 0.0);
         self.last_tick_s = None;
         self.settle();
@@ -497,12 +512,11 @@ impl MovementController {
             self.reset();
             return (0, 0);
         };
-        let raw = sample.raw_target.unwrap_or(target);
         let frame = FrameError {
             frame_id: sample.frame_id,
             received_s: sample.received_s,
-            control: crop_target_error(target, sample.crop_origin, sample.processed_size, offsets),
-            raw: crop_target_error(raw, sample.crop_origin, sample.processed_size, offsets),
+            raw: crop_target_error(target, sample.crop_origin, sample.processed_size, offsets),
+            smoothing_alpha: sample.smoothing_alpha,
         };
         self.track(frame, now, trigger_held)
     }
@@ -513,8 +527,8 @@ impl MovementController {
             FrameError {
                 frame_id,
                 received_s: now,
-                control: (dx, dy),
                 raw: (dx, dy),
+                smoothing_alpha: (1.0, 1.0),
             },
             now,
             false,
@@ -637,11 +651,13 @@ impl MovementController {
             if jump > TARGET_JUMP_PX {
                 // A different target: start over, with the acquisition ramp.
                 self.track.clear();
+                self.smoothed = None;
                 self.target_velocity = (0.0, 0.0);
                 self.stroke = None;
                 self.acquiring = true;
             } else if !(0.0005..=0.1).contains(&dt) {
                 self.track.clear();
+                self.smoothed = None;
                 self.target_velocity = (0.0, 0.0);
             } else {
                 let rate = (
@@ -658,6 +674,8 @@ impl MovementController {
                     }
                     None => rate,
                 };
+                // The velocity is not slowed by the smoothing strength: a slower
+                // velocity made the aim trail and overshoot more in simulation.
                 self.target_velocity = if self.track.len() >= 2 {
                     (
                         VELOCITY_ALPHA * own.0 + (1.0 - VELOCITY_ALPHA) * self.target_velocity.0,
@@ -682,8 +700,57 @@ impl MovementController {
             self.track.pop_front();
         }
         self.last_frame_id = Some(frame.frame_id);
-        self.frame_error = frame.control;
+        self.frame_error = self.smooth(frame);
         self.frame_received_s = t;
+    }
+
+    /// Exponential smoothing of the error around a constant-velocity
+    /// prediction. Calibrated, the previous smoothed error is first moved by
+    /// the target's own velocity and by the image shift of the moves applied
+    /// between the two captures, so only deviations of the target's own motion
+    /// are filtered. Before calibration that shift is unknown and the image
+    /// error is predicted with its apparent velocity.
+    fn smooth(&mut self, frame: &FrameError) -> (f64, f64) {
+        let alpha = |value: f64| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        let (ax, ay) = (
+            alpha(frame.smoothing_alpha.0),
+            alpha(frame.smoothing_alpha.1),
+        );
+        let seen_at = frame.received_s - self.calibration.map_or(0.0, |c| c.latency_s);
+        let value = match self.smoothed {
+            None => frame.raw,
+            Some(previous) => {
+                // Carry the previous value along the target's own velocity, so a
+                // steadily moving target is not trailed; only deviations from
+                // that motion (jitter, sudden jerks) are smoothed.
+                let elapsed = (seen_at - previous.seen_at).max(0.0);
+                let (vx, vy) = self.target_velocity;
+                let predicted = (
+                    previous.value.0 + vx * elapsed,
+                    previous.value.1 + vy * elapsed,
+                );
+                let carried = match self.calibration {
+                    Some(calibration) => {
+                        let ((mx, my), _) = self.moved_between(previous.seen_at, seen_at);
+                        let k = calibration.px_per_count;
+                        (predicted.0 - k * mx, predicted.1 - k * my)
+                    }
+                    None => predicted,
+                };
+                (
+                    carried.0 + ax * (frame.raw.0 - carried.0),
+                    carried.1 + ay * (frame.raw.1 - carried.1),
+                )
+            }
+        };
+        self.smoothed = Some(SmoothedError { value, seen_at });
+        value
     }
 
     /// One calibration sample from three frames about a span apart: the change
@@ -924,10 +991,11 @@ pub struct MovementRuntimeSettings {
 #[derive(Clone, Debug)]
 pub struct MovementTargetSample {
     pub frame_id: u64,
-    /// Smoothed target used for control.
+    /// The selected target, unsmoothed.
     pub target: Option<(f64, f64)>,
-    /// Unsmoothed target used for velocity and calibration.
-    pub raw_target: Option<(f64, f64)>,
+    /// Smoothing factor per axis drawn for this track (1 = none); applied to
+    /// the target's own motion by the controller.
+    pub smoothing_alpha: (f64, f64),
     pub crop_origin: (u32, u32),
     pub processed_size: (u32, u32),
     /// Monotonic receive time; set by `MovementTicker::update`.
@@ -1599,6 +1667,12 @@ mod tests {
         fps: f64,
         /// Strafe amplitude in px; 0 keeps the target still.
         strafe: f64,
+        /// Constant target velocity along X (px/s), added to the strafe.
+        drift: f64,
+        /// Smoothing strength (1 = none), as set on the config page.
+        smoothing: f64,
+        /// Detection jitter amplitude (px, uniform ±).
+        jitter: f64,
     }
 
     const GAME: World = World {
@@ -1606,6 +1680,9 @@ mod tests {
         latency_s: 0.024,
         fps: 240.0,
         strafe: 150.0,
+        drift: 0.0,
+        smoothing: 1.0,
+        jitter: 0.7,
     };
 
     fn simulate(aware: bool, seed: u64) -> (f64, Option<MotionCalibration>) {
@@ -1654,7 +1731,7 @@ mod tests {
         let frame_s = 1.0 / world.fps;
         let target = |t: f64| {
             (
-                60.0 + world.strafe * (std::f64::consts::TAU * 0.8 * t).sin(),
+                60.0 + world.strafe * (std::f64::consts::TAU * 0.8 * t).sin() + world.drift * t,
                 -20.0 + world.strafe / 4.0 * (std::f64::consts::TAU * 0.3 * t).cos(),
             )
         };
@@ -1689,13 +1766,13 @@ mod tests {
                 let captured = next_frame as f64 * frame_s;
                 let (tx, ty) = target(captured);
                 let (cx, cy) = camera_at(&camera, captured);
-                let mut jitter = || noise.random_range(-0.7..0.7);
+                let mut jitter = || noise.random_range(-world.jitter..=world.jitter);
                 let error = ((tx - cx + jitter()).trunc(), (ty - cy + jitter()).trunc());
                 frame = Some(FrameError {
                     frame_id: next_frame,
                     received_s: captured + world.latency_s,
-                    control: error,
                     raw: error,
+                    smoothing_alpha: (1.0 / world.smoothing, 1.0 / world.smoothing),
                 });
                 next_frame += 1;
             }
@@ -1806,6 +1883,50 @@ mod tests {
 
     /// Start-up behaviour across games, from no calibration:
     /// `cargo test --release --lib -- startup_report --ignored --nocapture`.
+    /// Effect of the smoothing strength (saved calibration, 240 FPS):
+    /// `cargo test --release --lib -- smoothing_report --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn smoothing_report() {
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        for smoothing in [1.0, 5.0, 10.0, 20.0, 35.0, 50.0] {
+            let still = simulate_run(
+                World {
+                    strafe: 0.0,
+                    smoothing,
+                    ..GAME
+                },
+                true,
+                500,
+                saved,
+            );
+            let strafe = (500..505)
+                .map(|seed| simulate_run(World { smoothing, ..GAME }, true, seed, saved).rms)
+                .sum::<f64>()
+                / 5.0;
+            let shaky = simulate_run(
+                World {
+                    strafe: 0.0,
+                    smoothing,
+                    jitter: 3.0,
+                    ..GAME
+                },
+                true,
+                500,
+                saved,
+            );
+            eprintln!(
+                "SMOOTH strength {smoothing}: still target 63 px reached after {:.2}s, overshoot {:.1} px | strafing RMS {strafe:.1} px | aim wobble on a ±3 px jittery still target {:.2} px RMS",
+                still.settled_at.unwrap_or(f64::INFINITY),
+                still.overshoot,
+                shaky.rms
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn startup_report() {
@@ -2195,31 +2316,47 @@ mod tests {
 
     #[test]
     fn a_moving_target_is_followed_without_settling() {
-        let mut controller = seeded(52);
-        controller.calibration = Some(MotionCalibration {
+        // A target crossing at a steady 200 px/s: once on it, feedforward keeps
+        // turning with it instead of stopping in the dead zone and chasing.
+        let crossing = World {
+            strafe: 0.0,
+            drift: 200.0,
+            ..GAME
+        };
+        let saved = Some(MotionCalibration {
             px_per_count: 0.25,
-            latency_s: 0.0,
+            latency_s: 0.024,
         });
-        // The aim is on target (1 px, inside the stop radius) but the target
-        // moves right at 200 px/s: keep turning with it instead of stopping.
-        let mut moved = 0;
-        for tick in 0..50 {
-            let now = tick as f64 * DEFAULT_TICK_S;
-            let frame = FrameError {
-                frame_id: tick,
-                received_s: now,
-                control: (1.0, 0.0),
-                raw: (200.0 * now, 0.0),
+        let run = simulate_run(crossing, true, 52, saved);
+        assert!(run.rms < 6.0, "RMS {:.1} px", run.rms);
+    }
+
+    #[test]
+    fn strong_smoothing_does_not_make_the_aim_overshoot() {
+        // Smoothing filters the target's own motion, not the image motion our
+        // moves cause, so even the strongest setting does not fling the aim.
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        for smoothing in [1.0, 10.0, 50.0] {
+            let still = World {
+                strafe: 0.0,
+                smoothing,
+                ..GAME
             };
-            let (dx, _) = controller.track(frame, now, false);
-            moved += dx;
-            // From the second frame on the speed is known: never a stop.
-            if tick >= 1 {
-                assert!(dx > 0, "tick {tick}");
-            }
+            let run = simulate_run(still, true, 83, saved);
+            assert!(
+                run.overshoot <= 6.0,
+                "strength {smoothing}: overshoot {:.1} px",
+                run.overshoot
+            );
+            let reached = run.settled_at.expect("reached");
+            assert!(
+                reached <= 0.4,
+                "strength {smoothing}: reached after {reached:.2} s"
+            );
         }
-        // Feedforward: 0.9 · 200 px/s · 0.2 s / 0.25 px per count ≈ 144 counts.
-        assert!((100..=180).contains(&moved), "{moved}");
     }
 
     #[test]

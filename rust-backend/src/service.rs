@@ -196,15 +196,14 @@ impl ReceiverService {
             // Wake every preview socket for this frame (no timer polling:
             // Windows timers tick at ~15.6 ms, which capped Preview near 60 FPS).
             preview_tx.send_replace(processed.published_ns);
-            let target = processed
-                .result
-                .smoothed_target_xy
-                .or(processed.result.target_xy);
             let point = |point: [f32; 2]| (f64::from(point[0]), f64::from(point[1]));
             callback_ticker.update(MovementTargetSample {
                 frame_id: processed.frame.frame_id,
-                target: target.map(point),
-                raw_target: processed.result.target_xy.map(point),
+                target: processed.result.target_xy.map(point),
+                smoothing_alpha: (
+                    f64::from(processed.smoothing_alpha.0),
+                    f64::from(processed.smoothing_alpha.1),
+                ),
                 crop_origin: (processed.crop_x, processed.crop_y),
                 processed_size: (
                     processed.result.processed_width,

@@ -51,6 +51,9 @@ pub struct ProcessedFrame {
     pub crop_x: u32,
     pub crop_y: u32,
     pub selected_target: Option<TargetCandidate>,
+    /// Smoothing factors drawn for this track; movement applies them to the
+    /// target's own motion (Preview uses `smoothed_target_xy`).
+    pub smoothing_alpha: (f32, f32),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -415,6 +418,7 @@ fn process_frame(
             crop_x: rect.x,
             crop_y: rect.y,
             selected_target,
+            smoothing_alpha: smoother.alphas(),
         });
     }
     let started = Instant::now();
@@ -460,6 +464,7 @@ fn process_frame(
         crop_x: rect.x,
         crop_y: rect.y,
         selected_target: None,
+        smoothing_alpha: smoother.alphas(),
     })
 }
 

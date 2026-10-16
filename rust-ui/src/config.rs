@@ -441,7 +441,7 @@ pub fn ConfigApp() -> impl IntoView {
                                     <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max))}</output></span>
                                         <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Y Max smoothing"/>
                                     </label>
-                                    <p class="smoothing-hint settings-wide">"1 = no smoothing, 50 = strongest (about the last N frames averaged). Each new target draws a strength between Min and Max per axis. Above about 5 the aim starts to overshoot; far more at high values."</p>
+                                    <p class="smoothing-hint settings-wide">"1 = no smoothing, 50 = strongest (about the last N frames averaged). Each new target draws a strength between Min and Max per axis. Smoothing steadies the target's own motion only, so it does not make the aim overshoot."</p>
                                 </div>
                             </div>
                             <div class="settings-row">

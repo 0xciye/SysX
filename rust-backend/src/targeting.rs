@@ -254,6 +254,11 @@ impl ExponentialTargetSmoother {
         })
     }
 
+    /// Filter factors drawn for the current track (1 = unsmoothed).
+    pub fn alphas(&self) -> (f32, f32) {
+        (self.alpha_x, self.alpha_y)
+    }
+
     /// `None` ends the track; the next target starts a new one with freshly
     /// drawn strengths.
     pub fn update(&mut self, target: Option<FrameCoordinate>) -> Option<FrameCoordinate> {
