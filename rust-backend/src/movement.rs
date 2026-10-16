@@ -208,7 +208,7 @@ const LATENCY_STEP_S: f64 = 0.004;
 const MOVE_LOG_S: f64 = 0.4;
 /// Exponential forgetting per frame, so the estimate follows a sens change.
 const CALIBRATION_FORGET: f64 = 0.999;
-const CALIBRATION_MIN_WEIGHT: f64 = 10.0;
+const CALIBRATION_MIN_WEIGHT: f64 = 6.0;
 /// Calibration switches on when the standard error falls below this fraction
 /// of the estimate (the safety margin below covers the rest), then follows
 /// every estimate up to the second fraction.
@@ -216,9 +216,12 @@ const CALIBRATION_ENTER_REL_ERROR: f64 = 0.4;
 const CALIBRATION_KEEP_REL_ERROR: f64 = 0.6;
 /// Saved to disk only once this tight.
 const CALIBRATION_SAVE_REL_ERROR: f64 = 0.15;
-/// Rates for calibration are taken over this span rather than between two
-/// frames: whole-pixel detections make single-frame rates far too noisy.
-const CALIBRATION_SPAN_S: f64 = 0.016;
+/// Rates for calibration are taken over this span (2 frames at the intended
+/// 240 FPS) rather than between two frames: whole-pixel detections make
+/// single-frame rates too noisy. At lower frame rates a span is one frame.
+const CALIBRATION_SPAN_S: f64 = 0.008;
+/// Frames of the current track kept for calibration spans.
+const TRACK_HISTORY_S: f64 = 0.1;
 const PX_PER_COUNT_RANGE: (f64, f64) = (0.01, 50.0);
 /// Frame-to-frame target jump treated as a target switch (crop pixels).
 const TARGET_JUMP_PX: f64 = 48.0;
@@ -637,7 +640,7 @@ impl MovementController {
         while self
             .track
             .front()
-            .is_some_and(|(time, _)| *time < t - 3.0 * CALIBRATION_SPAN_S)
+            .is_some_and(|(time, _)| *time < t - TRACK_HISTORY_S)
         {
             self.track.pop_front();
         }
@@ -664,7 +667,9 @@ impl MovementController {
             return;
         };
         let (late, early) = (t - tj, tj - ti);
-        if late > 2.0 * CALIBRATION_SPAN_S || early > 2.0 * CALIBRATION_SPAN_S {
+        // Allow one frame interval of slack, so slower frame rates still work.
+        let longest = 2.0 * CALIBRATION_SPAN_S.max(frame_dt);
+        if late > longest || early > longest {
             return;
         }
         let y = (
