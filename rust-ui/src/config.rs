@@ -2,7 +2,9 @@ use crate::client::{
     command_channel, get_local_settings, save_local_settings, send_command, start_backend_client,
 };
 use crate::protocol::{BackendEvent, BackendModel, BackendState, ModelArtifacts};
-use crate::settings::{format_recoil_levels, parse_recoil_levels, AppSettings};
+use crate::settings::{
+    format_recoil_levels, parse_recoil_levels, AppSettings, SmoothingAxis, SmoothingBound,
+};
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -427,13 +429,19 @@ pub fn ConfigApp() -> impl IntoView {
                             <div class="settings-row smoothing-settings-row">
                                 <div class="setting-description"><h2>"Exponential Smoothing"</h2></div>
                                 <div class="settings-fields smoothing-fields">
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Smoothing (α)"</span><output>{move || format!("{:.2}", settings.get().smoothing_alpha_x)}</output></span>
-                                        <input type="range" min="0.01" max="1" step="0.01" prop:value=move || settings.get().smoothing_alpha_x.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.smoothing_alpha_x = value) } aria-label="X smoothing alpha"/>
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Min"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min))}</output></span>
+                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Min, value)) } aria-label="X Min smoothing"/>
                                     </label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Smoothing (α)"</span><output>{move || format!("{:.2}", settings.get().smoothing_alpha_y)}</output></span>
-                                        <input type="range" min="0.01" max="1" step="0.01" prop:value=move || settings.get().smoothing_alpha_y.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.smoothing_alpha_y = value) } aria-label="Y smoothing alpha"/>
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Max))}</output></span>
+                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Max, value)) } aria-label="X Max smoothing"/>
                                     </label>
-                                    <p class="smoothing-hint settings-wide">"Lower alpha smooths more; higher alpha follows the target faster."</p>
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Min"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Min))}</output></span>
+                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Min).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Min, value)) } aria-label="Y Min smoothing"/>
+                                    </label>
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max))}</output></span>
+                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Y Max smoothing"/>
+                                    </label>
+                                    <p class="smoothing-hint settings-wide">"1 = no smoothing, 50 = strongest (about the last N frames averaged). Each new target draws a strength between Min and Max per axis. Above about 5 the aim starts to overshoot; far more at high values."</p>
                                 </div>
                             </div>
                             <div class="settings-row">
@@ -492,8 +500,10 @@ fn copy_state_to_settings(
         value.offset_x = state.target_offset_x;
         value.offset_y = state.target_offset_y;
         value.trigger_button = state.trigger_button.clone();
-        value.smoothing_alpha_x = state.smoothing_alpha_x;
-        value.smoothing_alpha_y = state.smoothing_alpha_y;
+        value.smoothing_x_min = state.smoothing_x_min;
+        value.smoothing_x_max = state.smoothing_x_max;
+        value.smoothing_y_min = state.smoothing_y_min;
+        value.smoothing_y_max = state.smoothing_y_max;
         value.sens = state.sens;
         value.recoil = state.recoil.clone();
         value.scale = state.preview_scale.clone();
@@ -549,7 +559,12 @@ fn send_settings_commands(
         ),
         command(
             "set_smoothing_config",
-            serde_json::json!({"alpha_x":settings.smoothing_alpha_x,"alpha_y":settings.smoothing_alpha_y}),
+            serde_json::json!({
+                "x_min": settings.smoothing_x_min,
+                "x_max": settings.smoothing_x_max,
+                "y_min": settings.smoothing_y_min,
+                "y_max": settings.smoothing_y_max,
+            }),
         ),
         command(
             "set_movement_calibration",

@@ -88,8 +88,12 @@ pub struct AppSettings {
     pub fov_degrees: u16,
     pub offset_x: f64,
     pub offset_y: f64,
-    pub smoothing_alpha_x: f32,
-    pub smoothing_alpha_y: f32,
+    /// Smoothing strength 1–50 per axis (1 = none); each new target draws a
+    /// strength between min and max.
+    pub smoothing_x_min: f32,
+    pub smoothing_x_max: f32,
+    pub smoothing_y_min: f32,
+    pub smoothing_y_max: f32,
     pub sens: f64,
     pub scale: String,
     pub show_preview: bool,
@@ -116,8 +120,10 @@ impl Default for AppSettings {
             fov_degrees: 36,
             offset_x: 0.0,
             offset_y: 0.0,
-            smoothing_alpha_x: 1.0,
-            smoothing_alpha_y: 1.0,
+            smoothing_x_min: 1.0,
+            smoothing_x_max: 1.0,
+            smoothing_y_min: 1.0,
+            smoothing_y_max: 1.0,
             sens: 0.25,
             scale: "Smooth".into(),
             show_preview: true,
@@ -137,7 +143,53 @@ impl Default for AppSettings {
     }
 }
 
+pub const SMOOTHING_LIMITS: (f32, f32) = (1.0, 50.0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingAxis {
+    X,
+    Y,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingBound {
+    Min,
+    Max,
+}
+
 impl AppSettings {
+    pub fn smoothing(&self, axis: SmoothingAxis, bound: SmoothingBound) -> f32 {
+        match (axis, bound) {
+            (SmoothingAxis::X, SmoothingBound::Min) => self.smoothing_x_min,
+            (SmoothingAxis::X, SmoothingBound::Max) => self.smoothing_x_max,
+            (SmoothingAxis::Y, SmoothingBound::Min) => self.smoothing_y_min,
+            (SmoothingAxis::Y, SmoothingBound::Max) => self.smoothing_y_max,
+        }
+    }
+
+    /// Sets one bound (clamped to 1–10) and moves the other bound along when
+    /// needed, so Min never ends above Max.
+    pub fn set_smoothing(&mut self, axis: SmoothingAxis, bound: SmoothingBound, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        let value = value.clamp(SMOOTHING_LIMITS.0, SMOOTHING_LIMITS.1);
+        let (min, max) = match axis {
+            SmoothingAxis::X => (&mut self.smoothing_x_min, &mut self.smoothing_x_max),
+            SmoothingAxis::Y => (&mut self.smoothing_y_min, &mut self.smoothing_y_max),
+        };
+        match bound {
+            SmoothingBound::Min => {
+                *min = value;
+                *max = max.max(value);
+            }
+            SmoothingBound::Max => {
+                *max = value;
+                *min = min.min(value);
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
             return Err("Choose Right, Middle, M4, or M5 for the trigger button.");
@@ -151,11 +203,17 @@ impl AppSettings {
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err("Target offsets must be finite numbers.");
         }
-        if ![self.smoothing_alpha_x, self.smoothing_alpha_y]
-            .iter()
-            .all(|value| value.is_finite() && (0.01..=1.0).contains(value))
+        let range_ok = |min: f32, max: f32| {
+            min.is_finite()
+                && max.is_finite()
+                && (SMOOTHING_LIMITS.0..=SMOOTHING_LIMITS.1).contains(&min)
+                && (SMOOTHING_LIMITS.0..=SMOOTHING_LIMITS.1).contains(&max)
+                && min <= max
+        };
+        if !range_ok(self.smoothing_x_min, self.smoothing_x_max)
+            || !range_ok(self.smoothing_y_min, self.smoothing_y_max)
         {
-            return Err("Smoothing alpha must be between 0.01 and 1.00.");
+            return Err("Smoothing must be from 1 to 50, with Min not above Max.");
         }
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err("Sensitivity must be from 0.01 to 10.");
@@ -192,5 +250,41 @@ mod tests {
         assert_eq!(format_recoil_levels(&levels), "1, -2, 3");
         assert!(parse_recoil_levels("1, nope").is_err());
         assert!(parse_recoil_levels(&vec!["1"; 65].join(",")).is_err());
+    }
+
+    #[test]
+    fn smoothing_bounds_stay_ordered_and_in_range() {
+        use super::{AppSettings, SmoothingAxis::*, SmoothingBound::*};
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.smoothing(X, Min), 1.0);
+        settings.set_smoothing(X, Max, 6.0);
+        settings.set_smoothing(X, Min, 3.0);
+        assert_eq!(
+            (settings.smoothing_x_min, settings.smoothing_x_max),
+            (3.0, 6.0)
+        );
+        // Raising Min past Max carries Max along, and the reverse.
+        settings.set_smoothing(X, Min, 8.0);
+        assert_eq!(
+            (settings.smoothing_x_min, settings.smoothing_x_max),
+            (8.0, 8.0)
+        );
+        settings.set_smoothing(X, Max, 2.0);
+        assert_eq!(
+            (settings.smoothing_x_min, settings.smoothing_x_max),
+            (2.0, 2.0)
+        );
+        // Clamped to 1–50; Y untouched.
+        settings.set_smoothing(X, Max, 75.0);
+        assert_eq!(settings.smoothing_x_max, 50.0);
+        settings.set_smoothing(X, Min, f32::NAN);
+        assert_eq!(settings.smoothing_x_min, 2.0);
+        assert_eq!(
+            (settings.smoothing_y_min, settings.smoothing_y_max),
+            (1.0, 1.0)
+        );
+        assert!(settings.validate().is_ok());
+        settings.smoothing_y_min = 5.0;
+        assert!(settings.validate().is_err(), "Min above Max");
     }
 }

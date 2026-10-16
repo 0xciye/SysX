@@ -25,9 +25,13 @@ pub struct BackendState {
     #[serde(default)]
     pub trigger_button: String,
     #[serde(default)]
-    pub smoothing_alpha_x: f32,
+    pub smoothing_x_min: f32,
     #[serde(default)]
-    pub smoothing_alpha_y: f32,
+    pub smoothing_x_max: f32,
+    #[serde(default)]
+    pub smoothing_y_min: f32,
+    #[serde(default)]
+    pub smoothing_y_max: f32,
     #[serde(default)]
     pub sens: f64,
     #[serde(

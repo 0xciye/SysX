@@ -7,7 +7,7 @@ use crate::results::{DetectionMode, DetectionResult};
 use crate::storage::DetectionDataStore;
 use crate::targeting::{
     object_detection_candidates, object_detection_target, ExponentialTargetSmoother,
-    FrameCoordinate, PriorTarget, TargetCandidate,
+    FrameCoordinate, PriorTarget, SmoothingRange, TargetCandidate,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,8 +20,8 @@ pub struct PipelineConfig {
     pub pixel_color: PixelTargetColor,
     pub crop_resolution: Option<u32>,
     pub fov_degrees: u16,
-    pub smoothing_alpha_x: f32,
-    pub smoothing_alpha_y: f32,
+    pub smoothing_x: SmoothingRange,
+    pub smoothing_y: SmoothingRange,
     pub model: Option<ModelDefinition>,
     pub model_backend: String,
     pub compute_target: String,
@@ -34,8 +34,8 @@ impl Default for PipelineConfig {
             pixel_color: PixelTargetColor::Yellow,
             crop_resolution: Some(640),
             fov_degrees: 36,
-            smoothing_alpha_x: 1.0,
-            smoothing_alpha_y: 1.0,
+            smoothing_x: SmoothingRange::NONE,
+            smoothing_y: SmoothingRange::NONE,
             model: None,
             model_backend: "onnxruntime".into(),
             compute_target: "cpu".into(),
@@ -233,8 +233,7 @@ fn processing_loop(
             (pending, state.config.clone())
         };
         if smoother_generation != Some(pending.generation) {
-            smoother =
-                ExponentialTargetSmoother::new(config.smoothing_alpha_x, config.smoothing_alpha_y);
+            smoother = ExponentialTargetSmoother::new(config.smoothing_x, config.smoothing_y);
             smoother_generation = Some(pending.generation);
             prior_target = None;
             prior_target_at = None;
@@ -529,9 +528,8 @@ fn validate_config(config: &PipelineConfig) -> Result<(), &'static str> {
     if !(1..=360).contains(&config.fov_degrees) {
         return Err("FOV must be 1..360");
     }
-    if ExponentialTargetSmoother::new(config.smoothing_alpha_x, config.smoothing_alpha_y).is_none()
-    {
-        return Err("smoothing alpha must be 0.01..1");
+    if !config.smoothing_x.is_valid() || !config.smoothing_y.is_valid() {
+        return Err("smoothing must be 1..50 with min <= max");
     }
     if config.crop_resolution == Some(0) {
         return Err("crop resolution must be positive");
@@ -576,7 +574,8 @@ mod tests {
             jpeg: Default::default(),
         };
         let config = PipelineConfig::default();
-        let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
         let mut runtime_cache = None;
         let processed = process_frame(
             frame,
@@ -621,7 +620,8 @@ mod tests {
             fov_degrees: 360,
             ..PipelineConfig::default()
         };
-        let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
         let mut runtime_cache = None;
         let mut image = image::RgbImage::new(64, 64);
         for row in (0..=4u32).rev() {
@@ -678,7 +678,8 @@ mod tests {
             model: Some(model),
             ..PipelineConfig::default()
         };
-        let mut smoother = ExponentialTargetSmoother::new(1.0, 1.0).unwrap();
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
         let mut runtime_cache = None;
 
         let error = process_frame(

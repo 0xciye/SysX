@@ -1,4 +1,5 @@
 use crate::results::{DetectionMode, DetectionResult};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameCoordinate {
@@ -191,32 +192,81 @@ pub fn object_detection_target(
     })
 }
 
+/// Smoothing strength on a 1–50 scale: 1 is no smoothing, 50 the strongest.
+/// A strength `s` filters with alpha `1 / s` (roughly an average over `s`
+/// frames). Each track draws its strength at random from `min..=max`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SmoothingRange {
+    pub min: f32,
+    pub max: f32,
+}
+
+impl SmoothingRange {
+    pub const NONE: Self = Self { min: 1.0, max: 1.0 };
+    pub const LIMITS: (f32, f32) = (1.0, 50.0);
+
+    pub fn new(min: f32, max: f32) -> Option<Self> {
+        let range = Self { min, max };
+        range.is_valid().then_some(range)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.min.is_finite()
+            && self.max.is_finite()
+            && Self::LIMITS.0 <= self.min
+            && self.min <= self.max
+            && self.max <= Self::LIMITS.1
+    }
+
+    fn draw_alpha(&self, rng: &mut StdRng) -> f32 {
+        let strength = if self.max > self.min {
+            rng.random_range(self.min..=self.max)
+        } else {
+            self.min
+        };
+        1.0 / strength
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExponentialTargetSmoother {
+    range_x: SmoothingRange,
+    range_y: SmoothingRange,
     alpha_x: f32,
     alpha_y: f32,
     previous: Option<FrameCoordinate>,
+    rng: StdRng,
 }
 
 impl ExponentialTargetSmoother {
-    pub fn new(alpha_x: f32, alpha_y: f32) -> Option<Self> {
-        (alpha_x.is_finite()
-            && alpha_y.is_finite()
-            && (0.01..=1.0).contains(&alpha_x)
-            && (0.01..=1.0).contains(&alpha_y))
-        .then_some(Self {
-            alpha_x,
-            alpha_y,
+    pub fn new(range_x: SmoothingRange, range_y: SmoothingRange) -> Option<Self> {
+        Self::with_rng(range_x, range_y, StdRng::from_os_rng())
+    }
+
+    fn with_rng(range_x: SmoothingRange, range_y: SmoothingRange, rng: StdRng) -> Option<Self> {
+        (range_x.is_valid() && range_y.is_valid()).then_some(Self {
+            range_x,
+            range_y,
+            alpha_x: 1.0,
+            alpha_y: 1.0,
             previous: None,
+            rng,
         })
     }
+
+    /// `None` ends the track; the next target starts a new one with freshly
+    /// drawn strengths.
     pub fn update(&mut self, target: Option<FrameCoordinate>) -> Option<FrameCoordinate> {
         let Some(current) = target else {
             self.previous = None;
             return None;
         };
         let next = match self.previous {
-            None => current,
+            None => {
+                self.alpha_x = self.range_x.draw_alpha(&mut self.rng);
+                self.alpha_y = self.range_y.draw_alpha(&mut self.rng);
+                current
+            }
             Some(previous) => FrameCoordinate {
                 x: previous.x + self.alpha_x * (current.x - previous.x),
                 y: previous.y + self.alpha_y * (current.y - previous.y),
@@ -274,5 +324,45 @@ mod tests {
 
         assert_eq!(selected.class_id, Some(0));
         assert_eq!(selected.coordinate, FrameCoordinate { x: 65.0, y: 50.0 });
+    }
+
+    #[test]
+    fn smoothing_strength_is_drawn_per_track_within_its_range() {
+        use super::{ExponentialTargetSmoother, SmoothingRange};
+        use rand::{rngs::StdRng, SeedableRng};
+        assert!(SmoothingRange::new(0.5, 2.0).is_none());
+        assert!(SmoothingRange::new(4.0, 3.0).is_none());
+        assert!(SmoothingRange::new(1.0, 51.0).is_none());
+        let point = |x: f32| Some(FrameCoordinate { x, y: x });
+
+        // Strength 1 (no smoothing) follows the target exactly.
+        let mut none =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        none.update(point(0.0));
+        assert_eq!(none.update(point(10.0)), point(10.0));
+
+        // Strength 4 moves a quarter of the way per frame.
+        let fixed = SmoothingRange::new(4.0, 4.0).unwrap();
+        let mut smoother = ExponentialTargetSmoother::new(fixed, fixed).unwrap();
+        smoother.update(point(0.0));
+        assert_eq!(smoother.update(point(8.0)), point(2.0));
+
+        // A range draws a strength per track, held for the whole track.
+        let range = SmoothingRange::new(2.0, 8.0).unwrap();
+        let mut smoother =
+            ExponentialTargetSmoother::with_rng(range, range, StdRng::seed_from_u64(7)).unwrap();
+        let mut strengths = Vec::new();
+        for _ in 0..40 {
+            smoother.update(point(0.0));
+            let alpha = smoother.alpha_x;
+            assert!((1.0 / 8.0..=0.5).contains(&alpha), "{alpha}");
+            smoother.update(point(1.0));
+            assert_eq!(smoother.alpha_x, alpha, "held within the track");
+            strengths.push((1.0 / alpha * 100.0).round() as i32);
+            smoother.update(None); // target lost: next track draws again
+        }
+        strengths.sort_unstable();
+        strengths.dedup();
+        assert!(strengths.len() > 10, "draws vary between tracks");
     }
 }

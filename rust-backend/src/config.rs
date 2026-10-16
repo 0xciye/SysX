@@ -1,3 +1,4 @@
+use crate::targeting::SmoothingRange;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -63,8 +64,12 @@ pub struct AppSettings {
     pub fov_degrees: u16,
     pub offset_x: f64,
     pub offset_y: f64,
-    pub smoothing_alpha_x: f32,
-    pub smoothing_alpha_y: f32,
+    /// Smoothing strength 1–50 per axis (1 = none); each track draws a
+    /// strength between min and max.
+    pub smoothing_x_min: f32,
+    pub smoothing_x_max: f32,
+    pub smoothing_y_min: f32,
+    pub smoothing_y_max: f32,
     pub sens: f64,
     pub scale: String,
     pub show_preview: bool,
@@ -91,8 +96,10 @@ impl Default for AppSettings {
             fov_degrees: 36,
             offset_x: 0.0,
             offset_y: 0.0,
-            smoothing_alpha_x: 1.0,
-            smoothing_alpha_y: 1.0,
+            smoothing_x_min: 1.0,
+            smoothing_x_max: 1.0,
+            smoothing_y_min: 1.0,
+            smoothing_y_max: 1.0,
             sens: 0.25,
             scale: "Smooth".into(),
             show_preview: true,
@@ -113,6 +120,20 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn smoothing_x(&self) -> SmoothingRange {
+        SmoothingRange {
+            min: self.smoothing_x_min,
+            max: self.smoothing_x_max,
+        }
+    }
+
+    pub fn smoothing_y(&self) -> SmoothingRange {
+        SmoothingRange {
+            min: self.smoothing_y_min,
+            max: self.smoothing_y_max,
+        }
+    }
+
     pub fn validate(&mut self) -> Result<(), SettingsError> {
         if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
             return Err(SettingsError::Invalid("invalid trigger button"));
@@ -126,11 +147,10 @@ impl AppSettings {
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err(SettingsError::Invalid("offsets must be finite"));
         }
-        if ![self.smoothing_alpha_x, self.smoothing_alpha_y]
-            .iter()
-            .all(|a| a.is_finite() && (0.01..=1.0).contains(a))
-        {
-            return Err(SettingsError::Invalid("smoothing alpha must be 0.01..1"));
+        if !self.smoothing_x().is_valid() || !self.smoothing_y().is_valid() {
+            return Err(SettingsError::Invalid(
+                "smoothing must be 1..50 with min <= max",
+            ));
         }
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err(SettingsError::Invalid("sensitivity must be 0.01..10"));
@@ -187,13 +207,39 @@ pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
     let Ok(raw) = fs::read_to_string(path) else {
         return AppSettings::default();
     };
-    let Ok(mut value) = serde_json::from_str::<AppSettings>(&raw) else {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return AppSettings::default();
+    };
+    migrate_smoothing(&mut json);
+    let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
         return AppSettings::default();
     };
     if value.validate().is_err() {
         AppSettings::default()
     } else {
         value
+    }
+}
+
+/// Files from before the 1–50 scale stored one alpha per axis; strength is
+/// `1 / alpha`, used as both min and max.
+fn migrate_smoothing(json: &mut serde_json::Value) {
+    for (axis, alpha_key) in [("X", "smoothingAlphaX"), ("Y", "smoothingAlphaY")] {
+        let (min_key, max_key) = (format!("smoothing{axis}Min"), format!("smoothing{axis}Max"));
+        if json.get(&min_key).is_some() || json.get(&max_key).is_some() {
+            continue;
+        }
+        let Some(alpha) = json.get(alpha_key).and_then(serde_json::Value::as_f64) else {
+            continue;
+        };
+        if alpha.is_finite() && alpha > 0.0 {
+            let strength = (1.0 / alpha).clamp(
+                SmoothingRange::LIMITS.0 as f64,
+                SmoothingRange::LIMITS.1 as f64,
+            );
+            json[min_key] = serde_json::json!(strength);
+            json[max_key] = serde_json::json!(strength);
+        }
     }
 }
 
@@ -442,6 +488,49 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_alpha_smoothing_settings_become_the_one_to_ten_scale() {
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-settings-smoothing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-settings.json");
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        for key in [
+            "smoothingXMin",
+            "smoothingXMax",
+            "smoothingYMin",
+            "smoothingYMax",
+        ] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        old["smoothingAlphaX"] = serde_json::json!(0.25);
+        old["smoothingAlphaY"] = serde_json::json!(1.0);
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let loaded = load_settings(&path);
+        assert_eq!((loaded.smoothing_x_min, loaded.smoothing_x_max), (4.0, 4.0));
+        assert_eq!((loaded.smoothing_y_min, loaded.smoothing_y_max), (1.0, 1.0));
+        save_settings(&path, &loaded).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("smoothingAlphaX").is_none());
+
+        // Out of range or reversed ranges are rejected.
+        let mut invalid = AppSettings::default();
+        invalid.smoothing_x_min = 6.0;
+        invalid.smoothing_x_max = 3.0;
+        assert!(invalid.validate().is_err());
+        invalid.smoothing_x_min = 0.5;
+        invalid.smoothing_x_max = 3.0;
+        assert!(invalid.validate().is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn settings_saved_with_the_removed_dpi_field_still_load_and_drop_it_on_save() {

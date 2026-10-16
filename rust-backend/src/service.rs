@@ -10,6 +10,7 @@ use crate::pixel_seek::PixelTargetColor;
 use crate::receiver::UdpDecodedFrameSource;
 use crate::results::DetectionMode;
 use crate::storage::DetectionDataStore;
+use crate::targeting::SmoothingRange;
 use crate::udp::ReassemblyStats;
 use crate::web_config;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -152,8 +153,8 @@ impl ReceiverService {
             pixel_color,
             crop_resolution: Some(app.crop_resolution),
             fov_degrees: app.fov_degrees,
-            smoothing_alpha_x: app.smoothing_alpha_x,
-            smoothing_alpha_y: app.smoothing_alpha_y,
+            smoothing_x: app.smoothing_x(),
+            smoothing_y: app.smoothing_y(),
             model,
             model_backend: app.model_backend.clone(),
             compute_target: app.compute_target.clone(),
@@ -319,7 +320,7 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
-            "trigger_button":settings.trigger_button, "smoothing_alpha_x":settings.smoothing_alpha_x, "smoothing_alpha_y":settings.smoothing_alpha_y,
+            "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
@@ -434,8 +435,8 @@ impl ReceiverService {
             pixel_color,
             crop_resolution: Some(settings.crop_resolution),
             fov_degrees: settings.fov_degrees,
-            smoothing_alpha_x: settings.smoothing_alpha_x,
-            smoothing_alpha_y: settings.smoothing_alpha_y,
+            smoothing_x: settings.smoothing_x(),
+            smoothing_y: settings.smoothing_y(),
             model,
             model_backend: settings.model_backend.clone(),
             compute_target: settings.compute_target.clone(),
@@ -576,16 +577,20 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_smoothing_config" => {
-                let x = finite_number(command.get("alpha_x"), "smoothing alpha must be 0.01..1")?
-                    as f32;
-                let y = finite_number(command.get("alpha_y"), "smoothing alpha must be 0.01..1")?
-                    as f32;
-                if !(0.01..=1.0).contains(&x) || !(0.01..=1.0).contains(&y) {
-                    return Err("smoothing alpha must be 0.01..1".into());
+                const INVALID: &str = "smoothing must be 1..50 with min <= max";
+                let value = |key: &str| finite_number(command.get(key), INVALID).map(|v| v as f32);
+                let (x_min, x_max) = (value("x_min")?, value("x_max")?);
+                let (y_min, y_max) = (value("y_min")?, value("y_max")?);
+                if SmoothingRange::new(x_min, x_max).is_none()
+                    || SmoothingRange::new(y_min, y_max).is_none()
+                {
+                    return Err(INVALID.into());
                 }
                 let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
-                settings.smoothing_alpha_x = x;
-                settings.smoothing_alpha_y = y;
+                settings.smoothing_x_min = x_min;
+                settings.smoothing_x_max = x_max;
+                settings.smoothing_y_min = y_min;
+                settings.smoothing_y_max = y_max;
                 drop(settings);
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
