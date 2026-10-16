@@ -44,97 +44,48 @@ decision.
 - The release UI post-process removes the Wasm `name`, `.debug_*`, and source
   map custom sections before embedding the bundle, reducing symbol/source-map
   metadata in the UI artifact. WASM remains a client artifact rather than a
-  security boundary; sensitive runtime logic stays in the protected backend.
+  security boundary; sensitive runtime logic stays in the native backend.
 - `src-tauri/build.rs` embeds the release backend and the complete Trunk UI
   bundle. The final distribution contains one `SysX.exe`; the backend is only
   extracted to `%LOCALAPPDATA%\SysX\runtime` while the app is running.
 - A Windows release host fails the build if either the backend sidecar or the
   Trunk UI bundle is missing. This prevents an apparently successful but
-  unusable executable from being sent to VMProtect.
+  unusable executable from being packaged.
 - The random loopback IPC token remains per launch. No license secret or
   reusable authentication credential is stored in the executable or repository.
 
-## VMProtect workflow
+## Build and package
 
-Protect both native images. Protecting only the outer host leaves the extracted
-backend easy to inspect while SysX is running.
+Build the release EXE on Windows x64:
 
-1. On a clean Windows x64 build machine, stage the backend:
+```powershell
+.\scripts\build-windows.ps1
+.\scripts\package-windows.ps1 -SkipBuild
+```
 
-   ```powershell
-   .\scripts\prepare-vmprotect.ps1 -Phase StageBackend
-   ```
+The normal EXE includes every built-in release security feature described above.
+VMProtect is neither invoked nor required by build/packaging; the preparation
+script and mandatory protection flags were removed at the user's request.
+Packaging still validates x86-64 PE format and excludes debug/source/map files
+and the separate backend. Pixel Seek requires no ONNX Runtime installation;
+Object Detection remains unavailable. The target computer needs WebView2/Edge
+and the Microsoft Visual C++ x64 runtime.
 
-   This produces `dist-vmprotect\receiver-backend.raw.exe`.
+## Optional manual third-party protection
 
-2. Open that file in VMProtect. Keep the command-line entry points needed by
-   the normal build smoke (`serve`, `udp-listen`, and `udp-send-image`) and
-   export the protected result as:
+The user manages VMProtect separately after the build. Protecting only the outer
+host does not protect the backend extracted at runtime. If manually protecting
+the backend, embed that exact final backend before protecting the host, so the
+build-time integrity manifest matches its bytes. Preserve CLI entry points and
+exclude receive/decode, detection, targeting, movement, queue, UI and hashing
+loops from virtualization. Re-run Windows lifecycle and device checks on the
+final protected output; no current raw-build result validates that output.
 
-   ```text
-   dist-vmprotect\receiver-backend.protected.exe
-   ```
+To package an existing final executable without rebuilding:
 
-3. Embed the protected backend and build the one-file host:
-
-   ```powershell
-   .\scripts\prepare-vmprotect.ps1 `
-     -Phase Finalize `
-     -ProtectedBackendPath .\dist-vmprotect\receiver-backend.protected.exe
-   ```
-
-   The final unprotected input for the second VMProtect pass is:
-
-   ```text
-   dist-vmprotect\SysX.exe
-   ```
-
-4. Protect that final host in VMProtect and save the result as:
-
-   ```text
-   dist-vmprotect\SysX-vmprotected.exe
-   ```
-
-For both VMProtect projects, enable the required anti-tamper/memory-protection
-options and keep import protection compatible with the Windows loader and CFG.
-Apply virtualization/mutation selectively to cold startup/security/licensing
-code. **Exclude frame receive/decode, Pixel Seek/targeting, the movement ticker,
-serial queue, UI event loop and SHA-256 implementation from virtualization**;
-those paths need predictable throughput. Do not add anti-debug queries, file
-hashes or timing probes to per-frame/per-move callbacks. Leave ordinary
-Windows/serial/WebView2 initialization compatible with the vendor runtimes.
-The protected backend must still accept the `serve` command used by the host.
-
-VMProtect is an external packaging step; this repository does not establish
-which options were applied to a final binary. Compare raw and protected output
-at the same frame rate and run the Windows lifecycle/device smoke on that exact
-final executable. CFG, loader policies and VMProtect can affect compatibility;
-Linux tests cannot validate those Windows-specific interactions.
-
-5. Package the protected host without rebuilding the raw executable:
-
-   ```powershell
-   .\scripts\package-windows.ps1 `
-     -SkipBuild `
-     -ExecutablePath .\dist-vmprotect\SysX-vmprotected.exe `
-     -VmProtected
-   ```
-
-   The archive contains the selected executable under the fixed name
-   `SysX.exe`; the raw backend is never copied beside it.
-
-`scripts/package-windows.ps1` refuses to package the raw build by default and
-requires the explicit `-VmProtected` acknowledgement for a final host. Use
-`-AllowUnprotected` only when making a local smoke package that must not be
-distributed. The script cannot independently prove that a third-party
-VMProtect project was applied, but it does verify the selected file is an
-x86-64 PE and that the staged package has no sidecar, debug, source, or map
-artifacts.
-
-The shipped folder can contain only the final `SysX.exe`. The machine still
-needs WebView2/Edge and any selected OpenVINO, TensorRT, or CUDA runtime, and
-the user imports model artifacts after installation; those dependencies are
-not secrets and are not embedded in the executable.
+```powershell
+.\scripts\package-windows.ps1 -SkipBuild -ExecutablePath .\SysX-final.exe
+```
 
 ## Future authentication
 

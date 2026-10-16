@@ -1,0 +1,78 @@
+name: SysX Windows portable test build
+
+on:
+  push:
+    branches: [build/windows-portable-eec8692]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !contains(github.event.head_commit.message, '[obs-only]') }}
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORT_SKIP_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Rust and verified Trunk release
+        shell: pwsh
+        run: |
+          rustup update stable
+          if ($LASTEXITCODE -ne 0) { throw 'Rust update failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+          rustup target add wasm32-unknown-unknown
+          if ($LASTEXITCODE -ne 0) { throw 'WASM target install failed' }
+          gh release download v0.21.14 --repo trunk-rs/trunk --pattern 'trunk-x86_64-pc-windows-msvc.zip*' --dir "$env:RUNNER_TEMP/trunk"
+          if ($LASTEXITCODE -ne 0) { throw 'Trunk download failed' }
+          $zip = "$env:RUNNER_TEMP/trunk/trunk-x86_64-pc-windows-msvc.zip"
+          $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $expected) { throw 'Trunk checksum mismatch' }
+          Expand-Archive $zip -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
+      - name: Windows occupied-port regression checks
+        shell: pwsh
+        run: |
+          cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic recovered_port_error_does_not_reappear_from_diagnostic_history
+          if ($LASTEXITCODE -ne 0) { throw 'Port recovery regression failed' }
+          cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic wildcard_listener_cannot_share_a_bound_loopback_port
+          if ($LASTEXITCODE -ne 0) { throw 'Exclusive UDP binding regression failed' }
+      - name: Windows host lifecycle regressions
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml native_app::tests
+          if ($LASTEXITCODE -ne 0) { throw 'Host lifecycle regression failed' }
+      - name: Build, unit test and Windows UDP smoke
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Windows application lifecycle smoke
+        shell: pwsh
+        run: ./scripts/smoke-windows-app.ps1 -ApplicationPath "$PWD/src-tauri/target/release/SysX.exe"
+      - name: Package raw test build (VMProtect not applied)
+        shell: pwsh
+        run: |
+          ./scripts/package-windows.ps1 -SkipBuild
+          $note = @'
+          SysX Windows x64 build. Based on eec8692 with portable build fixes and exclusive UDP port ownership on Windows.
+          Built-in release hardening and runtime integrity are enabled. VMProtect has NOT been applied.
+          Only Pixel Seek is usable; Object Detection is unavailable. Only Medius is supported.
+          Windows unit, UDP and application lifecycle smoke checks ran on a hosted runner.
+          Physical Medius, OBS and game behavior have not been tested by this build.
+          Extract the entire ZIP, then run SysX.exe. See HUONG-DAN.txt for prerequisites.
+          OBS sender plugin is built separately and is not included in this receiver package.
+          '@
+          $note | Set-Content dist-package/SysX/BUILD-INFO.txt -Encoding utf8
+          "Build commit: $env:GITHUB_SHA" | Add-Content dist-package/SysX/BUILD-INFO.txt -Encoding utf8
+          Compress-Archive -Path dist-package/SysX -DestinationPath dist-package/SysX-eec8692-windows-x64-test.zip -Force
+          $zip = Get-Item dist-package/SysX-eec8692-windows-x64-test.zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($zip.Name)" | Set-Content "$($zip.FullName).sha256" -Encoding ascii
+      - name: Save verified ZIP as a draft release (no Actions artifact storage)
+        shell: pwsh
+        run: |
+          $tag = "test-eec8692-$env:GITHUB_RUN_ID"
+          gh release create $tag 'dist-package/SysX-eec8692-windows-x64-test.zip' 'dist-package/SysX-eec8692-windows-x64-test.zip.sha256' --draft --prerelease --target $env:GITHUB_SHA --title 'SysX eec8692 Windows x64 test build (without VMProtect)' --notes-file dist-package/SysX/BUILD-INFO.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }

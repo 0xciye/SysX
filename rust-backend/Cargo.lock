@@ -1427,6 +1427,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower-http",
+ "windows-sys",
 ]
 
 [[package]]
