@@ -25,7 +25,6 @@ pub fn ConfigApp() -> impl IntoView {
     let offset_x_draft = RwSignal::new("0".to_string());
     let offset_y_draft = RwSignal::new("0".to_string());
     let sens_draft = RwSignal::new("0.25".to_string());
-    let dpi_draft = RwSignal::new("1600".to_string());
     let recoil_levels_draft = RwSignal::new(String::new());
     let command_sender = RwSignal::new(None);
     let last_applied = RwSignal::new(String::new());
@@ -65,7 +64,6 @@ pub fn ConfigApp() -> impl IntoView {
                             offset_x_draft,
                             offset_y_draft,
                             sens_draft,
-                            dpi_draft,
                             recoil_levels_draft,
                         );
                     }
@@ -132,7 +130,6 @@ pub fn ConfigApp() -> impl IntoView {
                     offset_x_draft.set(format_number(value.offset_x));
                     offset_y_draft.set(format_number(value.offset_y));
                     sens_draft.set(format_number(value.sens));
-                    dpi_draft.set(value.dpi.to_string());
                     recoil_levels_draft.set(format_recoil_levels(&value.recoil.recoil_levels));
                     last_applied.set(serde_json::to_string(&value).unwrap_or_default());
                     settings.set(value);
@@ -154,7 +151,6 @@ pub fn ConfigApp() -> impl IntoView {
             || offset_x_draft.get() != format_number(current.offset_x)
             || offset_y_draft.get() != format_number(current.offset_y)
             || sens_draft.get() != format_number(current.sens)
-            || dpi_draft.get() != current.dpi.to_string()
             || recoil_levels_draft.get() != format_recoil_levels(&current.recoil.recoil_levels)
     };
 
@@ -165,7 +161,6 @@ pub fn ConfigApp() -> impl IntoView {
         let offset_x = offset_x_draft.get().trim().parse::<i64>();
         let offset_y = offset_y_draft.get().trim().parse::<i64>();
         let sens = sens_draft.get().trim().parse::<f64>();
-        let dpi = dpi_draft.get().trim().parse::<u32>();
         let recoil_levels = match parse_recoil_levels(&recoil_levels_draft.get()) {
             Ok(value) => value,
             Err(error) => {
@@ -173,14 +168,13 @@ pub fn ConfigApp() -> impl IntoView {
                 return;
             }
         };
-        let validation_error = match (port, crop, offset_x, offset_y, sens, dpi) {
-            (Ok(port), Ok(crop), Ok(offset_x), Ok(offset_y), Ok(sens), Ok(dpi)) => {
+        let validation_error = match (port, crop, offset_x, offset_y, sens) {
+            (Ok(port), Ok(crop), Ok(offset_x), Ok(offset_y), Ok(sens)) => {
                 next.port = port.to_string();
                 next.crop_resolution = crop;
                 next.offset_x = offset_x as f64;
                 next.offset_y = offset_y as f64;
                 next.sens = sens;
-                next.dpi = dpi;
                 next.recoil.recoil_levels = recoil_levels;
                 next.validate().err().map(str::to_owned)
             }
@@ -195,10 +189,7 @@ pub fn ConfigApp() -> impl IntoView {
             {
                 Some("Enter a whole number for both target offsets.".into())
             }
-            _ if sens_draft.get().trim().parse::<f64>().is_err() => {
-                Some("Enter a sensitivity from 0.01 to 10.".into())
-            }
-            _ => Some("Enter an integer DPI from 100 to 100000.".into()),
+            _ => Some("Enter a sensitivity from 0.01 to 10.".into()),
         };
         if let Some(message) = validation_error {
             apply_message.set(format!("Check settings: {message}"));
@@ -252,7 +243,6 @@ pub fn ConfigApp() -> impl IntoView {
                     offset_x_draft.set(format_number(next.offset_x));
                     offset_y_draft.set(format_number(next.offset_y));
                     sens_draft.set(format_number(next.sens));
-                    dpi_draft.set(next.dpi.to_string());
                     recoil_levels_draft.set(format_recoil_levels(&next.recoil.recoil_levels));
                     last_applied.set(serde_json::to_string(&next).unwrap_or_default());
                 }
@@ -450,8 +440,7 @@ pub fn ConfigApp() -> impl IntoView {
                                 <div class="setting-description"><h2>"Movement Calibration"</h2></div>
                                 <div class="settings-fields">
                                     <label class="field"><span class="field-label">"Sensitivity"</span><input class="text-input" type="number" min="0.01" max="10" step="0.001" prop:value=sens_draft on:input=move |event| sens_draft.set(event_target_value(&event)) aria-label="Mouse sensitivity"/></label>
-                                    <label class="field"><span class="field-label">"DPI"</span><input class="text-input" type="number" min="100" max="100000" step="1" prop:value=dpi_draft on:input=move |event| dpi_draft.set(event_target_value(&event)) aria-label="Mouse DPI"/></label>
-                                    <p class="smoothing-hint settings-wide">"Used in the sensitivity/DPI movement conversion formula."</p>
+                                    <p class="smoothing-hint settings-wide">"Your in-game sensitivity. SysX measures how far one count turns the view and saves it per sensitivity; mouse DPI does not affect sent counts."</p>
                                 </div>
                             </div>
                             <div class="settings-row">
@@ -495,7 +484,6 @@ fn copy_state_to_settings(
     offset_x: RwSignal<String>,
     offset_y: RwSignal<String>,
     sens: RwSignal<String>,
-    dpi: RwSignal<String>,
     recoil_levels: RwSignal<String>,
 ) {
     settings.update(|value| {
@@ -507,7 +495,6 @@ fn copy_state_to_settings(
         value.smoothing_alpha_x = state.smoothing_alpha_x;
         value.smoothing_alpha_y = state.smoothing_alpha_y;
         value.sens = state.sens;
-        value.dpi = state.dpi;
         value.recoil = state.recoil.clone();
         value.scale = state.preview_scale.clone();
         value.crop_resolution = state.crop_resolution;
@@ -524,7 +511,6 @@ fn copy_state_to_settings(
     offset_x.set(format_number(state.target_offset_x));
     offset_y.set(format_number(state.target_offset_y));
     sens.set(format_number(state.sens));
-    dpi.set(state.dpi.to_string());
     recoil_levels.set(format_recoil_levels(&state.recoil.recoil_levels));
 }
 
@@ -567,7 +553,7 @@ fn send_settings_commands(
         ),
         command(
             "set_movement_calibration",
-            serde_json::json!({"sens":settings.sens,"dpi":settings.dpi}),
+            serde_json::json!({"sens":settings.sens}),
         ),
         command(
             "set_recoil",

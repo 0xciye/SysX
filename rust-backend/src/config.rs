@@ -66,7 +66,6 @@ pub struct AppSettings {
     pub smoothing_alpha_x: f32,
     pub smoothing_alpha_y: f32,
     pub sens: f64,
-    pub dpi: u32,
     pub scale: String,
     pub show_preview: bool,
     pub crop_resolution: u32,
@@ -95,7 +94,6 @@ impl Default for AppSettings {
             smoothing_alpha_x: 1.0,
             smoothing_alpha_y: 1.0,
             sens: 0.25,
-            dpi: 1600,
             scale: "Smooth".into(),
             show_preview: true,
             crop_resolution: 640,
@@ -136,9 +134,6 @@ impl AppSettings {
         }
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err(SettingsError::Invalid("sensitivity must be 0.01..10"));
-        }
-        if !(100..=100_000).contains(&self.dpi) {
-            return Err(SettingsError::Invalid("DPI must be 100..100000"));
         }
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err(SettingsError::Invalid("invalid preview scale"));
@@ -447,6 +442,32 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_saved_with_the_removed_dpi_field_still_load_and_drop_it_on_save() {
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-settings-dpi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-settings.json");
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        old["sens"] = serde_json::json!(0.42);
+        old["dpi"] = serde_json::json!(800);
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let loaded = load_settings(&path);
+        assert_eq!(loaded.sens, 0.42, "older files keep their sensitivity");
+        save_settings(&path, &loaded).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("dpi").is_none());
+        assert_eq!(saved["sens"], 0.42);
+        let _ = fs::remove_dir_all(directory);
+    }
 
     fn valid_artifacts() -> ModelArtifacts {
         ModelArtifacts {

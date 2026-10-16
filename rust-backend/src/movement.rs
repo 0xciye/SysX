@@ -2134,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn calibrations_are_saved_per_sens_and_dpi_and_reloaded() {
+    fn calibrations_are_saved_per_sensitivity_and_reloaded() {
         let directory = std::env::temp_dir().join(format!(
             "sysx-calibration-{}-{}",
             std::process::id(),

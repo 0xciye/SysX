@@ -320,7 +320,7 @@ impl ReceiverService {
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
             "trigger_button":settings.trigger_button, "smoothing_alpha_x":settings.smoothing_alpha_x, "smoothing_alpha_y":settings.smoothing_alpha_y,
-            "sens":settings.sens, "dpi":settings.dpi, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
+            "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
             "active_model_id":active_model_id,
@@ -564,17 +564,15 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_movement_calibration" => {
+                // In-game sensitivity only: DPI does not change injected counts.
                 let sens = finite_number(command.get("sens"), "sens must be 0.01..10")?;
-                let dpi = command
-                    .get("dpi")
-                    .and_then(Value::as_u64)
-                    .ok_or("DPI must be an integer from 100 to 100000")?;
-                if !(0.01..=10.0).contains(&sens) || !(100..=100_000).contains(&dpi) {
-                    return Err("sens must be 0.01..10 and DPI 100..100000".into());
+                if !(0.01..=10.0).contains(&sens) {
+                    return Err("sens must be 0.01..10".into());
                 }
-                let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
-                settings.sens = sens;
-                settings.dpi = dpi as u32;
+                self.settings
+                    .lock()
+                    .map_err(|_| "settings lock poisoned")?
+                    .sens = sens;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_smoothing_config" => {

@@ -30,8 +30,6 @@ pub struct BackendState {
     pub smoothing_alpha_y: f32,
     #[serde(default)]
     pub sens: f64,
-    #[serde(default)]
-    pub dpi: u32,
     #[serde(
         default,
         rename = "recoil",

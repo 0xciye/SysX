@@ -91,7 +91,6 @@ pub struct AppSettings {
     pub smoothing_alpha_x: f32,
     pub smoothing_alpha_y: f32,
     pub sens: f64,
-    pub dpi: u32,
     pub scale: String,
     pub show_preview: bool,
     pub crop_resolution: u32,
@@ -120,7 +119,6 @@ impl Default for AppSettings {
             smoothing_alpha_x: 1.0,
             smoothing_alpha_y: 1.0,
             sens: 0.25,
-            dpi: 1600,
             scale: "Smooth".into(),
             show_preview: true,
             crop_resolution: 640,
@@ -161,9 +159,6 @@ impl AppSettings {
         }
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err("Sensitivity must be from 0.01 to 10.");
-        }
-        if !(100..=100_000).contains(&self.dpi) {
-            return Err("DPI must be from 100 to 100000.");
         }
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err("Choose Smooth or Pixel perfect preview scaling.");

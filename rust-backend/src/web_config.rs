@@ -458,7 +458,6 @@ mod tests {
 
         let mut settings = crate::config::AppSettings::default();
         settings.sens = 1.25;
-        settings.dpi = 1600;
         let response = match put_settings(
             State(state.clone()),
             local_headers(state.config_port, true),
@@ -477,7 +476,6 @@ mod tests {
             Err(error) => panic!("settings load failed: {}", error.message),
         };
         assert_eq!(response.0["sens"], 1.25);
-        assert_eq!(response.0["dpi"], 1600);
         let _ = fs::remove_dir_all(data_dir).await;
     }
 
