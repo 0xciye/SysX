@@ -111,7 +111,7 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 - Update `README.md`, `AGENTS.md`, and `DEVELOPMENT.md` at each completed project milestone, as requested.
 - Use the approved tokens in `design-system/MASTER.md` for all production UI work.
 - Use `public/receiver-mark.svg` as the canonical SysX mark; keep desktop bundle icons visually aligned with this SVG.
-- Only Medius is supported. Use official `medius 3.4.3` Rust SDK discovery, version handshake, physical input stream and SDK-managed 6,000,000-baud transport. Keep output calls in `medius_device.rs`; do not add direct serial protocol code, Ferrum or MAKCU fallback. Physical movement and button telemetry require Windows/device validation.
+- Only Medius is supported. Use official `medius 3.4.6` Rust SDK CH343 discovery (`find_medius`), `Device::open` protocol-9 handshake, health query, physical input stream and SDK-managed 6,000,000-baud transport. Keep output calls in `medius_device.rs`; do not add direct serial protocol code, Ferrum or MAKCU fallback. Physical movement and button telemetry require Windows/device validation.
 
 ### Release hardening
 

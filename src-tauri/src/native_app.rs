@@ -380,37 +380,57 @@ fn inspect_devices(
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
 ) -> bool {
-    let medius_ports = medius::find_medius();
-    for port in &medius_ports {
-        if monitor_medius(movement_state, auto_target, device_state, &port.path) {
-            return true;
+    // Discovery must start from the box's control USB identity, not from the
+    // cloned mouse. Immediately after plug-in the control COM port appears
+    // first, while clone information can arrive later.
+    let ports = medius::find_medius();
+    if ports.is_empty() {
+        set_device_status(device_state, DeviceStatus::missing());
+        return false;
+    }
+    for port in ports {
+        if let Ok(device) = medius::Device::open(&port.path) {
+            return monitor_medius(movement_state, auto_target, device_state, device);
         }
     }
+    set_device_status(device_state, DeviceStatus::error());
+    true
+}
 
-    set_device_status(
-        device_state,
-        if !medius_ports.is_empty() {
-            DeviceStatus::error()
-        } else {
-            DeviceStatus::missing()
-        },
-    );
-    false
+fn injection_ready(health: medius::Health) -> bool {
+    health.link_up && health.mouse_attached
+}
+
+/// A box may report before its link and physical mouse are ready. Wait briefly
+/// for the conditions SysX needs before subscribing to its input.
+fn wait_for_injection_ready(device: &medius::Device) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if device.query_health().is_ok_and(injection_ready) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn monitor_medius(
     movement_state: &crate::movement::MovementState,
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
-    path: &str,
+    device: medius::Device,
 ) -> bool {
-    use medius::{Button, CatchFilter, Class, Device, Input};
+    use medius::{Button, CatchFilter, Class, Input};
 
-    let Ok(device) = Device::open(path) else {
-        return false;
-    };
     let Ok(version) = device.query_version() else {
-        return false;
+        set_device_status(device_state, DeviceStatus::error());
+        return true;
+    };
+    if !wait_for_injection_ready(&device) {
+        set_device_status(device_state, DeviceStatus::error());
+        return true;
     };
     let filters = [
         Button::LEFT,
@@ -421,7 +441,7 @@ fn monitor_medius(
     ]
     .into_iter()
     .map(CatchFilter::watch);
-    let Ok(mut events) = device.input_events(filters) else {
+    let Ok(events) = device.input_events(filters) else {
         return false;
     };
     let name = if version.name.trim().is_empty() {
@@ -451,6 +471,7 @@ fn monitor_medius(
     let mut movement_error = false;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
     let mut auto_state = crate::auto::AutoState::new();
+    let mut next_health_check = Instant::now() + Duration::from_millis(250);
     loop {
         if let Some(event) = events.recv_timeout(Duration::from_millis(4)) {
             let usage = match event.input {
@@ -474,6 +495,13 @@ fn monitor_medius(
         }
         if !events.is_connected() {
             break;
+        }
+        if Instant::now() >= next_health_check {
+            next_health_check = Instant::now() + Duration::from_millis(250);
+            if !device.query_health().is_ok_and(injection_ready) {
+                movement_error = true;
+                break;
+            }
         }
         serial.pump();
         if let Some(completion) = &move_completion {
@@ -700,6 +728,20 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn medius_health_requires_a_live_link_and_attached_mouse() {
+        assert!(!injection_ready(medius::Health::from_flags(0)));
+        assert!(!injection_ready(medius::Health::from_flags(0x01)));
+        assert!(injection_ready(medius::Health::from_flags(0x03)));
+        assert!(injection_ready(medius::Health::from_flags(0x07)));
+    }
+
+    #[test]
+    fn linked_attached_mouse_is_accepted_without_clone_status() {
+        assert!(injection_ready(medius::Health::from_flags(0x03)));
+        assert!(injection_ready(medius::Health::from_flags(0x07)));
+    }
 
     #[test]
     fn host_exits_after_monitor_closes_but_survives_reloads() {

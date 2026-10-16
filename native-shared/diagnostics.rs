@@ -25,20 +25,35 @@ pub fn install(component: &str) -> io::Result<()> {
     let stamp = format!("{component}-{}-{}", timestamp_ms(), std::process::id());
     let log = logs.join(format!("{stamp}.log"));
     OpenOptions::new().create_new(true).write(true).open(&log)?;
-    if SESSION.set(Session { log, dump: crashes.join(format!("{stamp}.dmp")) }).is_err() {
+    if SESSION
+        .set(Session {
+            log,
+            dump: crashes.join(format!("{stamp}.dmp")),
+        })
+        .is_err()
+    {
         return Ok(());
     }
-    record(&format!("startup component={component} pid={} version={}", std::process::id(), env!("CARGO_PKG_VERSION")));
+    record(&format!(
+        "startup component={component} pid={} version={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    ));
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        record(&format!("Rust panic: {info}\n{}", Backtrace::force_capture()));
+        record(&format!(
+            "Rust panic: {info}\n{}",
+            Backtrace::force_capture()
+        ));
         #[cfg(windows)]
         write_dump(std::ptr::null());
         previous(info);
     }));
     #[cfg(windows)]
     unsafe {
-        windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(unhandled_exception));
+        windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
+            unhandled_exception,
+        ));
     }
     Ok(())
 }
@@ -57,14 +72,26 @@ fn append(path: &Path, message: &str) -> io::Result<()> {
 
 /// Only backend stderr is redirected; protocol stdout stays piped to the host.
 pub fn backend_stderr() -> io::Result<File> {
-    let session = SESSION.get().ok_or_else(|| io::Error::other("diagnostics not initialized"))?;
-    let name = session.log.file_stem().unwrap_or_default().to_string_lossy();
-    OpenOptions::new().create(true).append(true)
-        .open(session.log.with_file_name(format!("backend-stderr-{name}.log")))
+    let session = SESSION
+        .get()
+        .ok_or_else(|| io::Error::other("diagnostics not initialized"))?;
+    let name = session
+        .log
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    OpenOptions::new().create(true).append(true).open(
+        session
+            .log
+            .with_file_name(format!("backend-stderr-{name}.log")),
+    )
 }
 
 fn timestamp_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 #[cfg(windows)]
@@ -73,8 +100,10 @@ unsafe extern "system" fn unhandled_exception(
 ) -> i32 {
     if let Some(info) = pointers.as_ref() {
         if let Some(exception) = info.ExceptionRecord.as_ref() {
-            record(&format!("unhandled Windows exception code=0x{:08x} address={:p}",
-                exception.ExceptionCode, exception.ExceptionAddress));
+            record(&format!(
+                "unhandled Windows exception code=0x{:08x} address={:p}",
+                exception.ExceptionCode, exception.ExceptionAddress
+            ));
         }
     }
     write_dump(pointers);
@@ -88,9 +117,13 @@ fn write_dump(pointers: *const windows_sys::Win32::System::Diagnostics::Debug::E
     use windows_sys::Win32::System::Diagnostics::Debug::{
         MiniDumpNormal, MiniDumpWriteDump, MINIDUMP_EXCEPTION_INFORMATION,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+    };
     static WRITING: AtomicBool = AtomicBool::new(false);
-    if WRITING.swap(true, Ordering::AcqRel) { return; }
+    if WRITING.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some(session) = SESSION.get() else {
         WRITING.store(false, Ordering::Release);
         return;
@@ -103,11 +136,23 @@ fn write_dump(pointers: *const windows_sys::Win32::System::Diagnostics::Debug::E
             ClientPointers: 0,
         };
         let ok = unsafe {
-            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file.as_raw_handle(),
-                MiniDumpNormal, if pointers.is_null() { std::ptr::null() } else { &exception },
-                std::ptr::null(), std::ptr::null())
+            MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                file.as_raw_handle(),
+                MiniDumpNormal,
+                if pointers.is_null() {
+                    std::ptr::null()
+                } else {
+                    &exception
+                },
+                std::ptr::null(),
+                std::ptr::null(),
+            )
         };
-        if ok == 0 { return Err(io::Error::last_os_error()); }
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     })();
     match result {
@@ -126,7 +171,11 @@ mod tests {
 
     #[test]
     fn diagnostic_records_append_without_overwriting_prior_errors() {
-        let path = std::env::temp_dir().join(format!("sysx-log-test-{}-{}.log", std::process::id(), timestamp_ms()));
+        let path = std::env::temp_dir().join(format!(
+            "sysx-log-test-{}-{}.log",
+            std::process::id(),
+            timestamp_ms()
+        ));
         File::create(&path).unwrap();
         append(&path, "first failure").unwrap();
         append(&path, "second failure").unwrap();

@@ -2830,9 +2830,9 @@ dependencies = [
 
 [[package]]
 name = "medius"
-version = "3.4.3"
+version = "3.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbcc4ed2c67e4767cfc6145251d1fa5da11b3be4ea99ef3bf6a733bd4fdf0739"
+checksum = "452b309eacd092b23676f0f2cfc55b2e8efd5a48867d251f70a81f8cd669ff5a"
 dependencies = [
  "flume",
  "parking_lot",

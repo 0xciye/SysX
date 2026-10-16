@@ -23,14 +23,14 @@ getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.24"
-medius = "3.4.3"
+medius = "3.4.6"
 sysx-ui = { path = "../rust-ui" }
 slint = { version = "=1.13.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "renderer-software", "compat-1-2"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 sha2 = "0.11"
 
 [dev-dependencies]
-medius = { version = "3.4.3", features = ["mock"] }
+medius = { version = "3.4.6", features = ["mock"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Threading"] }

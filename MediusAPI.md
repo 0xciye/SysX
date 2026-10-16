@@ -1,6 +1,6 @@
 # Medius Rust library integration
 
-SysX supports **Medius only**, using the official **`medius` Rust crate, version 3.4.3**:
+SysX supports **Medius only**, using the official **`medius` Rust crate, version 3.4.6**:
 <https://medius.k4tech.net/library>. The crate requires Rust 1.85 or newer.
 
 The runtime already used this Rust library before this migration. The former version of this file described Native wire opcodes/framing and made the application integration look like a custom Native API client. That protocol guide is replaced here by the SDK interface actually used by SysX. SysX neither builds Native frames/CRC nor implements the device handshake itself; the Rust SDK owns the transport underneath its public API.
@@ -9,14 +9,14 @@ The runtime already used this Rust library before this migration. The former ver
 
 `src-tauri/src/native_app.rs` uses:
 
-1. `medius::find_medius()` to discover supported ports.
-2. `Device::open(path)` for the library-managed connection/handshake.
-3. `device.query_version()` to verify and name the connected device.
+1. `medius::find_medius()` to discover Medius' CH343 control ports, then `Device::open(path)` for the SDK-managed protocol-9 handshake. This recognizes a box even while its cloned mouse is still enumerating after a USB reconnect.
+2. `device.query_version()` to obtain the library-validated firmware identity and name.
+3. `device.query_health()` before subscribing or injecting. SysX requires `link_up`, `mouse_attached`, and `clone_configured`; otherwise it reports the device as unavailable and retries instead of sending input to an incomplete chain.
 4. `device.input_events(filters)` with `CatchFilter::watch` for `Button::LEFT`, `RIGHT`, `MIDDLE`, `SIDE1`, and `SIDE2`.
 5. `recv_timeout` and `held(Class::Button)` to update physical held states. Watch filters observe input without taking it away from passthrough.
 6. `events.is_connected()` and SDK errors to clear status and reconnect after disconnect.
 
-The SDK owns its fixed 6,000,000-baud serial link, query correlation, keepalive, framing and recovery. Medius is the only device adapter; no other vendor’s endpoint/baud settings are used. Cloning `Device` shares the SDK link; it does not open another physical port. SysX gives a clone to its output worker so button-event reads do not wait for an output call.
+The SDK owns its fixed 6,000,000-baud serial link, protocol-9 handshake, query correlation, keepalive, framing and recovery. Medius is the only device adapter; no other vendor’s endpoint/baud settings are used. Cloning `Device` shares the SDK link; it does not open another physical port. SysX gives a clone to its output worker so button-event reads do not wait for an output call.
 
 ## Movement and Auto
 

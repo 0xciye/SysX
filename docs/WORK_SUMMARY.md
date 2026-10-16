@@ -11,7 +11,7 @@
 
 ## Cập nhật thiết bị và trạng thái tính năng
 
-- Chỉ còn Medius qua Rust SDK `medius 3.4.3`; chuẩn hóa adapter output, thay tài liệu Native wire bằng Rust library, bỏ Ferrum và không tích hợp MAKCU. Thuật toán tracking và Delay/Cooldown/Sleep không đổi.
+- Chỉ còn Medius qua Rust SDK `medius 3.4.6`; quét CH343 control port rồi `Device::open` trước khi kiểm tra health, nên nhận box không phụ thuộc clone chuột đã enumerate xong sau USB reconnect; chuẩn hóa adapter output, thay tài liệu Native wire bằng Rust library, bỏ Ferrum và không tích hợp MAKCU. Thuật toán tracking và Delay/Cooldown/Sleep không đổi.
 - Pixel Seek là chế độ dùng được duy nhất. Object Detection và ONNX Runtime/OpenVINO/TensorRT được đánh dấu chưa dùng được; UI khóa các lựa chọn đó.
 - Sửa lỗi Apply Changes bị deadlock trong lệnh cấu hình sensitivity/motion. Windows và thiết bị thật vẫn cần kiểm tra.
 

@@ -95,7 +95,7 @@ Các mục dưới đây mô tả source thử nghiệm; ONNX Runtime, OpenVINO 
 
 ## 8. Host native và vòng đời (`src-tauri`)
 
-- Chỉ giữ Medius qua Rust SDK `medius 3.4.3`; adapter `medius_device.rs` gọi API công khai. Bỏ Ferrum, không tích hợp MAKCU; không tự đóng gói Native wire. Đã sửa lỗi Apply Changes bị khóa do giữ mutex settings khi dựng ACK. Xem `MediusAPI.md`.
+- Chỉ giữ Medius qua Rust SDK `medius 3.4.6`; quét CH343 control port, dùng `Device::open` handshake rồi mới đợi health clone chuột trước khi SysX gửi input; adapter `medius_device.rs` gọi API công khai. Bỏ Ferrum, không tích hợp MAKCU; không tự đóng gói Native wire. Đã sửa lỗi Apply Changes bị khóa do giữ mutex settings khi dựng ACK. Xem `MediusAPI.md`.
 
 - **Một SysX duy nhất:** mutex `Local\SysX.Receiver.SingleInstance` (`single_instance.rs`). Mở lần hai → đưa cửa sổ monitor đang có lên trước (hoặc mở lại từ `%LOCALAPPDATA%\SysX\instance.json`) rồi thoát, không tạo backend thứ hai (trước đây gây lỗi 10048 trên UDP 4200).
 - **Đóng cửa sổ monitor → SysX tắt** sau 3 giây (60 giây nếu monitor không bao giờ kết nối).

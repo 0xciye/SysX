@@ -57,31 +57,35 @@ slint::slint! {
         callback viewport-changed();
         changed feed-size => { root.viewport-changed(); }
         Rectangle {
-            x: 0px; y: 0px; width: parent.width; height: 48px; background: #0f151c;
-            Rectangle { y: parent.height - 1px; height: 1px; background: #1e2731; }
-            Image { x: 16px; y: 12px; width: 24px; height: 24px; source: @image-url("../public/receiver-mark.svg"); }
-            Text { x: 49px; height: 48px; text: "SysX"; color: #ebf1f5; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+            x: 0px; y: 0px; width: parent.width; height: 58px; background: #090c10;
+            Rectangle {
+                x: 12px; y: 9px; width: parent.width - 24px; height: 40px;
+                border-radius: 8px; border-width: 1px; border-color: #2d3946; background: #0f151c;
+            }
+            Image { x: 22px; y: 17px; width: 24px; height: 24px; source: @image-url("../public/receiver-mark.svg"); }
             HorizontalLayout {
-                x: max(116px, parent.width - 310px); width: parent.width - self.x - 16px;
-                y: 10px; height: 28px; spacing: 12px;
+                x: 58px; width: parent.width - self.x - 22px;
+                y: 15px; height: 28px; spacing: 8px;
                 Rectangle {
-                    horizontal-stretch: 1; border-radius: 5px; border-width: 1px; border-color: #2d3946; background: #121a23;
-                    HorizontalLayout { padding-left: 9px; padding-right: 9px; spacing: 7px;
-                        if root.width > 520px: Text { text: "PROFILE"; color: #9aa9b4; font-size: 10px; vertical-alignment: center; }
+                    horizontal-stretch: 1; border-radius: 5px; border-width: 1px; border-color: #263340; background: #121a23;
+                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 7px;
+                        if root.width > 460px: Text { text: "ACTIVE PROFILE"; color: #9aa9b4; font-size: 10px; vertical-alignment: center; }
                         Text { text: root.profile; color: #ebf1f5; font-size: 12px; font-weight: 600; overflow: elide; vertical-alignment: center; }
                     }
                 }
-                HorizontalLayout { width: 110px; spacing: 7px;
-                    Rectangle { width: 7px; height: 7px; y: 10px; border-radius: 4px; background: root.device-ink; }
-                    Text { text: root.device; color: #ebf1f5; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                Rectangle { width: root.width > 430px ? 122px : 92px; border-radius: 5px; border-width: 1px; border-color: root.device-ink.with-alpha(0.42); background: root.device-ink.with-alpha(0.10);
+                    HorizontalLayout { padding-left: 9px; padding-right: 8px; spacing: 7px;
+                        Rectangle { width: 7px; height: 7px; y: 10px; border-radius: 4px; background: root.device-ink; }
+                        Text { text: root.device; color: #ebf1f5; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                    }
                 }
             }
         }
         property <length> pad: root.width <= 520px ? 12px : 20px;
         feed := Rectangle {
-            width: min(640px, root.width - 2 * root.pad, root.height - 48px - 2 * root.pad - 40px);
+            width: min(640px, root.width - 2 * root.pad, root.height - 58px - 2 * root.pad - 40px);
             height: self.width; x: (root.width - self.width) / 2;
-            y: 48px + (root.height - 48px - self.height - 40px) / 2;
+            y: 58px + (root.height - 58px - self.height - 40px) / 2;
             border-radius: 8px; border-width: 1px; border-color: #2d3946; background: #05080b; clip: true;
             if root.has-frame: Image {
                 x: root.image-x * 1px; y: root.image-y * 1px;
