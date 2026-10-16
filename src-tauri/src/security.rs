@@ -6,7 +6,7 @@
 
 /// Refuse to run under a user-mode Windows debugger in release builds.
 pub fn start_release_guard() {
-    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    #[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
     {
         enable_process_mitigations();
         if debugger_present() {
@@ -29,7 +29,7 @@ pub fn start_release_guard() {
 /// Reduce common DLL-hijacking and extension-point injection paths. Windows
 /// may reject a policy on older systems; that is intentionally non-fatal so
 /// the supported receiver runtime keeps its normal startup behavior.
-#[cfg(all(not(debug_assertions), target_os = "windows"))]
+#[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
 fn enable_process_mitigations() {
     const PROCESS_IMAGE_LOAD_POLICY: u32 = 10;
     const PROCESS_EXTENSION_POINT_DISABLE_POLICY: u32 = 6;
@@ -55,7 +55,7 @@ fn enable_process_mitigations() {
 
 /// Kill the host and every child it owns. A plain `process::exit` would skip
 /// `BackendRuntime::Drop` and could leave the extracted receiver alive.
-#[cfg(all(not(debug_assertions), target_os = "windows"))]
+#[cfg(all(not(debug_assertions), not(test), target_os = "windows"))]
 fn terminate_process_tree() -> ! {
     let pid = unsafe { GetCurrentProcessId() };
     let _ = std::process::Command::new("taskkill")

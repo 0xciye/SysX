@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,34 @@ fn main() {
         let source = dist.join(relative);
         let name = relative.to_string_lossy().replace('\\', "/");
         generated.push_str(&format!("    ({name:?}, include_bytes!({source:?})),\n"));
+    }
+    generated.push_str("];\n");
+
+    // This manifest is embedded in the host, never trusted from an editable
+    // runtime JSON file. Hash the final (possibly VMProtected) build inputs.
+    generated.push_str(
+        "#[allow(dead_code)]\npub const EMBEDDED_RUNTIME_HASHES: &[(&str, u64, [u8; 32])] = &[\n",
+    );
+    if sidecar.is_file() {
+        let bytes = fs::read(&sidecar).expect("read backend for integrity manifest");
+        let name = format!("receiver-backend{extension}");
+        generated.push_str(&format!(
+            "    ({name:?}, {}, {:?}),\n",
+            bytes.len(),
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        ));
+    }
+    for relative in &files {
+        let bytes = fs::read(dist.join(relative)).expect("read UI asset for integrity manifest");
+        let name = format!(
+            "web-config/{}",
+            relative.to_string_lossy().replace('\\', "/")
+        );
+        generated.push_str(&format!(
+            "    ({name:?}, {}, {:?}),\n",
+            bytes.len(),
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        ));
     }
     generated.push_str("];\n");
 

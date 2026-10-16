@@ -1,0 +1,8 @@
+{
+  "elapsed_ms": 2029.629153,
+  "owned_backend_terminated": true,
+  "runtime_patch_blocked": false,
+  "udp_port_released": true,
+  "os": "Linux",
+  "windows_file_locks_executed": false
+}
