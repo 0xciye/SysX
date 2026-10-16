@@ -4,7 +4,51 @@
 //! button calls stay outside this state machine so Auto never becomes part of
 //! movement or assumes a device API.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Controls and samples share this input, but a control event always has an
+/// invalid target and timestamp zero. Configuration never refreshes a sample.
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "snake_case")]
+pub(crate) struct AutoTargetEvent {
+    config_revision: u64,
+    enabled: bool,
+    pub(crate) trigger_button: String,
+    delay_ms: u32,
+    cooldown_ms: u32,
+    sleep_ms: u32,
+    target_valid: bool,
+    timestamp_ms: u64,
+}
+
+impl AutoTargetEvent {
+    pub(crate) fn action(
+        &self,
+        state: &mut AutoState,
+        trigger_held: bool,
+        now: Instant,
+    ) -> Option<AutoAction> {
+        state.set_config_revision(self.config_revision);
+        if state.enabled() != self.enabled {
+            state.set_enabled(self.enabled);
+        }
+        let timing = AutoTiming {
+            delay_ms: self.delay_ms,
+            cooldown_ms: self.cooldown_ms,
+            sleep_ms: self.sleep_ms,
+        };
+        if state.timing() != timing {
+            state.set_timing(timing);
+        }
+        let wall_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(u64::MAX);
+        let fresh = wall_now.saturating_sub(self.timestamp_ms) <= 100
+            && self.timestamp_ms <= wall_now.saturating_add(100);
+        state.update(trigger_held, fresh && self.target_valid, now)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoState {
@@ -12,6 +56,9 @@ pub struct AutoState {
     timing: AutoTiming,
     phase: AutoPhase,
     deadline: Option<Instant>,
+    /// The last click's minimum interval survives target loss/rearming.
+    cooldown_until: Option<Instant>,
+    config_revision: u64,
     /// Next time the Auto state may be evaluated. Sleep is a polling cadence,
     /// not part of the firing cooldown, so it never changes `deadline`.
     next_poll: Option<Instant>,
@@ -45,6 +92,8 @@ impl AutoState {
             timing: AutoTiming::new(),
             phase: AutoPhase::Armed,
             deadline: None,
+            cooldown_until: None,
+            config_revision: 0,
             next_poll: None,
         }
     }
@@ -65,6 +114,13 @@ impl AutoState {
     pub fn set_timing(&mut self, timing: AutoTiming) {
         self.timing = timing;
         self.reset();
+    }
+
+    pub fn set_config_revision(&mut self, revision: u64) {
+        if self.config_revision != revision {
+            self.config_revision = revision;
+            self.reset();
+        }
     }
 
     /// Advances Auto using the latest trigger and target state.
@@ -104,7 +160,7 @@ impl AutoState {
         let action = match self.phase {
             AutoPhase::Armed => {
                 if self.timing.delay_ms == 0 {
-                    Some(self.fire(now))
+                    self.cooldown_elapsed(now).then(|| self.fire(now))
                 } else {
                     self.phase = AutoPhase::WaitingDelay;
                     self.deadline = Some(now + millis(self.timing.delay_ms));
@@ -112,7 +168,9 @@ impl AutoState {
                 }
             }
             AutoPhase::WaitingDelay | AutoPhase::WaitingCooldown => {
-                if self.deadline.is_some_and(|deadline| now >= deadline) {
+                if self.deadline.is_some_and(|deadline| now >= deadline)
+                    && self.cooldown_elapsed(now)
+                {
                     Some(self.fire(now))
                 } else {
                     None
@@ -125,6 +183,7 @@ impl AutoState {
     }
 
     fn fire(&mut self, now: Instant) -> AutoAction {
+        self.cooldown_until = Some(now + millis(self.timing.cooldown_ms));
         if self.timing.cooldown_ms == 0 {
             self.phase = AutoPhase::Latched;
             self.deadline = None;
@@ -134,6 +193,10 @@ impl AutoState {
             self.deadline = Some(now + millis(self.timing.cooldown_ms));
         }
         AutoAction::LeftClick
+    }
+
+    fn cooldown_elapsed(&self, now: Instant) -> bool {
+        self.cooldown_until.is_none_or(|deadline| now >= deadline)
     }
 
     fn schedule_next_poll(&mut self, now: Instant) {
@@ -165,6 +228,125 @@ fn millis(value: u32) -> Duration {
 mod tests {
     use super::{AutoAction, AutoState, AutoTiming};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn wire_control_changes_cancel_delay_without_refreshing_target_freshness() {
+        use super::AutoTargetEvent;
+        let timestamp = super::SystemTime::now()
+            .duration_since(super::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for change in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"delay_ms":30}),
+            serde_json::json!({"trigger_button":"m4"}),
+            serde_json::json!({"enabled":true}), // off/on between device polls
+        ] {
+            let mut sample = serde_json::json!({
+                "event":"auto_target","enabled":true,"trigger_button":"right",
+                "delay_ms":90,"config_revision":1,"target_valid":true,"timestamp_ms":timestamp
+            });
+            let input: AutoTargetEvent = serde_json::from_value(sample.clone()).unwrap();
+            let start = Instant::now();
+            let mut state = AutoState::new();
+            assert_eq!(input.action(&mut state, true, start), None);
+            for (key, value) in change.as_object().unwrap() {
+                sample[key] = value.clone();
+            }
+            sample["event"] = "auto_config".into();
+            sample["config_revision"] = 3.into();
+            sample["target_valid"] = false.into();
+            sample["timestamp_ms"] = 0.into();
+            let control: AutoTargetEvent = serde_json::from_value(sample).unwrap();
+            assert_eq!(
+                control.action(&mut state, true, start + Duration::from_millis(90)),
+                None
+            );
+            assert_eq!(
+                control.action(&mut state, true, start + Duration::from_secs(1)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn cooldown_survives_target_flicker_and_trigger_rearming() {
+        for release_trigger in [false, true] {
+            let start = Instant::now();
+            let mut state = AutoState::new();
+            state.set_enabled(true);
+            state.set_timing(AutoTiming {
+                delay_ms: 0,
+                cooldown_ms: 1000,
+                sleep_ms: 0,
+            });
+            assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+            state.update(!release_trigger, false, start + Duration::from_millis(1));
+            for ms in [2, 500, 999] {
+                assert_eq!(
+                    state.update(true, true, start + Duration::from_millis(ms)),
+                    None
+                );
+            }
+            assert_eq!(
+                state.update(true, true, start + Duration::from_millis(1000)),
+                Some(AutoAction::LeftClick)
+            );
+        }
+    }
+
+    #[test]
+    fn reacquisition_delay_does_not_shorten_the_previous_click_cooldown() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 10,
+            cooldown_ms: 1000,
+            sleep_ms: 0,
+        });
+        state.update(true, true, start);
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(10)),
+            Some(AutoAction::LeftClick)
+        );
+        state.update(true, false, start + Duration::from_millis(11));
+        state.update(true, true, start + Duration::from_millis(12));
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(22)),
+            None
+        );
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(1010)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn configuration_revision_cancels_pending_click_without_a_new_target() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 90,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        state.set_config_revision(1);
+        state.update(true, true, start);
+        // Covers trigger changes and a disable/re-enable between device polls.
+        state.set_config_revision(3);
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(90)),
+            None
+        );
+        state.update(true, true, start + Duration::from_millis(100));
+        state.set_config_revision(3); // ordinary frames must not reset Delay
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(190)),
+            Some(AutoAction::LeftClick)
+        );
+    }
 
     #[test]
     fn auto_state_starts_disabled_and_can_be_toggled() {

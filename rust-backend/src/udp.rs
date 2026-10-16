@@ -10,6 +10,9 @@ pub const MAX_DIMENSION: u16 = 8192;
 pub const MAX_IN_FLIGHT_FRAMES: usize = 32;
 pub const MAX_REASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_NS: u64 = 100_000_000;
+/// UDP v1 has no session identifier. A quiet sender may restart its clock;
+/// a changed endpoint also explicitly starts a new session in receiver.rs.
+const SESSION_IDLE_NS: u64 = 1_000_000_000;
 const MAX_CHUNKS: u16 = ((MAX_FRAME_BYTES + MAX_DATAGRAM_BYTES - HEADER_BYTES - 1)
     / (MAX_DATAGRAM_BYTES - HEADER_BYTES)) as u16;
 
@@ -28,6 +31,7 @@ pub struct ReassemblyStats {
     pub invalid_packets: u64,
     pub expired_frames: u64,
     pub in_flight_bytes: usize,
+    pub invalid_frames: u64,
 }
 
 struct Assembly {
@@ -46,6 +50,8 @@ pub struct UdpFrameReassembler {
     insertion_order: Vec<u64>,
     ready: Option<EncodedFrame>,
     stats: ReassemblyStats,
+    last_completed: Option<(u64, u64)>,
+    last_packet_ns: Option<u64>,
 }
 
 pub fn encode_jpeg_frame(
@@ -105,6 +111,8 @@ impl UdpFrameReassembler {
             insertion_order: Vec::new(),
             ready: None,
             stats: ReassemblyStats::default(),
+            last_completed: None,
+            last_packet_ns: None,
         }
     }
 
@@ -153,6 +161,23 @@ impl UdpFrameReassembler {
         {
             self.discard(frame_id);
             self.stats.invalid_packets += 1;
+            return None;
+        }
+
+        if self
+            .last_packet_ns
+            .is_some_and(|last| now_ns.saturating_sub(last) >= SESSION_IDLE_NS)
+        {
+            self.reset_session();
+        }
+        self.last_packet_ns = Some(now_ns);
+        // Compare capture time first: OBS can restart its frame counter while
+        // its monotonic clock keeps increasing. Frame IDs break timestamp ties.
+        if self
+            .last_completed
+            .is_some_and(|last| (timestamp_ns, frame_id) <= last)
+        {
+            self.discard(frame_id);
             return None;
         }
 
@@ -230,6 +255,7 @@ impl UdpFrameReassembler {
             timestamp_ns,
             jpeg,
         };
+        self.last_completed = Some((timestamp_ns, frame_id));
         if self.ready.replace(frame.clone()).is_some() {
             self.stats.dropped_frames += 1;
         }
@@ -238,6 +264,20 @@ impl UdpFrameReassembler {
 
     pub fn take_latest(&mut self) -> Option<EncodedFrame> {
         self.ready.take()
+    }
+
+    pub fn reject_decoded_frame(&mut self) {
+        self.stats.invalid_frames += 1;
+        self.stats.dropped_frames += 1;
+    }
+
+    pub fn reset_session(&mut self) {
+        self.stats.dropped_frames += self.assemblies.len() as u64 + u64::from(self.ready.is_some());
+        self.assemblies.clear();
+        self.insertion_order.clear();
+        self.ready = None;
+        self.last_completed = None;
+        self.last_packet_ns = None;
     }
 
     pub fn expire(&mut self, now_ns: u64) {
@@ -277,6 +317,47 @@ fn parse_header(packet: &[u8]) -> Option<(u64, u16, u16, u16, u16, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_old_frames_and_duplicates_cannot_replace_or_follow_the_newest() {
+        let mut receiver = UdpFrameReassembler::default();
+        let jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        let newer = encode_jpeg_frame(2, 1, 1, 20, &jpeg).unwrap();
+        let older = encode_jpeg_frame(1, 1, 1, 10, &jpeg).unwrap();
+        receiver.accept(&newer[0], 1);
+        assert!(receiver.accept(&older[0], 2).is_none());
+        assert_eq!(receiver.take_latest().unwrap().frame_id, 2);
+        assert!(receiver.accept(&older[0], 3).is_none());
+        assert!(receiver.accept(&newer[0], 4).is_none());
+        assert!(receiver.take_latest().is_none());
+    }
+
+    #[test]
+    fn chunk_completion_order_cannot_regress_the_frame_stream() {
+        let mut receiver = UdpFrameReassembler::default();
+        let mut jpeg = vec![0; 2000];
+        jpeg[..2].copy_from_slice(&[0xff, 0xd8]);
+        jpeg[1998..].copy_from_slice(&[0xff, 0xd9]);
+        let old = encode_jpeg_frame(1, 1, 1, 10, &jpeg).unwrap();
+        let new = encode_jpeg_frame(2, 1, 1, 20, &jpeg).unwrap();
+        receiver.accept(&old[0], 1);
+        receiver.accept(&new[1], 2);
+        receiver.accept(&new[0], 3);
+        assert_eq!(receiver.take_latest().unwrap().frame_id, 2);
+        assert!(receiver.accept(&old[1], 4).is_none());
+        assert!(receiver.take_latest().is_none());
+    }
+
+    #[test]
+    fn sender_restarts_work_with_new_capture_time_or_an_idle_session() {
+        let mut receiver = UdpFrameReassembler::default();
+        let jpeg = [0xff, 0xd8, 0xff, 0xd9];
+        for (id, stamp, now) in [(50, 100, 1), (1, 101, 2), (1, 1, SESSION_IDLE_NS + 2)] {
+            let packets = encode_jpeg_frame(id, 1, 1, stamp, &jpeg).unwrap();
+            assert!(receiver.accept(&packets[0], now).is_some());
+            assert_eq!(receiver.take_latest().unwrap().frame_id, id);
+        }
+    }
 
     fn packet(frame_id: u64, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());

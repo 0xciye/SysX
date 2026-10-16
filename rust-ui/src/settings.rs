@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+/// Only a successful local settings API response confirms durable storage.
+pub fn require_settings_saved(status: u16, server_error: &str) -> Result<(), String> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Settings were not saved (HTTP {status}): {}",
+            server_error.trim()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::require_settings_saved;
+
+    #[test]
+    fn storage_validation_and_service_failures_are_not_successful_saves() {
+        for status in [400, 403, 409, 500, 503] {
+            let message = require_settings_saved(status, "permission denied").unwrap_err();
+            assert!(message.contains("not saved"));
+            assert!(message.contains(&status.to_string()));
+            assert!(message.contains("permission denied"));
+        }
+        assert!(require_settings_saved(200, "").is_ok());
+        assert!(require_settings_saved(204, "").is_ok());
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RecoilSettings {

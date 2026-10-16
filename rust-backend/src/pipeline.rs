@@ -24,6 +24,8 @@ pub struct PipelineConfig {
     /// True only while the enabled Auto trigger is held. In that state the
     /// Pixel Seek mask also feeds Auto's center-crossing validity gate.
     pub auto_target_active: bool,
+    /// Control revision used to reject callbacks completed before an Auto edit.
+    pub auto_config_revision: u64,
     pub smoothing_x: SmoothingRange,
     pub smoothing_y: SmoothingRange,
     pub model: Option<ModelDefinition>,
@@ -39,6 +41,7 @@ impl Default for PipelineConfig {
             crop_resolution: Some(640),
             fov_degrees: 36,
             auto_target_active: false,
+            auto_config_revision: 0,
             smoothing_x: SmoothingRange::NONE,
             smoothing_y: SmoothingRange::NONE,
             model: None,
@@ -50,6 +53,7 @@ impl Default for PipelineConfig {
 
 #[derive(Clone, Debug)]
 pub struct ProcessedFrame {
+    pub auto_config_revision: u64,
     pub frame: SourceFrame,
     pub result: DetectionResult,
     pub published_ns: u64,
@@ -418,6 +422,7 @@ fn process_frame(
         result.postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
         result.total_processing_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         return Ok(ProcessedFrame {
+            auto_config_revision: config.auto_config_revision,
             frame: SourceFrame { ..frame },
             result,
             published_ns: monotonic_ns(),
@@ -472,6 +477,7 @@ fn process_frame(
         auto_target_valid,
     };
     Ok(ProcessedFrame {
+        auto_config_revision: config.auto_config_revision,
         frame: SourceFrame { ..frame },
         result,
         published_ns: monotonic_ns(),

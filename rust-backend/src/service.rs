@@ -1,5 +1,6 @@
 use crate::config::{
-    load_settings, save_settings, AppSettings, ModelDefinition, ModelRegistry, RecoilSettings,
+    load_settings, save_settings, AppSettings, AutoSettings, ModelDefinition, ModelRegistry,
+    RecoilSettings,
 };
 use crate::movement::{
     CalibrationStore, MovementBatcher, MovementRuntimeSettings, MovementTargetSample,
@@ -34,6 +35,48 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 const UDP_RETRY: Duration = Duration::from_secs(3);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Serialize control changes and target samples on the same stdout channel.
+/// Controls have no fresh target; a revision also cancels pending actions when
+/// several changes occur between two device polls (for example off then on).
+struct AutoEvents {
+    settings: AutoSettings,
+    revision: u64,
+    emit: Arc<dyn Fn(Value) + Send + Sync>,
+}
+
+impl AutoEvents {
+    fn configure(&mut self, settings: &AutoSettings) {
+        if self.settings != *settings {
+            self.settings = settings.clone();
+            self.revision = self.revision.wrapping_add(1);
+            (self.emit)(self.event("auto_config", false, 0));
+        }
+    }
+
+    fn event(&self, kind: &str, target_valid: bool, timestamp_ms: u64) -> Value {
+        json!({
+            "event": kind,
+            "config_revision": self.revision,
+            "enabled": self.settings.enabled,
+            "trigger_button": self.settings.trigger_button,
+            "delay_ms": self.settings.delay_ms,
+            "cooldown_ms": self.settings.cooldown_ms,
+            "sleep_ms": self.settings.sleep_ms,
+            "target_valid": target_valid,
+            "timestamp_ms": timestamp_ms,
+        })
+    }
+
+    fn target(&self, revision: u64, valid: bool) {
+        // A processing callback can be delayed after releasing the pipeline
+        // lock. It must not rearm Auto using a pre-edit target.
+        if revision == self.revision {
+            (self.emit)(self.event("auto_target", valid, unix_ms()));
+        }
+    }
+}
+
 struct SourceState {
     active: Option<UdpDecodedFrameSource>,
     active_port: u16,
@@ -81,6 +124,7 @@ pub struct ReceiverService {
     /// Latest Medius status reported by the native host
     /// (`device_status` command); forwarded to the monitor page in `state`.
     device: Arc<Mutex<Value>>,
+    auto_events: Arc<Mutex<AutoEvents>>,
     /// Open `role=monitor` WebSocket clients.
     monitor_clients: AtomicUsize,
     /// Open configuration WebSocket clients keep the backend/config server
@@ -157,6 +201,7 @@ impl ReceiverService {
             crop_resolution: Some(app.crop_resolution),
             fov_degrees: app.fov_degrees,
             auto_target_active: false,
+            auto_config_revision: 0,
             smoothing_x: app.smoothing_x(),
             smoothing_y: app.smoothing_y(),
             model,
@@ -169,6 +214,11 @@ impl ReceiverService {
             }
         })));
         let device = Arc::new(Mutex::new(missing_device()));
+        let auto_events = Arc::new(Mutex::new(AutoEvents {
+            settings: app.auto.clone(),
+            revision: 0,
+            emit: Arc::new(|event| println!("{event}")),
+        }));
         let ticker_settings = Arc::clone(&settings);
         let ticker_device = Arc::clone(&device);
         let ticker_batcher = Arc::clone(&movement_batcher);
@@ -198,6 +248,7 @@ impl ReceiverService {
         let callback_ticker = Arc::clone(&movement_ticker);
         let callback_settings = Arc::clone(&settings);
         let callback_device = Arc::clone(&device);
+        let callback_auto = Arc::clone(&auto_events);
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(0_u64);
         let callback: Arc<dyn Fn(&ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
             // Wake every preview socket for this frame (no timer polling:
@@ -220,19 +271,13 @@ impl ReceiverService {
             });
             if let (Ok(settings), Ok(device)) = (callback_settings.lock(), callback_device.lock()) {
                 let auto_active = auto_trigger_active(&settings.auto, &device);
-                println!(
-                    "{}",
-                    json!({
-                        "event": "auto_target",
-                        "enabled": settings.auto.enabled,
-                        "trigger_button": settings.auto.trigger_button,
-                        "delay_ms": settings.auto.delay_ms,
-                        "cooldown_ms": settings.auto.cooldown_ms,
-                        "sleep_ms": settings.auto.sleep_ms,
-                        "target_valid": auto_active && processed.result.auto_target_valid,
-                        "timestamp_ms": unix_ms(),
-                    })
-                );
+                if let Ok(mut events) = callback_auto.lock() {
+                    events.configure(&settings.auto);
+                    events.target(
+                        processed.auto_config_revision,
+                        auto_active && processed.result.auto_target_valid,
+                    );
+                }
             }
         });
         let pipeline = Arc::new(LatestFramePipeline::new(
@@ -277,6 +322,7 @@ impl ReceiverService {
             reader: Mutex::new(None),
             session_id,
             device,
+            auto_events,
             monitor_clients: AtomicUsize::new(0),
             config_clients: AtomicUsize::new(0),
             preview_rx,
@@ -336,11 +382,9 @@ impl ReceiverService {
         // the receiver advertises to the sender and expects in each packet.
         let expected_source_resolution =
             Some(vec![settings.crop_resolution, settings.crop_resolution]);
-        let last_error = stats
-            .last_error
-            .clone()
-            .or(source_error)
-            .or_else(|| self.errors.lock().ok()?.last().cloned());
+        // History remains available for diagnostics, but a recovered error
+        // must not masquerade as a current operational failure.
+        let last_error = stats.last_error.clone().or(source_error);
         let device = self
             .device
             .lock()
@@ -373,6 +417,7 @@ impl ReceiverService {
             "session_id":self.session_id, "processed_frames":stats.processed_frames, "dropped_input_frames":stats.dropped_input_frames,
             "rejected_frames":stats.rejected_frames, "resolution_mismatches":stats.resolution_mismatches,
             "transport_dropped_frames":transport.dropped_frames + transport.expired_frames, "invalid_packets":transport.invalid_packets,
+            "invalid_frames":transport.invalid_frames,
             "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
             "device":device,
             "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
@@ -488,6 +533,7 @@ impl ReceiverService {
             crop_resolution: Some(settings.crop_resolution),
             fov_degrees,
             auto_target_active,
+            auto_config_revision: 0, // filled atomically by reconfigure()
             smoothing_x: settings.smoothing_x(),
             smoothing_y: settings.smoothing_y(),
             model,
@@ -497,14 +543,19 @@ impl ReceiverService {
     }
 
     fn reconfigure(&self) -> Result<(), String> {
-        let settings = self
-            .settings
+        let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        // Publish controls even if no frame arrives or pipeline configuration
+        // fails. In particular, disabling Auto must never depend on video.
+        let mut events = self
+            .auto_events
             .lock()
-            .map_err(|_| "settings lock poisoned")?
-            .clone();
-        self.pipeline
-            .configure(self.pipeline_config(&settings)?)
-            .map_err(str::to_owned)
+            .map_err(|_| "Auto event lock poisoned")?;
+        events.configure(&settings.auto);
+        let revision = events.revision;
+        drop(events);
+        let mut config = self.pipeline_config(&settings)?;
+        config.auto_config_revision = revision;
+        self.pipeline.configure(config).map_err(str::to_owned)
     }
 
     fn dispatch(&self, command: Value) -> Result<Value, String> {
@@ -996,6 +1047,9 @@ fn receiver_loop(service: Weak<ReceiverService>) {
                             state.active_port = port;
                             state.pending_port = None;
                             state.last_error = None;
+                            if let Ok(mut view) = service.source_view.lock() {
+                                *view = SourceView::of(&state);
+                            }
                             if let Ok(mut settings) = service.settings.lock() {
                                 settings.port = port.to_string();
                             }
@@ -1444,6 +1498,90 @@ mod tests {
     use crate::config::{save_settings, AppSettings};
     use crate::udp::encode_jpeg_frame;
     use std::net::UdpSocket;
+
+    #[test]
+    fn an_old_frame_callback_cannot_rearm_auto_after_a_control_edit() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let mut events = AutoEvents {
+            settings: AutoSettings::default(),
+            revision: 0,
+            emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
+        };
+        let mut settings = AutoSettings::default();
+        settings.enabled = true;
+        events.configure(&settings);
+        events.target(0, true); // callback finished under the previous config
+        assert_eq!(output.lock().unwrap().len(), 1);
+        events.target(1, true);
+        let output = output.lock().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["event"], "auto_target");
+        assert_eq!(output[1]["target_valid"], true);
+    }
+
+    #[test]
+    fn auto_controls_are_published_without_any_video_frames() {
+        let (service, data_dir) = test_service("auto-control-no-frames");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        service.auto_events.lock().unwrap().emit = Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+        for (enabled, button, delay) in
+            [(true, "right", 90), (false, "right", 90), (true, "m4", 30)]
+        {
+            service
+                .dispatch(json!({"version":1,"type":"set_auto","settings":{
+                    "enabled":enabled,"triggerButton":button,"delayMs":delay,
+                    "cooldownMs":250,"sleepMs":5
+                }}))
+                .unwrap();
+        }
+        let output = events.lock().unwrap().clone();
+        assert_eq!(output.len(), 3);
+        for (index, event) in output.iter().enumerate() {
+            assert_eq!(event["event"], "auto_config");
+            assert_eq!(event["config_revision"], index + 1);
+            assert_eq!(event["target_valid"], false);
+            assert_eq!(
+                event["timestamp_ms"], 0,
+                "a control must not refresh a target sample"
+            );
+        }
+        assert_eq!(output[1]["enabled"], false);
+        assert_eq!(output[2]["trigger_button"], "m4");
+        assert_eq!(output[2]["delay_ms"], 30);
+        assert_eq!(service.pipeline.stats().processed_frames, 0);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn recovered_port_error_does_not_reappear_from_diagnostic_history() {
+        let (service, data_dir) = test_service("recover-port-error");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let busy = reserve_udp_socket();
+        let port = busy.local_addr().unwrap().port();
+        assert!(service.set_udp_port(port).is_err());
+        assert!(!service.errors.lock().unwrap().is_empty());
+        drop(busy);
+        service.source.lock().unwrap().retry_at = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while service.state()["port"] != port && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = service.state();
+        assert_eq!(state["port"], port);
+        assert_eq!(state["last_error"], Value::Null);
+        assert!(
+            !service.errors.lock().unwrap().is_empty(),
+            "history should be retained separately"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     struct ServiceGuard(Arc<ReceiverService>);
 

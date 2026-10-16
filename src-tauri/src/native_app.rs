@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tungstenite::{connect, Message};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_runtime.rs"));
+use crate::auto::AutoTargetEvent;
 
 /// Grace period for monitor/configuration page reloads before the host shuts down.
 const MONITOR_CLOSE_GRACE: Duration = Duration::from_secs(3);
@@ -49,28 +50,6 @@ struct DeviceStatus {
     state: DeviceState,
     name: Option<String>,
     buttons: [Option<bool>; 5],
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
-#[serde(default, rename_all = "snake_case")]
-struct AutoTargetEvent {
-    enabled: bool,
-    trigger_button: String,
-    delay_ms: u32,
-    cooldown_ms: u32,
-    sleep_ms: u32,
-    target_valid: bool,
-    timestamp_ms: u64,
-}
-
-impl AutoTargetEvent {
-    fn is_fresh(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
-            .unwrap_or(u64::MAX);
-        now.saturating_sub(self.timestamp_ms) <= 100 && self.timestamp_ms <= now.saturating_add(100)
-    }
 }
 
 impl DeviceStatus {
@@ -157,7 +136,11 @@ pub fn run() {
         return;
     };
     crate::single_instance::record_config_port(&data_dir, config_port);
-    open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
+    // The opt-in Windows smoke owns only the monitor window. Do not open a
+    // config tab in the user's browser that would keep the host alive.
+    if !std::env::args().any(|arg| arg == "--smoke-test") {
+        open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
+    }
 
     // Preferred: the receiver as a native SysX window (WebView2). Closing it
     // leaves the backend alive while the browser config page is open. Without
@@ -304,7 +287,10 @@ fn start_backend(
                     crate::movement::set_target(&movement_state, &value);
                     continue;
                 }
-                if value.get("event").and_then(|value| value.as_str()) == Some("auto_target") {
+                if matches!(
+                    value.get("event").and_then(|value| value.as_str()),
+                    Some("auto_target" | "auto_config")
+                ) {
                     if let Ok(event) = serde_json::from_value::<AutoTargetEvent>(value) {
                         if let Ok(mut current) = auto_target.lock() {
                             *current = event;
@@ -428,26 +414,6 @@ fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
     if let Ok(mut current) = state.lock() {
         *current = status;
     }
-}
-
-fn auto_action(
-    state: &mut crate::auto::AutoState,
-    input: &AutoTargetEvent,
-    trigger_held: bool,
-    now: Instant,
-) -> Option<crate::auto::AutoAction> {
-    if state.enabled() != input.enabled {
-        state.set_enabled(input.enabled);
-    }
-    let timing = crate::auto::AutoTiming {
-        delay_ms: input.delay_ms,
-        cooldown_ms: input.cooldown_ms,
-        sleep_ms: input.sleep_ms,
-    };
-    if state.timing() != timing {
-        state.set_timing(timing);
-    }
-    state.update(trigger_held, input.is_fresh() && input.target_valid, now)
 }
 
 fn auto_trigger_held(input: &AutoTargetEvent, held: impl FnOnce(u16) -> bool) -> bool {
@@ -597,7 +563,7 @@ fn monitor_medius(
                 .any(|usage| usage.id == button)
         });
         if let Some(crate::auto::AutoAction::LeftClick) =
-            auto_action(&mut auto_state, &auto_input, auto_held, Instant::now())
+            auto_input.action(&mut auto_state, auto_held, Instant::now())
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {
