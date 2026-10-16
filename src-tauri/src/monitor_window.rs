@@ -1,6 +1,7 @@
 //! The receiver as a real desktop window: a native SysX window (tao) that
-//! hosts the monitor page in WebView2 (wry). Closing it quits SysX; if the
-//! backend goes away the window closes too.
+//! hosts the monitor page in WebView2 (wry). Closing it leaves the config page
+//! and backend alive when they are still in use; if the backend goes away the
+//! window closes too.
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::thread;

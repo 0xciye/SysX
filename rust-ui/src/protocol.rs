@@ -1,4 +1,4 @@
-use crate::settings::RecoilSettings;
+use crate::settings::{AutoSettings, RecoilSettings};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -16,6 +16,8 @@ pub struct BackendState {
     pub source: String,
     #[serde(default)]
     pub mode: String,
+    #[serde(default)]
+    pub motion_enabled: bool,
     #[serde(default)]
     pub fov_degrees: u16,
     #[serde(default)]
@@ -41,6 +43,8 @@ pub struct BackendState {
         alias = "native_motion"
     )]
     pub recoil: RecoilSettings,
+    #[serde(default)]
+    pub auto: AutoSettings,
     #[serde(default)]
     pub preview_scale: String,
     #[serde(default)]

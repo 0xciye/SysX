@@ -21,6 +21,7 @@ pub struct MovementTarget {
     pub target_valid: bool,
     pub dx: i64,
     pub dy: i64,
+    pub motion_enabled: bool,
     pub trigger_button: String,
     pub timestamp_ms: u64,
     #[serde(alias = "nativeMotion", alias = "native_motion")]
@@ -52,6 +53,10 @@ pub fn trigger_button_index(button: &str) -> Option<u16> {
         "m5" => Some(4),
         _ => None,
     }
+}
+
+pub fn should_apply_target(target: &MovementTarget, trigger_held: bool) -> bool {
+    target.motion_enabled && trigger_held && target.target_valid
 }
 
 impl MovementTarget {
@@ -127,7 +132,10 @@ impl VerticalAdjustmentClock {
 
 #[cfg(test)]
 mod tests {
-    use super::{trigger_button_index, MovementTarget, RecoilSettings, VerticalAdjustmentClock};
+    use super::{
+        should_apply_target, trigger_button_index, MovementTarget, RecoilSettings,
+        VerticalAdjustmentClock,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -137,6 +145,30 @@ mod tests {
         assert_eq!(trigger_button_index("middle"), Some(2));
         assert_eq!(trigger_button_index("m4"), Some(3));
         assert_eq!(trigger_button_index("m5"), Some(4));
+    }
+
+    #[test]
+    fn motion_switch_gates_all_target_commands() {
+        let target = MovementTarget {
+            target_valid: true,
+            motion_enabled: false,
+            ..MovementTarget::default()
+        };
+        assert!(!should_apply_target(&target, true));
+        assert!(!should_apply_target(
+            &MovementTarget {
+                motion_enabled: true,
+                ..target.clone()
+            },
+            false
+        ));
+        assert!(should_apply_target(
+            &MovementTarget {
+                motion_enabled: true,
+                ..target
+            },
+            true
+        ));
     }
 
     #[test]

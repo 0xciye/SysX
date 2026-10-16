@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auto;
 mod monitor_window;
 mod movement;
 mod native_app;

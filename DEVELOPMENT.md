@@ -247,6 +247,19 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 113. [x] Smoothing X/Y is now a strength 1–50 (user request; first built as 1–10) with Min and Max per axis; each new track draws a strength in [Min, Max] per axis and keeps it (`SmoothingRange`, `ExponentialTargetSmoother` in `targeting.rs`); alpha = 1/strength. Config page: four sliders (X Min/Max, Y Min/Max, step 0.1) that keep Min ≤ Max; `set_smoothing_config` takes `x_min/x_max/y_min/y_max`; old alpha settings migrate to min = max = 1/alpha. Simulation shows strong smoothing overshoots (5/10/20/50 → 6.6/14/27/55 px on a still target) because it also delays the image motion of our own moves. Backend 65, UI 8 tests pass on Linux; config page not recaptured.
 114. [x] Smoothing no longer makes the aim overshoot (user request). Cause: the filter smoothed the target's position in the image, which also moves when our own moves turn the camera, so the filtered error lagged the aim and the controller kept pushing past the target. The pipeline now passes the per-track smoothing factors with each frame; the controller smooths the raw error around a prediction carried by the target's own velocity and by the measured image shift of the moves applied between captures (image-domain with apparent velocity before calibration). Simulation, strength 1/10/20/50: overshoot 2.9/3.7/2.9/3.8 px (was 2.9/14/27/55), reach 0.19 s at all (was up to 1.17 s), strafing 11/11.6/12.9/15.1 px (was 11/12.6/19.2/41.2). Slowing the velocity filter with the strength was tried and rejected (strafing up to 62–117 px). On a still target with ±3 px detection jitter the aim wobbles ~1.4–1.7 px RMS at any strength — the 2/4 px dead zone already absorbs most of it. Backend 66 tests pass on Linux; not tried in a game.
 
+115. [x] Added the Auto configuration section between Motion and Recoil and created the isolated `src-tauri/src/auto.rs` state scaffold. Auto has no automatic action or movement integration yet; native, backend, and UI tests pass on this workspace.
+116. [x] Added independent Auto Trigger key and FOV settings to the Auto card. They persist through `app-settings.json` and the backend apply command without being connected to movement or automatic actions yet. Backend 68, UI 9, and native 18 tests pass; the release UI build succeeds.
+
+117. [x] Reduced configuration card spacing and header/row padding by roughly half while preserving control sizes and compact-screen stacking. The Auto card keeps FOV on the left and Trigger key on the right.
+
+118. [x] Added persisted Auto Delay, Cooldown, and Sleep timing fields in milliseconds, with backend validation and an isolated `AutoTiming` skeleton. These values are configuration only until Auto behavior is implemented.
+
+119. [x] Reduced configuration card width to roughly 50% on desktop and kept full width on compact screens, preserving the existing card height and control sizing.
+
+120. [x] Changed the configuration card layout to a balanced three-column, two-row desktop rectangle with Main, Motion, Auto on the first row and Recoil plus Settings on the second; medium screens use two columns and compact screens fall back to one column.
+
+121. [x] Moved Motion, Auto, and Recoil enable switches into a compact toggle group below Detection Engine in Main; module cards now contain settings only.
+
 ## Limitations to preserve
 
 - There are no sender binaries, user models, or target-Hardware measurements in the repository.
@@ -255,4 +268,3 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 - The app can only be called Windows-tested after a Windows CI or device build and runtime check.
 - `scripts/smoke-windows-app.ps1` has not been executed locally; run it on a Windows machine for authoritative end-to-end validation.
 - Except for `design-review/receiver-visual-qa-980x680.png`, the PNGs in `design-review/` are historical captures of earlier layouts. The current screenshot verifies layout only and shows a UDP bind error; Preview fit, overlay mapping, and HiDPI geometry have automated unit coverage, while Windows visual behavior remains unverified.
-

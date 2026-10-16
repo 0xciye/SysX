@@ -80,9 +80,11 @@ pub struct ReceiverService {
     /// Latest Medius/Ferrum status reported by the native host
     /// (`device_status` command); forwarded to the monitor page in `state`.
     device: Arc<Mutex<Value>>,
-    /// Open `role=monitor` WebSocket clients. The native host exits when the
-    /// monitor window has been closed.
+    /// Open `role=monitor` WebSocket clients.
     monitor_clients: AtomicUsize,
+    /// Open configuration WebSocket clients keep the backend/config server
+    /// alive after the monitor window is closed.
+    config_clients: AtomicUsize,
     /// Published-at timestamp of the newest processed frame; changes once per
     /// frame so each preview socket forwards every input frame.
     preview_rx: tokio::sync::watch::Receiver<u64>,
@@ -180,6 +182,7 @@ impl ReceiverService {
                     .ok()
                     .is_some_and(|device| trigger_held(&device, &settings.trigger_button));
                 Some(MovementRuntimeSettings {
+                    motion_enabled: settings.motion_enabled,
                     trigger_held,
                     sens: settings.sens,
                     offset_x: settings.offset_x,
@@ -254,6 +257,7 @@ impl ReceiverService {
             session_id,
             device,
             monitor_clients: AtomicUsize::new(0),
+            config_clients: AtomicUsize::new(0),
             preview_rx,
         });
         Self::start_reader(&service);
@@ -319,9 +323,10 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
-            "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
+            "motion_enabled":settings.motion_enabled, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
+            "auto":settings.auto,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
             "active_model_id":active_model_id,
             "expected_source_resolution":expected_source_resolution,
@@ -330,7 +335,8 @@ impl ReceiverService {
             "transport_dropped_frames":transport.dropped_frames + transport.expired_frames, "invalid_packets":transport.invalid_packets,
             "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
             "device":self.device.lock().map(|device| device.clone()).unwrap_or_else(|_| missing_device()),
-            "monitor_clients":self.monitor_clients.load(Ordering::Relaxed)
+            "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
+            "config_clients":self.config_clients.load(Ordering::Relaxed)
         })
     }
 
@@ -563,16 +569,32 @@ impl ReceiverService {
                     .recoil = recoil;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
+            "set_auto" => {
+                let auto: crate::config::AutoSettings = serde_json::from_value(
+                    command
+                        .get("settings")
+                        .cloned()
+                        .ok_or("Auto settings are required")?,
+                )
+                .map_err(|_| "invalid Auto settings")?;
+                auto.validate()?;
+                self.settings
+                    .lock()
+                    .map_err(|_| "settings lock poisoned")?
+                    .auto = auto;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
             "set_movement_calibration" => {
                 // In-game sensitivity only: DPI does not change injected counts.
                 let sens = finite_number(command.get("sens"), "sens must be 0.01..10")?;
                 if !(0.01..=10.0).contains(&sens) {
                     return Err("sens must be 0.01..10".into());
                 }
-                self.settings
-                    .lock()
-                    .map_err(|_| "settings lock poisoned")?
-                    .sens = sens;
+                let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                settings.sens = sens;
+                if let Some(enabled) = command.get("motion_enabled").and_then(Value::as_bool) {
+                    settings.motion_enabled = enabled;
+                }
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_smoothing_config" => {
@@ -906,6 +928,14 @@ impl Drop for MonitorGuard {
     }
 }
 
+struct ConfigGuard(Arc<ReceiverService>);
+
+impl Drop for ConfigGuard {
+    fn drop(&mut self) {
+        self.0.config_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn websocket_route(
     State(state): State<WebSocketState>,
     Query(query): Query<WsQuery>,
@@ -956,6 +986,10 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
     let _monitor = (role == ClientRole::Monitor).then(|| {
         service.monitor_clients.fetch_add(1, Ordering::Relaxed);
         MonitorGuard(Arc::clone(&service))
+    });
+    let _config = (role == ClientRole::Config).then(|| {
+        service.config_clients.fetch_add(1, Ordering::Relaxed);
+        ConfigGuard(Arc::clone(&service))
     });
     let initial_state = service.state();
     if send_text(&mut socket, initial_state.clone()).await.is_err() {
@@ -1369,6 +1403,33 @@ mod tests {
         attach_request_id(&mut error_event, Some(json!("apply-8")));
         assert_eq!(error_event["request_id"], "apply-8");
         assert_eq!(service.state()["recoil"]["recoilEnabled"], true);
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn apply_settings_keeps_auto_trigger_and_fov_separate() {
+        let (service, data_dir) = test_service("apply-auto-settings");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        let response = service
+            .dispatch(json!({
+                "version":1,
+                "type":"apply_settings",
+                "commands":[{
+                    "version":1,
+                    "type":"set_auto",
+                    "settings":{"triggerButton":"m4","fovDegrees":72,"delayMs":100,"cooldownMs":250,"sleepMs":10}
+                }]
+            }))
+            .expect("apply Auto settings");
+        assert_eq!(response["state"]["auto"]["triggerButton"], "m4");
+        assert_eq!(response["state"]["auto"]["fovDegrees"], 72);
+        assert_eq!(response["state"]["auto"]["delayMs"], 100);
+        assert_eq!(response["state"]["auto"]["cooldownMs"], 250);
+        assert_eq!(response["state"]["auto"]["sleepMs"], 10);
+        assert_eq!(response["state"]["trigger_button"], "right");
+        assert_eq!(response["state"]["fov_degrees"], 36);
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);

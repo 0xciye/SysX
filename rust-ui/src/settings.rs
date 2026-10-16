@@ -50,6 +50,45 @@ impl RecoilSettings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AutoSettings {
+    pub enabled: bool,
+    pub trigger_button: String,
+    pub fov_degrees: u16,
+    pub delay_ms: u32,
+    pub cooldown_ms: u32,
+    pub sleep_ms: u32,
+}
+
+impl Default for AutoSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_button: "right".into(),
+            fov_degrees: 36,
+            delay_ms: 0,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        }
+    }
+}
+
+impl AutoSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+            return Err("Choose Right, Middle, M4, or M5 for the Auto trigger key.");
+        }
+        if !(1..=360).contains(&self.fov_degrees) {
+            return Err("Auto FOV must be from 1 to 360 degrees.");
+        }
+        if self.delay_ms > 60_000 || self.cooldown_ms > 60_000 || self.sleep_ms > 60_000 {
+            return Err("Auto delay, cooldown, and sleep must be from 0 to 60000 ms.");
+        }
+        Ok(())
+    }
+}
+
 pub fn parse_recoil_levels(value: &str) -> Result<Vec<i32>, &'static str> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
@@ -83,6 +122,7 @@ pub fn format_recoil_levels(levels: &[i32]) -> String {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
+    pub motion_enabled: bool,
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
@@ -110,11 +150,13 @@ pub struct AppSettings {
     pub compute_target: String,
     #[serde(rename = "recoil", alias = "nativeMotion", alias = "native_motion")]
     pub recoil: RecoilSettings,
+    pub auto: AutoSettings,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            motion_enabled: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,
@@ -139,6 +181,7 @@ impl Default for AppSettings {
             model_precision: "fp16".into(),
             compute_target: "cpu".into(),
             recoil: RecoilSettings::default(),
+            auto: AutoSettings::default(),
         }
     }
 }
@@ -235,13 +278,21 @@ impl AppSettings {
             return Err("Crop resolution must be from 1 to 8192 pixels.");
         }
         self.recoil.validate()?;
+        self.auto.validate()?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_recoil_levels, parse_recoil_levels};
+    use super::{format_recoil_levels, parse_recoil_levels, AppSettings, AutoSettings};
+
+    #[test]
+    fn auto_defaults_are_valid_and_separate_from_motion_settings() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.auto, AutoSettings::default());
+        assert!(settings.auto.validate().is_ok());
+    }
 
     #[test]
     fn recoil_levels_parse_and_format_as_signed_integer_lists() {

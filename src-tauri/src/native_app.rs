@@ -1,11 +1,13 @@
 //! Native SysX host. It owns everything that must stay native â€” the embedded
 //! backend process, Medius/Ferrum device I/O and movement output â€” and shows
 //! the receiver UI as the web monitor page (`/monitor.html`) in a chromeless
-//! browser app window. The host exits once that window has been closed.
+//! browser app window. The host exits once the monitor and configuration
+//! clients have both closed.
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,13 +16,13 @@ use tungstenite::{connect, Message};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_runtime.rs"));
 
-/// Grace period for a monitor page reload before the host shuts down.
+/// Grace period for monitor/configuration page reloads before the host shuts down.
 const MONITOR_CLOSE_GRACE: Duration = Duration::from_secs(3);
 /// How long to wait for the monitor window to connect at all.
 const MONITOR_FIRST_CONNECT: Duration = Duration::from_secs(60);
 
 enum HostEvent {
-    MonitorClients(usize),
+    ClientCounts { monitor: usize, config: usize },
     Disconnected,
 }
 
@@ -119,13 +121,26 @@ pub fn run() {
     open_config_page(&format!("http://127.0.0.1:{config_port}/config.html"));
 
     // Preferred: the receiver as a native SysX window (WebView2). Closing it
-    // quits SysX. Without the WebView2 runtime, fall back to an Edge app window.
+    // leaves the backend alive while the browser config page is open. Without
+    // the WebView2 runtime, fall back to an Edge app window.
     if wry::webview_version().is_ok() {
+        let ui_counts = Arc::new(Mutex::new((0_usize, 0_usize)));
+        let backend_disconnected = Arc::new(AtomicBool::new(false));
+        let counts_for_events = Arc::clone(&ui_counts);
+        let disconnected_for_events = Arc::clone(&backend_disconnected);
         let (gone_tx, gone_rx) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(event) = event_rx.recv() {
-                if matches!(event, HostEvent::Disconnected) {
-                    break;
+                match event {
+                    HostEvent::ClientCounts { monitor, config } => {
+                        if let Ok(mut counts) = counts_for_events.lock() {
+                            *counts = (monitor, config);
+                        }
+                    }
+                    HostEvent::Disconnected => {
+                        disconnected_for_events.store(true, Ordering::Release);
+                        break;
+                    }
                 }
             }
             let _ = gone_tx.send(());
@@ -133,6 +148,16 @@ pub fn run() {
         if let Err(gone_rx) = crate::monitor_window::run(config_port, &data_dir, gone_rx) {
             open_monitor_window(config_port, &data_dir);
             let _ = gone_rx.recv();
+        }
+        if !backend_disconnected.load(Ordering::Acquire) {
+            let mut lifecycle = MonitorLifecycle::new(Instant::now());
+            loop {
+                let counts = ui_counts.lock().map(|value| *value).ok();
+                if lifecycle.should_exit(counts, Instant::now()) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
         }
         crate::single_instance::clear_config_port(&data_dir);
         drop(runtime);
@@ -142,7 +167,7 @@ pub fn run() {
     let mut lifecycle = MonitorLifecycle::new(Instant::now());
     loop {
         let count = match event_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(HostEvent::MonitorClients(count)) => Some(count),
+            Ok(HostEvent::ClientCounts { monitor, config }) => Some((monitor, config)),
             Ok(HostEvent::Disconnected) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => None,
         };
@@ -155,13 +180,14 @@ pub fn run() {
     drop(runtime);
 }
 
-/// Decides when the receiver window is gone: the host keeps running while at
-/// least one monitor page is connected, tolerates a short reload gap, and
-/// gives up if no monitor ever connects.
+/// Decides when the UI clients are gone: the host keeps running while at least
+/// one monitor or configuration page is connected, tolerates a short reload
+/// gap, and gives up if neither client ever connects.
 struct MonitorLifecycle {
     started: Instant,
     seen: bool,
     count: usize,
+    config_count: usize,
     zero_since: Option<Instant>,
 }
 
@@ -171,13 +197,18 @@ impl MonitorLifecycle {
             started: now,
             seen: false,
             count: 0,
+            config_count: 0,
             zero_since: None,
         }
     }
 
-    fn should_exit(&mut self, count: Option<usize>, now: Instant) -> bool {
-        if let Some(count) = count {
+    fn should_exit(&mut self, counts: Option<(usize, usize)>, now: Instant) -> bool {
+        if let Some((count, config_count)) = counts {
             self.count = count;
+            self.config_count = config_count;
+        }
+        if self.config_count > 0 {
+            return false;
         }
         if self.count > 0 {
             self.seen = true;
@@ -286,8 +317,11 @@ fn start_host_client(
                 }
                 match socket.read() {
                     Ok(Message::Text(text)) => {
-                        if let Some(count) = monitor_clients(&text) {
-                            let _ = events.send(HostEvent::MonitorClients(count));
+                        if let Some(counts) = client_counts(&text) {
+                            let _ = events.send(HostEvent::ClientCounts {
+                                monitor: counts.0,
+                                config: counts.1,
+                            });
                         }
                     }
                     Ok(Message::Close(_)) => break,
@@ -319,12 +353,14 @@ fn device_command(device: &DeviceStatus) -> serde_json::Value {
     })
 }
 
-fn monitor_clients(text: &str) -> Option<usize> {
+fn client_counts(text: &str) -> Option<(usize, usize)> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     if value.get("event")?.as_str()? != "state" {
         return None;
     }
-    usize::try_from(value.get("monitor_clients")?.as_u64()?).ok()
+    let monitor = usize::try_from(value.get("monitor_clients")?.as_u64()?).ok()?;
+    let config = usize::try_from(value.get("config_clients")?.as_u64()?).ok()?;
+    Some((monitor, config))
 }
 
 const FERRUM_LEGACY_BAUD_RATE: u32 = 115_200;
@@ -497,12 +533,13 @@ fn monitor_medius(
                         .any(|usage| usage.id == button)
                 },
             );
+            let motion_active = crate::movement::should_apply_target(&target, held);
             let recoil = vertical_adjustment.sample(
-                held && target.target_valid,
+                motion_active,
                 &target.recoil,
                 std::time::Instant::now(),
             );
-            if held && target.target_valid {
+            if motion_active {
                 let (dx, dy) = target.device_delta(recoil);
                 if dx != 0 || dy != 0 {
                     match serial.submit_medius_move(dx, dy) {
@@ -653,12 +690,13 @@ fn monitor_ferrum(
         if let Some(target) = crate::movement::take_target(movement_state) {
             let held = crate::movement::trigger_button_index(&target.trigger_button)
                 .is_some_and(|button| last_mask & (1 << button) != 0);
+            let motion_active = crate::movement::should_apply_target(&target, held);
             let recoil = vertical_adjustment.sample(
-                held && target.target_valid,
+                motion_active,
                 &target.recoil,
                 std::time::Instant::now(),
             );
-            if held && target.target_valid {
+            if motion_active {
                 let (dx, dy) = target.device_delta(recoil);
                 if dx != 0 || dy != 0 {
                     match serial.submit_move(dx.into(), dy.into()) {
@@ -846,11 +884,11 @@ mod tests {
         let start = Instant::now();
         let mut lifecycle = MonitorLifecycle::new(start);
         assert!(!lifecycle.should_exit(None, start + Duration::from_secs(30)));
-        assert!(!lifecycle.should_exit(Some(1), start + Duration::from_secs(31)));
+        assert!(!lifecycle.should_exit(Some((1, 0)), start + Duration::from_secs(31)));
         // Reload: the page disconnects and reconnects inside the grace period.
-        assert!(!lifecycle.should_exit(Some(0), start + Duration::from_secs(40)));
-        assert!(!lifecycle.should_exit(Some(1), start + Duration::from_secs(41)));
-        assert!(!lifecycle.should_exit(Some(0), start + Duration::from_secs(50)));
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(40)));
+        assert!(!lifecycle.should_exit(Some((1, 0)), start + Duration::from_secs(41)));
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(50)));
         assert!(!lifecycle.should_exit(None, start + Duration::from_millis(52_900)));
         assert!(lifecycle.should_exit(None, start + Duration::from_secs(53)));
     }
@@ -859,8 +897,17 @@ mod tests {
     fn host_gives_up_when_no_monitor_ever_connects() {
         let start = Instant::now();
         let mut lifecycle = MonitorLifecycle::new(start);
-        assert!(!lifecycle.should_exit(Some(0), start + Duration::from_secs(59)));
+        assert!(!lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(59)));
         assert!(lifecycle.should_exit(None, start + MONITOR_FIRST_CONNECT));
+    }
+
+    #[test]
+    fn config_client_keeps_backend_alive_after_monitor_closes() {
+        let start = Instant::now();
+        let mut lifecycle = MonitorLifecycle::new(start);
+        assert!(!lifecycle.should_exit(Some((1, 1)), start + Duration::from_secs(1)));
+        assert!(!lifecycle.should_exit(Some((0, 1)), start + Duration::from_secs(120)));
+        assert!(lifecycle.should_exit(Some((0, 0)), start + Duration::from_secs(124)));
     }
 
     #[test]
@@ -878,13 +925,13 @@ mod tests {
             serde_json::json!([true, false, null, false, false])
         );
         assert_eq!(
-            monitor_clients(r#"{"event":"state","monitor_clients":2}"#),
-            Some(2)
+            client_counts(r#"{"event":"state","monitor_clients":2,"config_clients":1}"#),
+            Some((2, 1))
         );
         assert_eq!(
-            monitor_clients(r#"{"event":"ack","monitor_clients":2}"#),
+            client_counts(r#"{"event":"ack","monitor_clients":2,"config_clients":1}"#),
             None
         );
-        assert_eq!(monitor_clients("not json"), None);
+        assert_eq!(client_counts("not json"), None);
     }
 }

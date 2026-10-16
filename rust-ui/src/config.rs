@@ -222,11 +222,13 @@ pub fn ConfigApp() -> impl IntoView {
                                 "Changes applied successfully.".into()
                             },
                         );
-                        apply_pending_id.set(request_id.clone());
+                        if connected {
+                            apply_pending_id.set(request_id.clone());
+                        }
                         apply_message.set(if connected {
                             "Applying changes…".into()
                         } else {
-                            "Settings saved. Waiting for the backend to reconnect.".into()
+                            "Settings saved locally. Backend will apply them when connected.".into()
                         });
                         if !send_settings_commands(sender, &next, has_model, &request_id) {
                             apply_pending_id.set(String::new());
@@ -234,6 +236,16 @@ pub fn ConfigApp() -> impl IntoView {
                             apply_message.set(
                                 "Settings saved. Backend will apply them when connected.".into(),
                             );
+                        }
+                        if !connected {
+                            let epoch = apply_epoch.get_untracked();
+                            spawn_local(async move {
+                                TimeoutFuture::new(3000).await;
+                                if apply_epoch.get_untracked() == epoch {
+                                    apply_message.set(String::new());
+                                    apply_success_message.set(String::new());
+                                }
+                            });
                         }
                     } else {
                         apply_message
@@ -289,9 +301,9 @@ pub fn ConfigApp() -> impl IntoView {
                     <div class="page-heading">
                         <div class="page-title">
                             <h1>"Settings"</h1>
-                            <p class="page-subtitle">"Tune capture, detection, targeting, and movement for this receiver."</p>
                         </div>
                         <div class="apply-controls">
+                            <label class="global-toggle"><span>{move || if settings.get().motion_enabled && settings.get().auto.enabled && settings.get().recoil.recoil_enabled { "All features enabled" } else { "All features disabled" }}</span><input aria-label="Enable all features" type="checkbox" prop:checked=move || settings.get().motion_enabled && settings.get().auto.enabled && settings.get().recoil.recoil_enabled on:change=move |_| settings.update(|value| { let enabled = !(value.motion_enabled && value.auto.enabled && value.recoil.recoil_enabled); value.motion_enabled = enabled; value.auto.enabled = enabled; value.recoil.recoil_enabled = enabled; })/></label>
                             <button type="button" class="apply-button" on:click=apply_changes disabled=move || !apply_pending_id.get().is_empty() || (!settings_changed() && apply_message.get().is_empty())>"Apply Changes"</button>
                             <Show when=move || !apply_message.get().is_empty()>
                                 <span class=move || format!("apply-message{}", if apply_message.get().starts_with("Enter") || apply_message.get().starts_with("Could not") || apply_message.get().starts_with("Check") { " error" } else { "" }) role="status">{apply_message}</span>
@@ -300,9 +312,9 @@ pub fn ConfigApp() -> impl IntoView {
                     </div>
                     <div class="general-page config-general">
                         <div class="settings-panel general-settings">
+                            <section class="config-card" aria-labelledby="settings-section-title">
                             <div class="config-section-heading">
-                                <div><span class="config-section-kicker">"01 / Settings"</span><h2>"Connection & canvas"</h2></div>
-                                <p>"Choose how SysX receives and displays the source."</p>
+                                <div><span class="config-section-kicker">"05"</span><h2 id="settings-section-title">"Settings"</h2></div>
                             </div>
                             <div class="settings-row preview-options-row">
                                 <div class="setting-description"><h2>"Preview"</h2></div>
@@ -329,9 +341,10 @@ pub fn ConfigApp() -> impl IntoView {
                                     </label>
                                 </div>
                             </div>
+                            </section>
+                            <section class="config-card" aria-labelledby="main-section-title">
                             <div class="config-section-heading">
-                                <div><span class="config-section-kicker">"02 / Main"</span><h2>"Detection engine"</h2></div>
-                                <p>"Select the target source and model pipeline."</p>
+                                <div><span class="config-section-kicker">"01"</span><h2 id="main-section-title">"Main"</h2></div>
                             </div>
                             <div class="settings-row">
                                 <div class="setting-description"><h2>"Detection Engine"</h2></div>
@@ -417,17 +430,46 @@ pub fn ConfigApp() -> impl IntoView {
                                     </Show>
                                 </div>
                             </div>
+                            <div class="settings-row module-switch-row">
+                                <div class="setting-description"><h2>"Modules"</h2></div>
+                                <div class="settings-fields">
+                                    <div class="module-toggles settings-wide" role="group" aria-label="Module switches">
+                                        <label class="module-toggle">
+                                            <span class="module-toggle-name">"Motion"</span>
+                                            <span class="module-toggle-state">{move || if settings.get().motion_enabled { "On" } else { "Off" }}</span>
+                                            <input aria-label="Enable motion" type="checkbox" prop:checked=move || settings.get().motion_enabled on:change=move |_| settings.update(|value| value.motion_enabled = !value.motion_enabled)/>
+                                            <span class=move || format!("switch{}", if settings.get().motion_enabled { " is-on" } else { "" }) aria-hidden="true"><span/></span>
+                                        </label>
+                                        <label class="module-toggle">
+                                            <span class="module-toggle-name">"Auto"</span>
+                                            <span class="module-toggle-state">{move || if settings.get().auto.enabled { "On" } else { "Off" }}</span>
+                                            <input aria-label="Enable auto" type="checkbox" prop:checked=move || settings.get().auto.enabled on:change=move |_| settings.update(|value| value.auto.enabled = !value.auto.enabled)/>
+                                            <span class=move || format!("switch{}", if settings.get().auto.enabled { " is-on" } else { "" }) aria-hidden="true"><span/></span>
+                                        </label>
+                                        <label class="module-toggle">
+                                            <span class="module-toggle-name">"Recoil"</span>
+                                            <span class="module-toggle-state">{move || if settings.get().recoil.recoil_enabled { "On" } else { "Off" }}</span>
+                                            <input aria-label="Enable recoil" type="checkbox" prop:checked=move || settings.get().recoil.recoil_enabled on:change=move |_| settings.update(|value| value.recoil.recoil_enabled = !value.recoil.recoil_enabled)/>
+                                            <span class=move || format!("switch{}", if settings.get().recoil.recoil_enabled { " is-on" } else { "" }) aria-hidden="true"><span/></span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                            </section>
+                            <section class="config-card" aria-labelledby="motion-section-title">
                             <div class="config-section-heading">
-                                <div><span class="config-section-kicker">"03 / Motion"</span><h2>"Aim behavior"</h2></div>
-                                <p>"Shape how the cursor follows a live target."</p>
+                                <div><span class="config-section-kicker">"02"</span><h2 id="motion-section-title">"Motion"</h2></div>
                             </div>
                             <div class="settings-row target-offset-row">
                                 <div class="setting-description"><h2>"Target Offset"</h2></div>
                                 <div class="settings-fields target-offset-fields">
-                                    <label class="field settings-wide"><span class="field-label">"Trigger button"</span>
+                                    <label class="field"><span class="field-label">"Trigger button"</span>
                                         <select prop:value=move || settings.get().trigger_button on:change=move |event| settings.update(|value| value.trigger_button = event_target_value(&event))>
                                             <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
                                         </select>
+                                    </label>
+                                    <label class="field"><span class="field-label">"FOV (degrees)"</span>
+                                        <input class="text-input" type="number" min="1" max="360" step="1" inputmode="numeric" prop:value=move || settings.get().fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.fov_degrees = value) } aria-label="FOV size in degrees"/>
                                     </label>
                                     <label class="field"><span class="field-label">"X Offset (px)"</span><input class="text-input" type="number" step="1" prop:value=offset_x_draft on:input=move |event| { offset_x_draft.set(event_target_value(&event)); apply_message.set(String::new()); }/></label>
                                     <label class="field"><span class="field-label">"Y Offset (px)"</span><input class="text-input" type="number" step="1" prop:value=offset_y_draft on:input=move |event| { offset_y_draft.set(event_target_value(&event)); apply_message.set(String::new()); }/></label>
@@ -453,42 +495,64 @@ pub fn ConfigApp() -> impl IntoView {
                                     <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max))}</output></span>
                                         <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Y Max smoothing"/>
                                     </label>
-                                    <p class="smoothing-hint settings-wide">"1 = no smoothing, 50 = strongest (about the last N frames averaged). Each new target draws a strength between Min and Max per axis. Smoothing steadies the target's own motion only, so it does not make the aim overshoot."</p>
                                 </div>
                             </div>
                             <div class="settings-row">
                                 <div class="setting-description"><h2>"Movement Calibration"</h2></div>
                                 <div class="settings-fields">
                                     <label class="field"><span class="field-label">"Sensitivity"</span><input class="text-input" type="number" min="0.01" max="10" step="0.001" prop:value=sens_draft on:input=move |event| sens_draft.set(event_target_value(&event)) aria-label="Mouse sensitivity"/></label>
-                                    <p class="smoothing-hint settings-wide">"Your in-game sensitivity. SysX measures how far one count turns the view and saves it per sensitivity; mouse DPI does not affect sent counts."</p>
                                 </div>
                             </div>
-                            <div class="settings-row fov-settings-row">
-                                <div class="setting-description"><h2>"FOV"</h2></div>
-                                <div class="settings-fields">
-                                    <label class="field fov-size settings-wide"><span class="range-heading"><span class="field-label">"Size"</span><output>{move || format!("{}°", settings.get().fov_degrees)}</output></span>
-                                        <input type="range" min="1" max="360" step="1" prop:value=move || settings.get().fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.fov_degrees = value) } aria-label="FOV size in degrees"/>
+                            </section>
+                            <section class="config-card" aria-labelledby="auto-section-title">
+                            <div class="config-section-heading">
+                                <div><span class="config-section-kicker">"03"</span><h2 id="auto-section-title">"Auto"</h2></div>
+                            </div>
+                            <div class="settings-row">
+                                <div class="setting-description"><h2>"Targeting"</h2></div>
+                                <div class="settings-fields auto-fields">
+                                    <label class="field"><span class="field-label">"FOV (degrees)"</span>
+                                        <input class="text-input" type="number" min="1" max="360" step="1" inputmode="numeric" prop:value=move || settings.get().auto.fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.fov_degrees = value) } aria-label="Auto FOV size in degrees"/>
+                                    </label>
+                                    <label class="field"><span class="field-label">"Trigger key"</span>
+                                        <select prop:value=move || settings.get().auto.trigger_button on:change=move |event| settings.update(|value| value.auto.trigger_button = event_target_value(&event)) aria-label="Auto trigger key">
+                                            <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
+                                        </select>
                                     </label>
                                 </div>
                             </div>
+                            <div class="settings-row auto-timing-row">
+                                <div class="setting-description"><h2>"Timing"</h2></div>
+                                <div class="settings-fields auto-timing-fields">
+                                    <label class="field"><span class="field-label">"Delay (ms)"</span>
+                                        <input class="text-input" type="number" min="0" max="60000" step="1" inputmode="numeric" prop:value=move || settings.get().auto.delay_ms.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.delay_ms = value) } aria-label="Auto delay in milliseconds"/>
+                                    </label>
+                                    <label class="field"><span class="field-label">"Cooldown (ms)"</span>
+                                        <input class="text-input" type="number" min="0" max="60000" step="1" inputmode="numeric" prop:value=move || settings.get().auto.cooldown_ms.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.cooldown_ms = value) } aria-label="Auto cooldown in milliseconds"/>
+                                    </label>
+                                    <label class="field"><span class="field-label">"Sleep (ms)"</span>
+                                        <input class="text-input" type="number" min="0" max="60000" step="1" inputmode="numeric" prop:value=move || settings.get().auto.sleep_ms.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.sleep_ms = value) } aria-label="Auto sleep in milliseconds"/>
+                                    </label>
+                                </div>
+                            </div>
+                            </section>
+                            <section class="config-card" aria-labelledby="recoil-section-title">
                             <div class="config-section-heading">
-                                <div><span class="config-section-kicker">"04 / Recoil"</span><h2>"Vertical adjustment"</h2></div>
-                                <p>"Apply a timed Y-axis profile while the trigger is held."</p>
+                                <div><span class="config-section-kicker">"04"</span><h2 id="recoil-section-title">"Recoil"</h2></div>
                             </div>
                             <div class="settings-row">
                                 <div class="setting-description"><h2>"Vertical Adjustment"</h2></div>
                                 <div class="settings-fields">
-                                    <label class="motion-toggle settings-wide"><span>"Enable sampled Y adjustment"</span><input type="checkbox" prop:checked=move || settings.get().recoil.recoil_enabled on:change=move |_| settings.update(|value| value.recoil.recoil_enabled = !value.recoil.recoil_enabled)/></label>
+                                    <label class="field smooth-control settings-wide recoil-strength"><span class="range-heading"><span class="field-label">"Strength (%)"</span><output>{move || settings.get().recoil.recoil_percentage}</output></span>
+                                        <input type="range" min="0" max="100" step="1" prop:value=move || settings.get().recoil.recoil_percentage.to_string() on:input=move |event| { if let Ok(value) = event_target_value(&event).parse::<u8>() { settings.update(|settings| settings.recoil.recoil_percentage = value) } } aria-label="Vertical adjustment strength"/>
+                                    </label>
                                     <label class="field settings-wide"><span class="field-label">"Levels (comma-separated)"</span><input class="text-input" type="text" prop:value=recoil_levels_draft on:input=move |event| recoil_levels_draft.set(event_target_value(&event)) aria-label="Vertical adjustment levels"/></label>
                                     <label class="field"><span class="field-label">"Start delay (ms)"</span><input class="text-input" type="number" min="0" max="60000" step="1" prop:value=move || settings.get().recoil.recoil_start_delay_ms.to_string() on:input=move |event| { if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.recoil.recoil_start_delay_ms = value) } }/></label>
                                     <label class="field"><span class="field-label">"Time per level (ms)"</span><input class="text-input" type="number" min="0" max="5000" step="1" prop:value=move || settings.get().recoil.recoil_level_duration_ms.to_string() on:input=move |event| { if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.recoil.recoil_level_duration_ms = value) } }/></label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Strength (%)"</span><output>{move || settings.get().recoil.recoil_percentage}</output></span>
-                                        <input type="range" min="0" max="100" step="1" prop:value=move || settings.get().recoil.recoil_percentage.to_string() on:input=move |event| { if let Ok(value) = event_target_value(&event).parse::<u8>() { settings.update(|settings| settings.recoil.recoil_percentage = value) } } aria-label="Vertical adjustment strength"/>
-                                    </label>
-                                    <label class="motion-toggle"><span>"Allow early resampling"</span><input type="checkbox" prop:checked=move || settings.get().recoil.recoil_allow_early_resample on:change=move |_| settings.update(|value| value.recoil.recoil_allow_early_resample = !value.recoil.recoil_allow_early_resample)/></label>
-                                    <p class="smoothing-hint settings-wide">"The selected physical trigger starts the elapsed-time profile. Values are sampled by level and added to the Y delta."</p>
                                 </div>
                             </div>
+                            </section>
+
                         </div>
                     </div>
                     <Show when=move || !backend_error.get().is_empty()>
@@ -511,6 +575,7 @@ fn copy_state_to_settings(
     recoil_levels: RwSignal<String>,
 ) {
     settings.update(|value| {
+        value.motion_enabled = state.motion_enabled;
         value.strategy = state.mode.clone();
         value.fov_degrees = state.fov_degrees.clamp(1, 360);
         value.offset_x = state.target_offset_x;
@@ -522,6 +587,7 @@ fn copy_state_to_settings(
         value.smoothing_y_max = state.smoothing_y_max;
         value.sens = state.sens;
         value.recoil = state.recoil.clone();
+        value.auto = state.auto.clone();
         value.scale = state.preview_scale.clone();
         value.crop_resolution = state.crop_resolution;
         value.pixel_color = state.pixel_color.clone();
@@ -584,12 +650,13 @@ fn send_settings_commands(
         ),
         command(
             "set_movement_calibration",
-            serde_json::json!({"sens":settings.sens}),
+            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled}),
         ),
         command(
             "set_recoil",
             serde_json::json!({"settings":settings.recoil}),
         ),
+        command("set_auto", serde_json::json!({"settings":settings.auto})),
         command(
             "set_crop_resolution",
             serde_json::json!({"resolution":settings.crop_resolution}),

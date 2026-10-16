@@ -971,6 +971,8 @@ pub struct MovementEvent {
     pub target_valid: bool,
     pub dx: i64,
     pub dy: i64,
+    #[serde(default)]
+    pub motion_enabled: bool,
     pub trigger_button: String,
     pub timestamp_ms: u64,
     pub recoil: RecoilSettings,
@@ -978,6 +980,7 @@ pub struct MovementEvent {
 
 #[derive(Clone, Debug)]
 pub struct MovementRuntimeSettings {
+    pub motion_enabled: bool,
     pub sens: f64,
     pub offset_x: f64,
     pub offset_y: f64,
@@ -1148,6 +1151,25 @@ impl MovementTicker {
                             thread::sleep(Duration::from_millis(4));
                             continue;
                         };
+                        if !runtime.motion_enabled {
+                            controller.reset();
+                            if !sent_invalid {
+                                on_event(MovementEvent {
+                                    event: "movement_target".into(),
+                                    frame_id: sample.frame_id,
+                                    target_valid: false,
+                                    dx: 0,
+                                    dy: 0,
+                                    motion_enabled: false,
+                                    trigger_button: runtime.trigger_button,
+                                    timestamp_ms: unix_ms(),
+                                    recoil: runtime.recoil,
+                                });
+                                sent_invalid = true;
+                            }
+                            thread::sleep(Duration::from_millis(4));
+                            continue;
+                        }
                         if sample.target.is_none() {
                             controller.reset();
                             if !sent_invalid {
@@ -1157,6 +1179,7 @@ impl MovementTicker {
                                     target_valid: false,
                                     dx: 0,
                                     dy: 0,
+                                    motion_enabled: runtime.motion_enabled,
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
@@ -1195,6 +1218,7 @@ impl MovementTicker {
                             target_valid: sample.target.is_some(),
                             dx,
                             dy,
+                            motion_enabled: runtime.motion_enabled,
                             trigger_button: runtime.trigger_button,
                             timestamp_ms: unix_ms(),
                             recoil: runtime.recoil,
@@ -1209,6 +1233,7 @@ impl MovementTicker {
                                 target_valid: false,
                                 dx: 0,
                                 dy: 0,
+                                motion_enabled: runtime.motion_enabled,
                                 trigger_button: runtime.trigger_button,
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
@@ -1426,6 +1451,7 @@ mod tests {
             target_valid: true,
             dx,
             dy,
+            motion_enabled: true,
             trigger_button: trigger_button.into(),
             timestamp_ms,
             recoil: RecoilSettings::default(),

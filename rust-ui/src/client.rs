@@ -5,9 +5,12 @@ use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Uint8Array};
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::VecDeque;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{Blob, UrlSearchParams};
+
+const SETTINGS_CACHE_KEY: &str = "sysx.settings.v1";
 
 pub fn command_channel() -> (UnboundedSender<String>, UnboundedReceiver<String>) {
     unbounded()
@@ -174,32 +177,57 @@ async fn connection_info() -> Result<ConnectionInfo, String> {
         .map_err(|error| error.to_string())
 }
 
-pub async fn get_local_settings<T: serde::de::DeserializeOwned>() -> Result<T, String> {
-    let response = Request::get("/api/settings")
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.ok() {
-        return Err("Could not load saved settings".into());
-    }
-    response
-        .json::<T>()
-        .await
-        .map_err(|error| error.to_string())
+pub async fn get_local_settings<T: DeserializeOwned>() -> Result<T, String> {
+    let api_error = match Request::get("/api/settings").send().await {
+        Ok(response) if response.ok() => {
+            return response
+                .json::<T>()
+                .await
+                .map_err(|error| error.to_string());
+        }
+        Ok(_) => "Could not load saved settings".to_string(),
+        Err(error) => error.to_string(),
+    };
+    read_cached_settings().ok_or_else(|| {
+        format!(
+            "Could not load saved settings: {api_error}. Start SysX once to create the local settings service."
+        )
+    })
 }
 
-pub async fn save_local_settings<T: serde::Serialize>(settings: &T) -> Result<(), String> {
-    let response = Request::put("/api/settings")
-        .json(settings)
+pub async fn save_local_settings<T: Serialize>(settings: &T) -> Result<(), String> {
+    let payload = serde_json::to_string(settings).map_err(|error| error.to_string())?;
+    let api_result = Request::put("/api/settings")
+        .header("content-type", "application/json")
+        .body(payload.clone())
         .map_err(|error| error.to_string())?
         .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if response.ok() {
-        Ok(())
-    } else {
-        Err("Local settings could not be saved".into())
+        .await;
+    if matches!(api_result, Ok(ref response) if response.ok()) {
+        let _ = write_cached_settings(&payload);
+        return Ok(());
     }
+    write_cached_settings(&payload).map_err(|error| {
+        format!(
+            "Local settings could not be saved while the configuration service is offline: {error}"
+        )
+    })
+}
+
+fn settings_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+fn read_cached_settings<T: DeserializeOwned>() -> Option<T> {
+    let payload = settings_storage()?.get_item(SETTINGS_CACHE_KEY).ok()??;
+    serde_json::from_str(&payload).ok()
+}
+
+fn write_cached_settings(payload: &str) -> Result<(), String> {
+    settings_storage()
+        .ok_or_else(|| "browser storage is unavailable".to_string())?
+        .set_item(SETTINGS_CACHE_KEY, payload)
+        .map_err(|_| "browser storage rejected the settings".to_string())
 }
 
 /// The native host opens the receiver window at `/monitor.html`; every other

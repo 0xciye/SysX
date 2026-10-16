@@ -58,7 +58,47 @@ impl RecoilSettings {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
+pub struct AutoSettings {
+    pub enabled: bool,
+    pub trigger_button: String,
+    pub fov_degrees: u16,
+    pub delay_ms: u32,
+    pub cooldown_ms: u32,
+    pub sleep_ms: u32,
+}
+
+impl Default for AutoSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_button: "right".into(),
+            fov_degrees: 36,
+            delay_ms: 0,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        }
+    }
+}
+
+impl AutoSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+            return Err("invalid Auto trigger button");
+        }
+        if !(1..=360).contains(&self.fov_degrees) {
+            return Err("Auto FOV must be 1..360");
+        }
+        if self.delay_ms > 60_000 || self.cooldown_ms > 60_000 || self.sleep_ms > 60_000 {
+            return Err("Auto delay, cooldown, and sleep must be 0..60000 ms");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
+    pub motion_enabled: bool,
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
@@ -86,11 +126,13 @@ pub struct AppSettings {
     pub compute_target: String,
     #[serde(rename = "recoil", alias = "nativeMotion", alias = "native_motion")]
     pub recoil: RecoilSettings,
+    pub auto: AutoSettings,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            motion_enabled: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,
@@ -115,6 +157,7 @@ impl Default for AppSettings {
             model_precision: "fp16".into(),
             compute_target: "cpu".into(),
             recoil: RecoilSettings::default(),
+            auto: AutoSettings::default(),
         }
     }
 }
@@ -188,6 +231,7 @@ impl AppSettings {
             return Err(SettingsError::Invalid("active model ID cannot be empty"));
         }
         self.recoil.validate().map_err(SettingsError::Invalid)?;
+        self.auto.validate().map_err(SettingsError::Invalid)?;
         self.show_preview = true;
         Ok(())
     }
@@ -607,6 +651,13 @@ mod tests {
         let settings = AppSettings::default();
         assert!(!settings.recoil.recoil_enabled);
         assert!(settings.recoil.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_defaults_are_separate_and_valid() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.auto, AutoSettings::default());
+        assert!(settings.auto.validate().is_ok());
     }
 
     #[test]

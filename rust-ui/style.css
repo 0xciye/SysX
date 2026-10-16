@@ -43,10 +43,12 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 
 .settings-workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); padding: 24px 32px 30px; background: #0b1218; }
 .settings-view { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-.page-heading { min-height: 62px; display: flex; align-items: flex-start; justify-content: space-between; padding: 0 2px 16px; }
+.page-heading { width: min(100%, 1240px); min-height: 62px; display: flex; align-items: flex-start; justify-content: space-between; margin-inline: auto; padding: 0 2px 16px; }
 .page-title { min-width: 0; }
-.page-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .apply-controls { min-width: 0; display: grid; justify-items: end; gap: 4px; }
+.global-toggle { min-height: 34px; display: inline-flex; align-items: center; gap: 10px; padding: 0 11px; border: 1px solid #3c6e67; border-radius: 7px; background: #12231f; color: #baf8ec; font-size: 10px; font-weight: 700; cursor: pointer; }
+.global-toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.global-toggle:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .apply-button { min-height: 38px; padding: 0 17px; border: 1px solid #3f9f8e; border-radius: 7px; background: var(--accent-soft); color: #baf8ec; font-size: 11px; font-weight: 700; letter-spacing: .01em; white-space: nowrap; cursor: pointer; transition: background .18s ease, border-color .18s ease, transform .18s ease; }
 .apply-button:hover:not(:disabled) { border-color: var(--accent); background: #1d4a42; color: #e4fff9; transform: translateY(-1px); }
 .apply-button:disabled { border-color: #30383b; background: #171c1e; color: var(--dim); cursor: default; }
@@ -62,10 +64,39 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .general-settings { min-width: 0; }
 
 .settings-panel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 22px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); scrollbar-color: #425660 transparent; scrollbar-width: thin; box-shadow: 0 18px 45px rgb(0 0 0 / 16%); }
+.config-card { margin: 0; overflow: hidden; border: 1px solid #29363d; border-radius: 12px; background: #10171b; box-shadow: 0 14px 34px rgb(0 0 0 / 14%); }
+.config-general .general-settings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
+}
+.config-general .general-settings > [aria-labelledby="main-section-title"] { grid-column: 1; grid-row: 1; }
+.config-general .general-settings > [aria-labelledby="motion-section-title"] { grid-column: 2; grid-row: 1; }
+.config-general .general-settings > [aria-labelledby="auto-section-title"] { grid-column: 3; grid-row: 1; }
+.config-general .general-settings > [aria-labelledby="recoil-section-title"] { grid-column: 1; grid-row: 2; }
+.config-general .general-settings > [aria-labelledby="settings-section-title"] { grid-column: 2 / -1; grid-row: 2; }
+.config-card .config-section-heading { padding: 9px 28px 7px; border-bottom-color: #29363d; background: #111a1f; }
+.config-card .config-section-heading h2 { font-size: 17px; }
+.config-card .settings-row { grid-template-columns: minmax(100px, .7fr) minmax(0, 1.3fr); gap: 12px; min-height: 0; padding: 12px 18px; border-bottom-color: #25323a; }
+.config-card .setting-description { width: auto; display: flex; align-items: flex-start; justify-content: flex-start; gap: 16px; margin: 0; }
+.config-card .module-switch-row { grid-template-columns: 1fr; gap: 8px; }
+.config-card .module-switch-row .setting-description { align-items: center; }
+.config-card .module-switch-row .settings-fields { grid-column: 1; }
+.config-card .setting-description h2 { color: #dce6e7; font-size: 13px; }
+.config-card .settings-fields { width: 100%; max-width: none; }
+.config-card .field-label { color: #a5b2b5; font-size: 11px; font-weight: 600; }
+.config-card .field select, .config-card .text-input, .config-card .readout { height: 36px; padding-inline: 10px; border-radius: 7px; background: #15191b; font-size: 12px; }
+.config-card .target-offset-map { min-height: 56px; border-radius: 10px; }
+.config-card .strategy-option { min-height: 58px; border-radius: 8px; }
+.config-card .model-config { padding-top: 2px; }
+.config-card .model-upload { width: 100%; min-height: 36px; align-self: end; justify-content: flex-start; }
+.config-card .motion-toggle { min-height: 36px; border-radius: 7px; }
+.auto-fields { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+.auto-timing-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .config-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; padding: 28px 2px 13px; border-bottom: 1px solid #2c3d45; }
 .config-section-heading > div { display: grid; gap: 4px; }
 .config-section-heading h2 { margin: 0; color: #f0f7f7; font-size: 18px; font-weight: 650; letter-spacing: -.025em; }
-.config-section-heading p { max-width: 330px; margin: 0 0 2px; color: var(--dim); font-size: 10px; line-height: 1.4; text-align: right; }
 .config-section-kicker { color: var(--accent); font: 9px Consolas, monospace; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .config-section-heading + .settings-row { border-top: 0; }
 .settings-row { min-height: 102px; display: grid; grid-template-columns: minmax(170px, .7fr) minmax(280px, 1.5fr); align-items: center; gap: 28px; padding: 21px 2px; border-bottom: 1px solid #22313a; }
@@ -84,7 +115,7 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .strategy-option.selected .strategy-radio::after { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); content: ""; }
 .strategy-option input:focus-visible + .strategy-radio { outline: 2px solid var(--accent); outline-offset: 3px; }
 .strategy-copy { min-width: 0; display: grid; }
-.strategy-copy strong { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.strategy-copy strong { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 500; line-height: 1.2; text-overflow: ellipsis; white-space: normal; }
 .model-confidence { gap: 6px; }
 .range-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .range-heading output { color: var(--text); font: 10px Consolas, monospace; font-variant-numeric: tabular-nums; }
@@ -129,7 +160,6 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .smoothing-fields { align-self: center; }
 .smooth-control { gap: 6px; }
 .smooth-control input { width: 100%; margin: 0; accent-color: var(--accent); cursor: pointer; }
-.smoothing-hint { margin: 0; color: var(--dim); font-size: 10px; }
 .target-offset-map { min-height: 88px; position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background-color: #0b1318; background-image: radial-gradient(#49606a 1px, transparent 1px); background-position: 5px 5px; background-size: 12px 12px; }
 .offset-origin { width: 14px; height: 14px; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
 .offset-origin::before, .offset-origin::after { position: absolute; top: 6px; left: 0; width: 14px; height: 2px; background: #abb4b6; content: ""; }
@@ -138,6 +168,13 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .offset-point { width: 12px; height: 12px; position: absolute; z-index: 2; transform: translate(-50%, -50%); border: 2px solid #fff; border-radius: 50%; background: #f4f6f6; box-shadow: 0 0 0 2px rgb(0 0 0 / 35%); }
 .offset-readout { position: absolute; right: 7px; bottom: 6px; padding: 3px 6px; border-radius: 3px; background: rgb(8 10 11 / 78%); color: #dce3e4; font: 10px Consolas, monospace; }
 .toggle-row { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 10px; cursor: pointer; }
+.module-toggles { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.module-toggle { min-width: 0; min-height: 38px; position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--control); color: var(--text); cursor: pointer; }
+.module-toggle:hover { border-color: var(--border-strong); background: #182022; }
+.module-toggle:focus-within { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
+.module-toggle-name { min-width: 0; font-size: 11px; font-weight: 600; }
+.module-toggle-state { color: var(--muted); font-size: 9px; font-weight: 600; text-transform: uppercase; }
+.module-toggle input { position: absolute; width: 1px; height: 1px; margin: -1px; opacity: 0; }
 .switch { width: 40px; height: 24px; display: flex; flex: 0 0 auto; align-items: center; padding: 4px; border: 0; border-radius: 999px; background: #343b3e; cursor: pointer; }
 .switch span { width: 16px; height: 16px; border-radius: 50%; background: #aab5b8; transition: transform .15s ease, background .15s ease; }
 .switch.is-on { background: #244c46; }
@@ -159,11 +196,13 @@ h1 { margin: 0; color: #f2f8f8; font-size: 26px; font-weight: 650; letter-spacin
 .config-window { height: auto; min-height: 100vh; }
 body:has(.config-window) { overflow: auto; }
 .config-window .settings-workspace { min-height: calc(100vh - 64px); display: block; }
-.config-window .settings-panel { overflow: visible; }
-.config-general .general-settings { width: min(100%, 1480px); margin-inline: auto; }
-.config-general .settings-panel { width: 100%; }
-.config-general .settings-row { grid-template-columns: minmax(190px, .55fr) minmax(0, 1.8fr); }
-.config-general .settings-fields { width: 100%; max-width: 1120px; }
+.config-window .settings-panel { overflow: visible; padding: 0; border: 0; background: transparent; box-shadow: none; }
+.config-general .general-settings {
+  width: min(100%, 1240px);
+  margin-inline: auto;
+}
+.config-general .settings-panel { width: min(100%, 1240px); margin-inline: auto; }
+.config-general .settings-fields { width: 100%; max-width: none; margin-inline: auto; }
 .model-upload { position: relative; display: inline-flex; align-items: center; cursor: pointer; }
 .model-upload input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
 
@@ -176,8 +215,39 @@ body:has(.config-window) { overflow: auto; }
   .settings-row, .config-general .settings-row { grid-template-columns: 1fr; gap: 14px; padding-block: 20px; }
   .settings-fields, .config-general .settings-fields { max-width: none; }
   .strategy-picker { grid-template-columns: 1fr; }
+  .module-toggles { grid-template-columns: 1fr; }
+  .auto-fields { grid-template-columns: 1fr; }
+  .auto-timing-fields { grid-template-columns: 1fr; }
+  .config-general .general-settings { grid-template-columns: 1fr; gap: 12px; }
+  .config-general .general-settings > [aria-labelledby="main-section-title"],
+  .config-general .general-settings > [aria-labelledby="motion-section-title"],
+  .config-general .general-settings > [aria-labelledby="auto-section-title"],
+  .config-general .general-settings > [aria-labelledby="recoil-section-title"],
+  .config-general .general-settings > [aria-labelledby="settings-section-title"] { grid-column: auto; grid-row: auto; }
+  .config-general .general-settings, .config-general .settings-panel { width: 100%; }
+  .config-card .config-section-heading, .config-card .settings-row { padding-inline: 18px; }
+  .config-card .settings-row { padding-block: 10px; }
   .config-section-heading { align-items: start; flex-direction: column; gap: 7px; }
-  .config-section-heading p { max-width: none; text-align: left; }
+}
+
+@media (min-width: 721px) and (max-width: 900px) {
+  .config-general .general-settings { grid-template-columns: 1fr; }
+  .config-general .general-settings > [aria-labelledby="main-section-title"],
+  .config-general .general-settings > [aria-labelledby="motion-section-title"],
+  .config-general .general-settings > [aria-labelledby="auto-section-title"],
+  .config-general .general-settings > [aria-labelledby="recoil-section-title"],
+  .config-general .general-settings > [aria-labelledby="settings-section-title"] { grid-column: auto; grid-row: auto; }
+}
+
+@media (min-width: 901px) and (max-width: 1180px) {
+  .config-general .general-settings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .config-general .general-settings > [aria-labelledby="main-section-title"],
+  .config-general .general-settings > [aria-labelledby="motion-section-title"],
+  .config-general .general-settings > [aria-labelledby="auto-section-title"],
+  .config-general .general-settings > [aria-labelledby="recoil-section-title"],
+  .config-general .general-settings > [aria-labelledby="settings-section-title"] { grid-column: auto; grid-row: auto; }
 }
 
 /* ── Receiver monitor (/monitor.html) ─────────────────────────────────────
