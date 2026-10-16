@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,9 @@ const ui = path.join(root, "rust-ui");
 const executable = process.platform === "win32" ? "trunk.exe" : "trunk";
 const bundledTrunk = path.join(homedir(), ".cargo", "bin", executable);
 const trunk = existsSync(bundledTrunk) ? bundledTrunk : "trunk";
+const rustcName = process.platform === "win32" ? "rustc.exe" : "rustc";
+const bundledRustc = path.join(homedir(), ".cargo", "bin", rustcName);
+const rustc = process.env.RUSTC ?? (existsSync(bundledRustc) ? bundledRustc : rustcName);
 const env = { ...process.env };
 delete env.NO_COLOR;
 env.PATH = [path.join(homedir(), ".cargo", "bin"), env.PATH]
@@ -36,6 +39,33 @@ if (mode === "serve") {
   });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
+  const targetDirectory = path.join(root, "target");
+  mkdirSync(targetDirectory, { recursive: true });
+  const stripper = path.join(
+    targetDirectory,
+    process.platform === "win32" ? "strip-wasm-debug.exe" : "strip-wasm-debug",
+  );
+  const compile = spawnSync(
+    rustc,
+    [
+      path.join(root, "scripts", "strip-wasm-debug.rs"),
+      "--edition",
+      "2021",
+      "-O",
+      "-o",
+      stripper,
+    ],
+    { cwd: root, env, stdio: "inherit" },
+  );
+  if (compile.error) throw compile.error;
+  if (compile.status !== 0) process.exit(compile.status ?? 1);
+  const strip = spawnSync(stripper, [path.join(root, "dist")], {
+    cwd: root,
+    env,
+    stdio: "inherit",
+  });
+  if (strip.error) throw strip.error;
+  if (strip.status !== 0) process.exit(strip.status ?? 1);
 } else {
   throw new Error(`Unknown Rust UI mode: ${mode}`);
 }

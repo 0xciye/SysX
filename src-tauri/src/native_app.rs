@@ -3,7 +3,11 @@
 //! the receiver UI as the web monitor page (`/monitor.html`) in a chromeless
 //! browser app window. The host exits once the monitor and configuration
 //! clients have both closed.
+#[cfg(not(debug_assertions))]
+use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(not(debug_assertions))]
+use std::io::Read;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,6 +33,8 @@ enum HostEvent {
 struct BackendRuntime {
     child: Child,
     runtime_dir: Option<PathBuf>,
+    integrity_stop: Option<Arc<AtomicBool>>,
+    integrity_thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +93,12 @@ impl DeviceStatus {
 
 impl Drop for BackendRuntime {
     fn drop(&mut self) {
+        if let Some(stop) = self.integrity_stop.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(thread) = self.integrity_thread.take() {
+            let _ = thread.join();
+        }
         #[cfg(target_os = "windows")]
         {
             let _ = Command::new("taskkill")
@@ -258,7 +270,7 @@ fn start_backend(
     let data_dir = app_data_dir();
     fs::create_dir_all(&data_dir).map_err(|error| format!("Cannot create app data: {error}"))?;
     let (executable, config_root, runtime_dir) = prepare_runtime(&data_dir, &token)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&executable);
     command
         .args(["serve", "--host", "127.0.0.1", "--port", "0", "--data-dir"])
         .arg(&data_dir)
@@ -312,7 +324,20 @@ fn start_backend(
             }
         })
         .map_err(|error| error.to_string())?;
-    let runtime = BackendRuntime { child, runtime_dir };
+    let (integrity_stop, integrity_thread) =
+        match start_backend_integrity_watchdog(&executable, child.id()) {
+            Ok(value) => value,
+            Err(error) => {
+                terminate_backend_child(&mut child);
+                return Err(error);
+            }
+        };
+    let runtime = BackendRuntime {
+        child,
+        runtime_dir,
+        integrity_stop,
+        integrity_thread,
+    };
     let (port, config_port) = ready_rx
         .recv_timeout(Duration::from_secs(12))
         .map_err(|_| "Backend did not become ready within 12 seconds".to_string())?;
@@ -911,6 +936,98 @@ fn prepare_runtime(
     }
 }
 
+/// Protect the extracted backend from a post-launch patch or replacement.
+/// The expected digest comes from the bytes embedded into this host, so it
+/// remains correct when the backend is VMProtected before the host is built.
+#[cfg(not(debug_assertions))]
+fn start_backend_integrity_watchdog(
+    executable: &Path,
+    pid: u32,
+) -> Result<(Option<Arc<AtomicBool>>, Option<thread::JoinHandle<()>>), String> {
+    let expected = sha256_bytes(EMBEDDED_BACKEND);
+    if sha256_file(executable) != Some(expected) {
+        return Err("Extracted backend failed its embedded integrity check".into());
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let path = executable.to_path_buf();
+    let handle = thread::Builder::new()
+        .name("sysx-backend-integrity".into())
+        .spawn(move || {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                for _ in 0..20 {
+                    if stop_for_thread.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if sha256_file(&path) != Some(expected) {
+                    terminate_backend_pid(pid);
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("Could not start backend integrity watchdog: {error}"))?;
+    Ok((Some(stop), Some(handle)))
+}
+
+#[cfg(debug_assertions)]
+fn start_backend_integrity_watchdog(
+    _executable: &Path,
+    _pid: u32,
+) -> Result<(Option<Arc<AtomicBool>>, Option<thread::JoinHandle<()>>), String> {
+    Ok((None, None))
+}
+
+fn terminate_backend_child(child: &mut Child) {
+    terminate_backend_pid(child.id());
+    let _ = child.wait();
+}
+
+fn terminate_backend_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+#[cfg(not(debug_assertions))]
+fn sha256_file(path: &Path) -> Option<[u8; 32]> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    Some(output)
+}
+
 fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Ok(root) = std::env::var("LOCALAPPDATA") {
@@ -981,6 +1098,8 @@ fn open_config_page(url: &str) {
 }
 
 fn open_url(url: &str) {
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let _ = url;
     #[cfg(target_os = "windows")]
     {
         let _ = Command::new("rundll32")

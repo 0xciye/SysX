@@ -30,12 +30,35 @@ fn main() {
     let embedded_backend = if sidecar.is_file() {
         format!("include_bytes!({sidecar:?})")
     } else {
+        // A Windows release is distributed as one executable.  Refuse to
+        // produce a host that can never start its receiver instead of
+        // silently embedding an empty sidecar and letting packaging continue.
+        if target.contains("windows") && env::var("PROFILE").as_deref() == Ok("release") {
+            panic!(
+                "release Windows host is missing the Rust backend sidecar: {}",
+                sidecar.display()
+            );
+        }
         println!("cargo:warning=Rust backend was not built; run pnpm build:desktop before a runnable release build");
         "&[]".into()
     };
 
     let dist = manifest_dir.join("../dist");
     println!("cargo:rerun-if-changed={}", dist.display());
+    let windows_release =
+        target.contains("windows") && env::var("PROFILE").as_deref() == Ok("release");
+    if windows_release && !dist.is_dir() {
+        panic!(
+            "release Windows host is missing the Rust UI bundle: {}",
+            dist.display()
+        );
+    }
+    if windows_release && !dist.join("index.html").is_file() {
+        panic!(
+            "release Windows host is missing dist/index.html: {}",
+            dist.display()
+        );
+    }
     let mut files = Vec::new();
     if dist.is_dir() {
         collect_files(&dist, &dist, &mut files).expect("read built UI assets");

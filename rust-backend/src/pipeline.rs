@@ -1,4 +1,4 @@
-use crate::auto_target::has_pixel_in_fov;
+use crate::auto_target::has_center_pixel_in_fov;
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
@@ -22,7 +22,7 @@ pub struct PipelineConfig {
     pub crop_resolution: Option<u32>,
     pub fov_degrees: u16,
     /// True only while the enabled Auto trigger is held. In that state the
-    /// Pixel Seek mask also feeds Auto's presence-only validity gate.
+    /// Pixel Seek mask also feeds Auto's center-crossing validity gate.
     pub auto_target_active: bool,
     pub smoothing_x: SmoothingRange,
     pub smoothing_y: SmoothingRange,
@@ -441,7 +441,7 @@ fn process_frame(
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let auto_target_valid = config.auto_target_active
-        && has_pixel_in_fov(
+        && has_center_pixel_in_fov(
             &output.mask,
             processed.width(),
             processed.height(),

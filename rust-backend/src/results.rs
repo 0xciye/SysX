@@ -35,7 +35,8 @@ pub struct DetectionResult {
     pub target_xy: Option<[f32; 2]>,
     #[serde(default)]
     pub smoothed_target_xy: Option<[f32; 2]>,
-    /// Auto's presence gate: any active-color pixel inside Auto FOV.
+    /// Auto's presence gate: an active-color pixel must occupy the
+    /// screen-center cell inside Auto FOV (the crosshair must touch it).
     #[serde(default)]
     pub auto_target_valid: bool,
 }

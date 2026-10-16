@@ -1,8 +1,17 @@
 param(
     # Reuse the existing build output instead of rebuilding first.
     [switch] $SkipBuild,
+    # Raw packages are for local smoke testing only. A distributable package
+    # must point at the host after the final VMProtect pass.
+    [switch] $AllowUnprotected,
+    # Explicit acknowledgement that -ExecutablePath is the final VMProtected
+    # host. The script cannot prove a third-party protector was applied.
+    [switch] $VmProtected,
     # Path to WinRAR's Rar.exe; found automatically in the usual install folders.
-    [string] $RarPath
+    [string] $RarPath,
+    # Optional final executable, normally the host after the second VMProtect
+    # pass. When supplied, this file is copied into the package as SysX.exe.
+    [string] $ExecutablePath
 )
 # Builds SysX and packs what another Windows PC needs to run it into one
 # archive: SysX.exe (backend + web UI embedded), a LAN firewall helper, and
@@ -12,13 +21,49 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
+if ($ExecutablePath -and -not $SkipBuild) {
+    throw "-ExecutablePath is for an existing final executable; pass -SkipBuild with it."
+}
+if (-not $ExecutablePath -and -not $AllowUnprotected) {
+    throw "Final packaging requires -ExecutablePath pointing to the VMProtected host. Use -AllowUnprotected only for a local raw smoke package."
+}
+if ($ExecutablePath -and -not $VmProtected -and -not $AllowUnprotected) {
+    throw "Pass -VmProtected when packaging the final host, or use -AllowUnprotected only for a local raw smoke package."
+}
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot "build-windows.ps1")
 }
 
-$sysx = Join-Path $root "src-tauri\target\release\SysX.exe"
-if (-not (Test-Path $sysx)) { throw "SysX.exe not found: $sysx (run without -SkipBuild)" }
+$sysx = if ($ExecutablePath) {
+    (Resolve-Path -LiteralPath $ExecutablePath -ErrorAction Stop).Path
+} else {
+    Join-Path $root "src-tauri\target\release\SysX.exe"
+}
+if (-not (Test-Path -LiteralPath $sysx)) {
+    throw "SysX.exe not found: $sysx (run without -SkipBuild or pass -ExecutablePath)"
+}
 
+function Assert-PeX64 {
+    param([Parameter(Mandatory)] [string] $Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 0x40 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+        throw "The selected executable is not a valid PE image: $Path"
+    }
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+    if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+        throw "The selected executable has an invalid PE header: $Path"
+    }
+    if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+        $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) {
+        throw "The selected executable is missing the PE signature: $Path"
+    }
+    $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    if ($machine -ne 0x8664) {
+        throw "The selected executable is not x86-64 PE (machine 0x$('{0:X4}' -f $machine)): $Path"
+    }
+}
+
+Assert-PeX64 -Path $sysx
 $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 $outDir = Join-Path $root "dist-package"
 $stage = Join-Path $outDir "SysX"
@@ -58,6 +103,18 @@ Chay qua LAN (OBS o may khac):
   - Dung day LAN gigabit (crop 640 o 240 FPS can ~150-190 Mbit/s).
 '@
 Set-Content -Path (Join-Path $stage "HUONG-DAN.txt") -Value $guide -Encoding utf8
+
+$allowedNames = @("SysX.exe", "Mo-cong-UDP-4200.bat", "HUONG-DAN.txt")
+$unexpected = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
+    $allowedNames -notcontains $_.Name
+})
+if ($unexpected.Count -gt 0) {
+    throw "Release package contains unexpected files: $($unexpected.FullName -join ', ')"
+}
+if (@(Get-ChildItem -LiteralPath $stage -Recurse -File -Include "*.pdb", "*.map", "*.rs", "receiver-backend*.exe").Count -gt 0) {
+    throw "Release package contains debug/source/backend artifacts."
+}
+Write-Host "Package PE/layout audit passed: x86-64 SysX.exe and no sidecar/debug/source artifacts."
 
 # Archive: WinRAR's Rar.exe (RAR is a proprietary format; 7-Zip cannot write it).
 if (-not $RarPath) {

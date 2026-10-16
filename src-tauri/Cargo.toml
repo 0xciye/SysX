@@ -5,6 +5,15 @@ description = "SysX native host: backend, device I/O and receiver window launche
 authors = ["Receiver"]
 edition = "2021"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+incremental = false
+
 [build-dependencies]
 
 [dependencies]
@@ -17,4 +26,5 @@ serialport = { version = "4", default-features = false }
 tao = "0.37.1"
 wry = "0.57.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+sha2 = "0.11"
 

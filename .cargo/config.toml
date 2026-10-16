@@ -1,0 +1,10 @@
+# Windows release hardening. Control Flow Guard is a platform mitigation, not
+# an application feature, so it is safe to apply to debug/test builds too; it
+# does not disable the debugger or change any SysX processing logic.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "control-flow-guard=yes",
+  "-C", "link-arg=/DYNAMICBASE",
+  "-C", "link-arg=/HIGHENTROPYVA",
+  "-C", "link-arg=/NXCOMPAT",
+]

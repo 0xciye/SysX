@@ -103,9 +103,10 @@ pub fn MonitorApp() -> impl IntoView {
                         // only `frame` notifies, so each frame is drawn once.
                         target.update_untracked(|value| {
                             *value = if next.detection.auto_target_valid {
-                                // Auto is a presence gate: a matching pixel
-                                // is enough, so never draw Motion's target
-                                // line/ring to an arbitrary pixel.
+                                // Auto fires only when the shared color mask
+                                // reaches the crosshair. It has no selected
+                                // movement target, so never draw Motion's
+                                // target line/ring for this frame.
                                 None
                             } else {
                                 next.detection

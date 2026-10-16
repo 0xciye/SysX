@@ -12,6 +12,9 @@ pub struct AutoState {
     timing: AutoTiming,
     phase: AutoPhase,
     deadline: Option<Instant>,
+    /// Next time the Auto state may be evaluated. Sleep is a polling cadence,
+    /// not part of the firing cooldown, so it never changes `deadline`.
+    next_poll: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,6 +45,7 @@ impl AutoState {
             timing: AutoTiming::new(),
             phase: AutoPhase::Armed,
             deadline: None,
+            next_poll: None,
         }
     }
 
@@ -65,11 +69,13 @@ impl AutoState {
 
     /// Advances Auto using the latest trigger and target state.
     ///
-    /// `delay_ms` applies when a target first enters the FOV. After an action,
-    /// `cooldown_ms + sleep_ms` is the quiet period before another action while
-    /// the target remains valid. With both set to zero, one action is emitted
-    /// per target acquisition and the state stays latched until the target is
-    /// lost or the trigger is released.
+    /// `delay_ms` starts when a valid center-crossing target is first observed while the
+    /// trigger is held. `cooldown_ms` starts when the click action is emitted
+    /// and is the minimum interval between two clicks. `sleep_ms` only spaces
+    /// state evaluations to keep an idle loop from running continuously; it
+    /// does not extend the cooldown. With a zero cooldown, one action is
+    /// emitted per target acquisition and the state stays latched until the
+    /// target is lost or the trigger is released.
     pub fn update(
         &mut self,
         trigger_held: bool,
@@ -81,7 +87,11 @@ impl AutoState {
             return None;
         }
 
-        match self.phase {
+        if self.next_poll.is_some_and(|next_poll| now < next_poll) {
+            return None;
+        }
+
+        let action = match self.phase {
             AutoPhase::Armed => {
                 if self.timing.delay_ms == 0 {
                     Some(self.fire(now))
@@ -99,24 +109,31 @@ impl AutoState {
                 }
             }
             AutoPhase::Latched => None,
-        }
+        };
+        self.schedule_next_poll(now);
+        action
     }
 
     fn fire(&mut self, now: Instant) -> AutoAction {
-        let quiet_ms = self.timing.cooldown_ms.saturating_add(self.timing.sleep_ms);
-        if quiet_ms == 0 {
+        if self.timing.cooldown_ms == 0 {
             self.phase = AutoPhase::Latched;
             self.deadline = None;
         } else {
             self.phase = AutoPhase::WaitingCooldown;
-            self.deadline = Some(now + millis(quiet_ms));
+            // Cooldown starts at the moment the action is emitted.
+            self.deadline = Some(now + millis(self.timing.cooldown_ms));
         }
         AutoAction::LeftClick
+    }
+
+    fn schedule_next_poll(&mut self, now: Instant) {
+        self.next_poll = (self.timing.sleep_ms > 0).then(|| now + millis(self.timing.sleep_ms));
     }
 
     fn reset(&mut self) {
         self.phase = AutoPhase::Armed;
         self.deadline = None;
+        self.next_poll = None;
     }
 }
 
@@ -179,22 +196,44 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_and_sleep_allow_repeated_actions_while_target_stays_valid() {
+    fn cooldown_starts_when_the_click_is_emitted() {
         let start = Instant::now();
         let mut state = AutoState::new();
         state.set_enabled(true);
         state.set_timing(AutoTiming {
             delay_ms: 0,
             cooldown_ms: 50,
-            sleep_ms: 10,
+            sleep_ms: 0,
         });
         assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
         assert_eq!(
-            state.update(true, true, start + Duration::from_millis(59)),
+            state.update(true, true, start + Duration::from_millis(49)),
             None
         );
         assert_eq!(
-            state.update(true, true, start + Duration::from_millis(60)),
+            state.update(true, true, start + Duration::from_millis(50)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn sleep_only_delays_polling_and_does_not_extend_cooldown() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 5,
+            sleep_ms: 50,
+        });
+        assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+        // Cooldown has elapsed, but Sleep has not allowed another poll yet.
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(49)),
+            None
+        );
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(50)),
             Some(AutoAction::LeftClick)
         );
     }

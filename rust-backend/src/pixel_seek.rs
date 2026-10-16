@@ -39,7 +39,7 @@ pub struct PixelSeekOutput {
 }
 
 /// Builds the shared color mask used by Motion selection and Auto's
-/// presence-only target gate.
+/// center-crossing target gate.
 pub fn color_mask(image: &RgbImage, color: PixelTargetColor) -> Vec<u8> {
     let lut = profile_lut(color);
     image

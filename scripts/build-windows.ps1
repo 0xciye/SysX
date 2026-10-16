@@ -1,6 +1,11 @@
 param(
     # Launches SysX.exe (opens the monitor and config windows). Off by default.
-    [switch] $AppSmoke
+    [switch] $AppSmoke,
+    # Reuse a backend that has already been protected with VMProtect. The
+    # protected backend is embedded into the final SysX.exe and is not copied
+    # beside it in the release package.
+    [switch] $UseExistingBackend,
+    [string] $BackendPath
 )
 $ErrorActionPreference = "Stop"
 
@@ -10,6 +15,7 @@ if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64
 
 $root = Split-Path -Parent $PSScriptRoot
 $target = "x86_64-pc-windows-msvc"
+$sidecar = Join-Path $root "src-tauri\binaries\receiver-backend-$target.exe"
 $env:Path = (Join-Path $env:USERPROFILE ".cargo\bin") + ";" + $env:Path
 # Trunk rejects NO_COLOR=1.
 Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
@@ -34,14 +40,36 @@ function Invoke-CheckedNative {
 
 Push-Location $root
 try {
-    # 1. Web UI (monitor + config) -> dist/, embedded by src-tauri/build.rs.
+    # 1. Web UI (monitor + config) -> dist/, then remove Wasm debug/name
+    # metadata before src-tauri/build.rs embeds it. The helper is Rust-only;
+    # this Windows build path does not require Node.
     Invoke-CheckedNative -Command "trunk" -CommandArguments @("build", "--release") -WorkingDirectory (Join-Path $root "rust-ui")
+    $stripperDirectory = Join-Path $root "target"
+    New-Item -ItemType Directory -Force $stripperDirectory | Out-Null
+    $stripper = Join-Path $stripperDirectory "strip-wasm-debug.exe"
+    Invoke-CheckedNative -Command "rustc" -CommandArguments @(
+        (Join-Path $root "scripts\strip-wasm-debug.rs"), "--edition", "2021", "-O", "-o", $stripper
+    )
+    Invoke-CheckedNative -Command $stripper -CommandArguments @((Join-Path $root "dist"))
 
     # 2. Backend sidecar, embedded into SysX.exe.
-    Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--bin", "receiver-backend", "--target", $target, "--release")
-    $backend = Join-Path $root "rust-backend\target\$target\release\receiver-backend.exe"
-    $sidecar = Join-Path $root "src-tauri\binaries\receiver-backend-$target.exe"
-    Copy-Item -LiteralPath $backend -Destination $sidecar -Force
+    if ($UseExistingBackend) {
+        if ($BackendPath) {
+            $protected = (Resolve-Path -LiteralPath $BackendPath -ErrorAction Stop).Path
+            $destination = [IO.Path]::GetFullPath($sidecar)
+            if ([IO.Path]::GetFullPath($protected) -ne $destination) {
+                Copy-Item -LiteralPath $protected -Destination $sidecar -Force
+            }
+        }
+        if (-not (Test-Path -LiteralPath $sidecar)) {
+            throw "-UseExistingBackend requires a protected backend at $sidecar or -BackendPath."
+        }
+        Write-Host "Using pre-protected backend: $sidecar"
+    } else {
+        Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--bin", "receiver-backend", "--target", $target, "--release")
+        $backend = Join-Path $root "rust-backend\target\$target\release\receiver-backend.exe"
+        Copy-Item -LiteralPath $backend -Destination $sidecar -Force
+    }
 
     # 3. Tests.
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-backend\Cargo.toml")
