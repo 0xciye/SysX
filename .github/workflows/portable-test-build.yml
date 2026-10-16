@@ -43,7 +43,7 @@ jobs:
         run: |
           ./scripts/package-windows.ps1 -SkipBuild -AllowUnprotected
           $note = @'
-          SysX Windows x64 test build. Application source: eec8692fee0af7373ddf77dbf8435ba89bb8aec1.
+          SysX Windows x64 test build. Based on application source eec8692fee0af7373ddf77dbf8435ba89bb8aec1, with backend build/tests using ort/load-dynamic.
           Built-in release hardening and runtime integrity are enabled. VMProtect has NOT been applied.
           Only Pixel Seek is usable; Object Detection is unavailable. Only Medius is supported.
           Windows unit, UDP and application lifecycle smoke checks ran on a hosted runner.

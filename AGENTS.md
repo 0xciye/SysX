@@ -96,6 +96,8 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 
 ## Development
 
+- Windows portable test builds use `ort/load-dynamic` for backend build/tests; Pixel Seek needs no ONNX Runtime DLL. The user authorized deferring VMProtect for the current test ZIP. Label that package as unprotected by VMProtect, retain built-in release integrity, and do not treat it as final protected-release validation.
+
 - Read `DEVELOPMENT.md` before changing the application architecture.
 - Add automated tests for new parsing, processing, persistence, and coordinate-mapping behavior. The user explicitly requested automated tests in the source specification.
 - Do not say a Windows build or hardware throughput target passed unless it was actually run on Windows or the target hardware.

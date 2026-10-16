@@ -66,13 +66,15 @@ try {
         }
         Write-Host "Using pre-protected backend: $sidecar"
     } else {
-        Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--bin", "receiver-backend", "--target", $target, "--release")
+        # Pixel Seek does not use ONNX Runtime. Keep the retained development
+        # adapter dynamically loaded so the portable build needs no ORT SDK.
+        Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic", "--bin", "receiver-backend", "--target", $target, "--release")
         $backend = Join-Path $root "rust-backend\target\$target\release\receiver-backend.exe"
         Copy-Item -LiteralPath $backend -Destination $sidecar -Force
     }
 
     # 3. Tests.
-    Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-backend\Cargo.toml")
+    Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic")
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-ui\Cargo.toml")
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "src-tauri\Cargo.toml")
 

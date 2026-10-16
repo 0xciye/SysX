@@ -1,5 +1,7 @@
 # SysX
 
+The Windows portable test build uses `scripts/build-windows.ps1` with `ort/load-dynamic` for the retained, unavailable Object Detection adapter. Pixel Seek does not require an ONNX Runtime installation. A requested test ZIP may explicitly skip VMProtect; it is labeled accordingly and retains built-in release integrity checks.
+
 > **Current availability:** Pixel Seek is the only usable detection engine. Object Detection and its ONNX Runtime, OpenVINO and TensorRT integrations are **not ready for use**. Their source/dependencies remain for development; build and unit-test results are not functional validation. SysX supports **Medius only** through its Rust SDK.
 
 SysX is a portable Windows desktop application distributed as one `SysX.exe`; no installer is produced. The executable embeds its Rust backend and web UI assets, then extracts them to app data while it runs. The receiver window is a compact monitor — Preview, five equal-width Mouse State buttons, device state, and receiver connection state — shown as a chromeless Microsoft Edge app window (`--app`, with its own profile under app data) that loads the loopback page `/monitor.html`. Configuration opens automatically in a separate browser window at a loopback-only local address. Closing the receiver window shuts SysX down. Settings are stored in the computer's app-data folder and restored on launch. There are no Start, Pause, Stop, or Preview visibility controls.

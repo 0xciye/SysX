@@ -4,6 +4,8 @@
 
 ## Current milestone status (2026-10-16)
 
+Windows portable packaging: `scripts/build-windows.ps1` builds and tests the backend with `ort/load-dynamic`, so Pixel Seek builds do not link/download the unused ONNX Runtime SDK. The branch-only `portable-test-build.yml` runs Windows checks and stores a raw test ZIP in a draft release instead of Actions artifacts. VMProtect is deferred at the user's request; no physical-device validation is implied.
+
 The Rust conversion is the active implementation: `rust-backend`, `rust-ui`, and `src-tauri` build and test without the retired Python/React runtime. The receiver window is the Rust WASM monitor page (`/monitor.html`) served by the backend and hosted in the native Wry/WebView2 window with a chromeless Edge app fallback; the separate config page is the same bundle at `/config.html` in the default browser. The `eframe/egui` window was removed. Windows visual review and physical-device validation remain outstanding.
 
 ## Architecture
