@@ -1,4 +1,4 @@
-use crate::auto_target::{has_target_at_center, CrosshairTracker};
+use crate::auto_target::{center_sides, CenterCrossing, CrosshairTracker};
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
@@ -238,6 +238,7 @@ fn processing_loop(
     let mut runtime_cache = None;
     // Not reset on reconfiguration: the game's crosshair stays the same.
     let mut crosshair = CrosshairTracker::default();
+    let mut crossing = CenterCrossing::default();
     loop {
         let (pending, config) = {
             let Ok(mut state) = shared.state.lock() else {
@@ -275,6 +276,7 @@ fn processing_loop(
             prior_target.as_ref(),
             prior_is_fresh,
             &mut crosshair,
+            &mut crossing,
         );
         let finished_ns = monotonic_ns();
         let Ok(mut state) = shared.state.lock() else {
@@ -341,6 +343,7 @@ fn process_frame(
     previous_target: Option<&PriorTarget>,
     previous_is_fresh: bool,
     crosshair: &mut CrosshairTracker,
+    crossing: &mut CenterCrossing,
 ) -> Result<ProcessedFrame, ProcessError> {
     let frame_started = Instant::now();
     // The OBS plugin is the sole owner of capture cropping.  The receiver
@@ -473,14 +476,19 @@ fn process_frame(
     let crosshair_px = crosshair.radius_px();
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
-    let auto_target_valid = config.auto_target_active
-        && has_target_at_center(
+    let auto_target_valid = if config.auto_target_active {
+        let sides = center_sides(
             &output.mask,
             processed.width(),
             processed.height(),
             config.auto_fov_degrees,
             crosshair_px,
         );
+        crossing.update(sides, frame.received)
+    } else {
+        crossing.reset();
+        false
+    };
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
         x: point[0],
         y: point[1],
@@ -668,6 +676,7 @@ mod tests {
                 None,
                 false,
                 &mut Default::default(),
+                &mut Default::default(),
             )
             .unwrap()
             .result;
@@ -703,6 +712,7 @@ mod tests {
             &mut runtime_cache,
             None,
             false,
+            &mut Default::default(),
             &mut Default::default(),
         )
         .expect("the already-cropped frame should be processed as-is");
@@ -761,6 +771,7 @@ mod tests {
                 None,
                 false,
                 &mut Default::default(),
+                &mut Default::default(),
             )
             .unwrap();
             let target = processed.result.smoothed_target_xy.expect("target");
@@ -799,6 +810,7 @@ mod tests {
                 &mut None,
                 None,
                 false,
+                &mut Default::default(),
                 &mut Default::default(),
             )
             .unwrap()
@@ -859,6 +871,7 @@ mod tests {
             &mut runtime_cache,
             None,
             false,
+            &mut Default::default(),
             &mut Default::default(),
         )
         .unwrap_err();

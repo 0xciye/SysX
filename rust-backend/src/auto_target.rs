@@ -12,6 +12,7 @@
 
 use crate::targeting::fov_radius_px;
 use image::RgbImage;
+use std::time::{Duration, Instant};
 
 /// Half side of the square around the center the crosshair is measured in.
 const WINDOW_HALF_PX: u32 = 48;
@@ -144,18 +145,50 @@ pub fn has_target_at_center(
     degrees: u16,
     crosshair_px: f32,
 ) -> bool {
+    center_sides(mask, width, height, degrees, crosshair_px).covers()
+}
+
+/// Where the target's visible pixels lie around the center in one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CenterSides {
+    /// A mask pixel in the center cells.
+    pub center: bool,
+    pub west: bool,
+    pub east: bool,
+    pub north: bool,
+    pub south: bool,
+}
+
+impl CenterSides {
+    /// The target covers the center in this frame.
+    pub fn covers(self) -> bool {
+        self.center || (self.west && self.east && self.north && self.south)
+    }
+}
+
+/// The sides of the center (inside the Auto FOV, or just past a measured
+/// crosshair) on which mask pixels lie; see [`has_target_at_center`].
+pub fn center_sides(
+    mask: &[u8],
+    width: u32,
+    height: u32,
+    degrees: u16,
+    crosshair_px: f32,
+) -> CenterSides {
+    let mut sides = CenterSides::default();
     if width == 0
         || height == 0
         || !(1..=360).contains(&degrees)
         || mask.len() != width as usize * height as usize
     {
-        return false;
+        return sides;
     }
     let (left, right) = (width.saturating_sub(1) / 2, width / 2);
     let (top, bottom) = (height.saturating_sub(1) / 2, height / 2);
     let hit = |x: u32, y: u32| mask[(y * width + x) as usize] != 0;
     if (top..=bottom).any(|y| (left..=right).any(|x| hit(x, y))) {
-        return true;
+        sides.center = true;
+        return sides;
     }
     let limit = (width.min(height) as f32 - 1.0).max(0.0) / 2.0;
     let crosshair = if crosshair_px > 0.0 {
@@ -168,7 +201,6 @@ pub fn has_target_at_center(
     let reach = radius.ceil() as u32 + 1;
     let (x0, x1) = (left.saturating_sub(reach), (right + reach).min(width - 1));
     let (y0, y1) = (top.saturating_sub(reach), (bottom + reach).min(height - 1));
-    let (mut west, mut east, mut north, mut south) = (false, false, false, false);
     for y in y0..=y1 {
         let dy = y as f32 + 0.5 - cy;
         for x in x0..=x1 {
@@ -176,16 +208,77 @@ pub fn has_target_at_center(
             if dx * dx + dy * dy > radius * radius || !hit(x, y) {
                 continue;
             }
-            west |= dx < 0.0;
-            east |= dx > 0.0;
-            north |= dy < 0.0;
-            south |= dy > 0.0;
-            if west && east && north && south {
-                return true;
+            sides.west |= dx < 0.0;
+            sides.east |= dx > 0.0;
+            sides.north |= dy < 0.0;
+            sides.south |= dy > 0.0;
+            if sides.covers() {
+                return sides;
             }
         }
     }
-    false
+    sides
+}
+
+/// A crosshair line through the center, with the color bleed JPEG adds
+/// beside it, can hide a small target for the whole time it is on center,
+/// so no single frame sees it on all four sides. A target seen straddling
+/// the center row on one side of the center and then on the other side
+/// within [`CROSSING_WINDOW`] passed through the center (likewise across the
+/// center column).
+pub const CROSSING_WINDOW: Duration = Duration::from_millis(100);
+/// A detected center pass stays valid this long, so the host (polling every
+/// few ms) sees it even when the next frame no longer does.
+pub const CENTER_HOLD: Duration = Duration::from_millis(30);
+
+#[derive(Default)]
+pub struct CenterCrossing {
+    seen: [Option<Instant>; 4],
+    valid_until: Option<Instant>,
+}
+
+impl CenterCrossing {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether the target is on center now: it covers the center in this
+    /// frame, or it has just passed through it.
+    pub fn update(&mut self, sides: CenterSides, now: Instant) -> bool {
+        const WEST: usize = 0;
+        const EAST: usize = 1;
+        const NORTH: usize = 2;
+        const SOUTH: usize = 3;
+        let recent = |at: Option<Instant>| {
+            at.is_some_and(|at| now.saturating_duration_since(at) <= CROSSING_WINDOW)
+        };
+        let mut passed = sides.covers();
+        if !passed {
+            let mut side = |here: usize, there: usize| {
+                passed |= recent(self.seen[there]);
+                self.seen[here] = Some(now);
+            };
+            if sides.north && sides.south {
+                if sides.west && !sides.east {
+                    side(WEST, EAST);
+                } else if sides.east && !sides.west {
+                    side(EAST, WEST);
+                }
+            }
+            if sides.west && sides.east {
+                if sides.north && !sides.south {
+                    side(NORTH, SOUTH);
+                } else if sides.south && !sides.north {
+                    side(SOUTH, NORTH);
+                }
+            }
+        }
+        if passed {
+            self.seen = [None; 4];
+            self.valid_until = Some(now + CENTER_HOLD);
+        }
+        self.valid_until.is_some_and(|until| now < until)
+    }
 }
 
 #[cfg(test)]
@@ -355,5 +448,47 @@ mod tests {
             let mask = color_mask(image, PixelTargetColor::Yellow);
             assert_eq!(has_target_at_center(&mask, 128, 128, 90, 0.0), expected);
         }
+    }
+
+    #[test]
+    fn a_target_seen_on_both_sides_of_a_hiding_line_passed_the_center() {
+        use super::{center_sides, CenterCrossing, CenterSides, CENTER_HOLD, CROSSING_WINDOW};
+        use std::time::{Duration, Instant};
+        // A 6 px head straddling the center row, hidden while it is within
+        // the vertical line: left of it, hidden, then right of it.
+        let head = |x0: u32| {
+            let mut points = Vec::new();
+            for x in x0..x0 + 6 {
+                for y in [28u32, 29, 30, 34, 35, 36] {
+                    points.push((x, y));
+                }
+            }
+            mask(&points)
+        };
+        let left = center_sides(&head(24), 64, 64, 36, 0.0);
+        let right = center_sides(&head(35), 64, 64, 36, 0.0);
+        assert!(!left.covers() && !right.covers());
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut crossing = CenterCrossing::default();
+        assert!(!crossing.update(left, at(0)));
+        assert!(!crossing.update(CenterSides::default(), at(8)));
+        assert!(crossing.update(right, at(16)));
+        // Held briefly for the host, then gone.
+        assert!(crossing.update(CenterSides::default(), at(20)));
+        assert!(!crossing.update(CenterSides::default(), at(16) + CENTER_HOLD));
+
+        // Too slow to be one pass, or back on the same side: no pass.
+        let mut slow = CenterCrossing::default();
+        assert!(!slow.update(left, at(0)));
+        assert!(!slow.update(right, at(1) + CROSSING_WINDOW));
+        let mut back = CenterCrossing::default();
+        assert!(!back.update(left, at(0)));
+        assert!(!back.update(left, at(10)));
+        // Entirely above the center row: never a pass.
+        let above = center_sides(&mask(&[(26, 26), (38, 26)]), 64, 64, 36, 0.0);
+        let mut high = CenterCrossing::default();
+        assert!(!high.update(above, at(0)));
+        assert!(!high.update(above, at(5)));
     }
 }
