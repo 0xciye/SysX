@@ -50,6 +50,16 @@ constexpr int kSendBufferBytes = 8 * 1024 * 1024;
 // frame interval, so one thread alone dropped frames whenever the game loaded
 // the CPU.
 constexpr size_t kEncoderThreads = 2;
+// Without a SYSCFG from the receiver for this long (SysX not running or not
+// reachable), capture only kIdleFps frames per second: enough for a receiver
+// that starts to see the sender and answer, without encoding and sending 240
+// frames per second to nobody while the game runs. The receiver repeats
+// SYSCFG every second while it receives.
+constexpr uint64_t kReceiverQuietNs = 3000000000ull;
+constexpr uint32_t kIdleFps = 2;
+// Frame buffers kept for reuse, so a 640 x 640 frame (1.6 MB) is not
+// allocated on OBS's render thread every frame.
+constexpr size_t kSpareBuffers = kEncoderThreads + 1;
 
 // ---- Sender configuration: edit these and rebuild the DLL. ----
 // SysX receiver IPv4 address (or hostname) and UDP port.
@@ -227,6 +237,11 @@ class Sender {
   }
 
   uint32_t crop_size() const { return crop_size_.load(); }
+  // A receiver answered (SYSCFG) within kReceiverQuietNs.
+  bool receiver_active(uint64_t now) const {
+    const uint64_t last = last_control_ns_.load();
+    return last != 0 && now - last < kReceiverQuietNs;
+  }
   uint32_t max_fps() const { return config_.max_fps; }
 
   void submit_mapped(const uint8_t *data, uint32_t width, uint32_t height, uint32_t stride,
@@ -234,9 +249,12 @@ class Sender {
     if (!data || width == 0 || height == 0 || stride < width * 4u) return;
     Frame next;
     {
-      // Reuse the previous frame's allocation when the worker has handed it back.
+      // Reuse an allocation a worker has handed back.
       std::lock_guard<std::mutex> lock(mutex_);
-      next.bgra.swap(spare_);
+      if (!spare_.empty()) {
+        next.bgra.swap(spare_.back());
+        spare_.pop_back();
+      }
     }
     next.id = next_frame_id_.fetch_add(1);
     next.width = width;
@@ -249,7 +267,9 @@ class Sender {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_) return;
-      pending_ = std::move(next); // latest-frame semantics
+      // Latest-frame semantics; a replaced frame's buffer is kept for reuse.
+      if (pending_ && spare_.size() < kSpareBuffers) spare_.push_back(std::move(pending_->bgra));
+      pending_ = std::move(next);
     }
     condition_.notify_one();
   }
@@ -280,7 +300,10 @@ class Sender {
       const char *digits = message.data() + sizeof(kControlPrefix) - 1;
       char *end = nullptr;
       const auto value = std::strtoul(digits, &end, 10);
-      if (end != digits && value >= 1 && value <= 8192) crop_size_.store(static_cast<uint32_t>(value));
+      if (end != digits && value >= 1 && value <= 8192) {
+        crop_size_.store(static_cast<uint32_t>(value));
+        last_control_ns_.store(monotonic_ns());
+      }
     }
   }
 
@@ -300,7 +323,7 @@ class Sender {
         // A bad allocation or encoder failure must never terminate OBS's worker.
       }
       std::lock_guard<std::mutex> lock(mutex_);
-      if (spare_.empty()) spare_.swap(frame.bgra);
+      if (spare_.size() < kSpareBuffers) spare_.push_back(std::move(frame.bgra));
     }
   }
 
@@ -429,13 +452,14 @@ class Sender {
   std::mutex mutex_;
   std::condition_variable condition_;
   std::optional<Frame> pending_;
-  std::vector<uint8_t> spare_;
+  std::vector<std::vector<uint8_t>> spare_;
   bool stopping_ = false;
   bool winsock_ready_ = false;
   std::vector<std::thread> workers_;
   std::thread control_worker_;
   std::atomic<uint32_t> crop_size_{640};
   std::atomic<uint64_t> next_frame_id_{1};
+  std::atomic<uint64_t> last_control_ns_{0};
   SOCKET socket_ = INVALID_SOCKET;
   sockaddr_in destination_{};
 };
@@ -461,8 +485,9 @@ class GpuCapture {
     // formats, so they are silently not sent.
     if (obs_api.texture_format(main_texture) != GS_BGRA) return;
     const uint64_t now = monotonic_ns();
-    if (const uint32_t fps = sender.max_fps(); fps && now - last_capture_ns_ < 1000000000ull / fps)
-      return;
+    uint32_t fps = sender.max_fps();
+    if (!sender.receiver_active(now)) fps = fps ? std::min(fps, kIdleFps) : kIdleFps;
+    if (fps && now - last_capture_ns_ < 1000000000ull / fps) return;
 
     const uint32_t source_width = obs_api.texture_width(main_texture);
     const uint32_t source_height = obs_api.texture_height(main_texture);
