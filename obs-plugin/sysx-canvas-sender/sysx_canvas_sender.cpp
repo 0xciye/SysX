@@ -15,6 +15,13 @@
 
 #include <csetjmp>
 #include <cstdio>
+// d3d11.h pulls in rpcndr.h, which already defines `boolean` as unsigned
+// char, the type libjpeg-turbo's Windows jconfig.h uses ("per Windows
+// custom"). Keep jmorecfg.h from declaring it a second time with headers
+// that lack that Windows branch.
+#ifndef HAVE_BOOLEAN
+#define HAVE_BOOLEAN
+#endif
 #include <jpeglib.h>
 
 #include <algorithm>
