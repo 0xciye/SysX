@@ -504,7 +504,7 @@ pub fn ConfigApp() -> impl IntoView {
                                 <div class="settings-fields target-offset-fields">
                                     <label class="field"><span class="field-label">"Trigger button"</span>
                                         <select prop:value=move || settings.get().trigger_button on:change=move |event| settings.update(|value| value.trigger_button = event_target_value(&event))>
-                                            <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
+                                            <option value="right">"Right"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
                                         </select>
                                     </label>
                                     <label class="field"><span class="field-label">"FOV (degrees)"</span>
@@ -559,7 +559,7 @@ pub fn ConfigApp() -> impl IntoView {
                                     </label>
                                     <label class="field"><span class="field-label">"Trigger key"</span>
                                         <select prop:value=move || settings.get().auto.trigger_button on:change=move |event| settings.update(|value| value.auto.trigger_button = event_target_value(&event)) aria-label="Auto trigger key">
-                                            <option value="right">"Right"</option><option value="middle">"Middle"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
+                                            <option value="right">"Right"</option><option value="m4">"M4"</option><option value="m5">"M5"</option>
                                         </select>
                                     </label>
                                 </div>

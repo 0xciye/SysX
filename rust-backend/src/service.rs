@@ -10,7 +10,6 @@ use crate::pipeline::{LatestFramePipeline, PipelineConfig, ProcessedFrame};
 use crate::pixel_seek::PixelTargetColor;
 use crate::receiver::UdpDecodedFrameSource;
 use crate::results::DetectionMode;
-use crate::storage::DetectionDataStore;
 use crate::targeting::SmoothingRange;
 use crate::udp::ReassemblyStats;
 use crate::web_config;
@@ -123,7 +122,6 @@ pub struct ReceiverService {
     settings_path: PathBuf,
     registry: Arc<Mutex<ModelRegistry>>,
     pipeline: Arc<LatestFramePipeline>,
-    store: Arc<DetectionDataStore>,
     movement_batcher: Arc<MovementBatcher>,
     movement_ticker: Arc<MovementTicker>,
     source: Arc<Mutex<SourceState>>,
@@ -182,10 +180,9 @@ impl ReceiverService {
             }
         }
         let session_id = format!("{}", unix_ms());
-        let store = Arc::new(
-            DetectionDataStore::new(data_dir.join("sessions").join(&session_id), 4096)
-                .map_err(|error| error.to_string())?,
-        );
+        // Per-frame detection logs were written here (about 290 MB per hour
+        // at 240 FPS, never read back); reclaim what older versions left.
+        let _ = std::fs::remove_dir_all(data_dir.join("sessions"));
         let app = settings
             .lock()
             .map_err(|_| "settings lock poisoned")?
@@ -304,11 +301,7 @@ impl ReceiverService {
                 }
             }
         });
-        let pipeline = Arc::new(LatestFramePipeline::new(
-            config,
-            Some(Arc::clone(&store)),
-            Some(callback),
-        ));
+        let pipeline = Arc::new(LatestFramePipeline::new(config, Some(callback)));
         let mut initial_source = UdpDecodedFrameSource::new(
             "0.0.0.0",
             app.port.parse::<u16>().unwrap_or(requested_udp_port),
@@ -335,7 +328,6 @@ impl ReceiverService {
             settings_path: settings_path.clone(),
             registry,
             pipeline,
-            store,
             movement_batcher,
             movement_ticker,
             source_view: Mutex::new(SourceView::of(&source_state)),
@@ -383,14 +375,7 @@ impl ReceiverService {
         // Never wait on the source lock: the UDP thread holds it while blocked
         // in a read, which used to stall every state()/preview send by up to a
         // frame interval. Fall back to the snapshot that thread keeps current.
-        let view = match self.source.try_lock() {
-            Ok(source) => SourceView::of(&source),
-            Err(_) => self
-                .source_view
-                .lock()
-                .map(|view| view.clone())
-                .unwrap_or_default(),
-        };
+        let view = self.source_view_now();
         source_port = view.port;
         source_name = format!("UDP · 0.0.0.0:{}", view.port);
         transport = view.transport;
@@ -447,6 +432,17 @@ impl ReceiverService {
             "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
             "config_clients":self.config_clients.load(Ordering::Relaxed)
         })
+    }
+
+    fn source_view_now(&self) -> SourceView {
+        match self.source.try_lock() {
+            Ok(source) => SourceView::of(&source),
+            Err(_) => self
+                .source_view
+                .lock()
+                .map(|view| view.clone())
+                .unwrap_or_default(),
+        }
     }
 
     fn source_fps(&self) -> Option<f64> {
@@ -624,11 +620,25 @@ impl ReceiverService {
                     .and_then(Value::as_array)
                     .filter(|commands| !commands.is_empty() && commands.len() <= 16)
                     .ok_or("settings command batch must contain 1..16 commands")?;
-                for item in commands {
-                    if item.get("type").and_then(Value::as_str) == Some("apply_settings") {
-                        return Err("nested settings command batches are not supported".into());
-                    }
-                    self.dispatch(item.clone())?;
+                if commands
+                    .iter()
+                    .any(|item| item.get("type").and_then(Value::as_str) == Some("apply_settings"))
+                {
+                    return Err("nested settings command batches are not supported".into());
+                }
+                // Apply every command even when one fails (for example a busy
+                // UDP port), so the rest of the user's settings still take effect.
+                let failures: Vec<String> = commands
+                    .iter()
+                    .filter_map(|item| {
+                        let command_type = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                        self.dispatch(item.clone())
+                            .err()
+                            .map(|error| format!("{command_type}: {error}"))
+                    })
+                    .collect();
+                if !failures.is_empty() {
+                    return Err(failures.join("; ").into());
                 }
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
@@ -719,8 +729,8 @@ impl ReceiverService {
                     .get("button")
                     .and_then(Value::as_str)
                     .ok_or("trigger button is required")?;
-                if !["right", "middle", "m4", "m5"].contains(&value) {
-                    return Err("trigger button must be right, middle, m4, or m5".into());
+                if !crate::config::TRIGGER_BUTTONS.contains(&value) {
+                    return Err("trigger button must be right, m4, or m5".into());
                 }
                 self.settings
                     .lock()
@@ -1037,7 +1047,6 @@ impl ReceiverService {
         }
         let _ = self.movement_ticker.close(Duration::from_secs(1));
         let _ = self.movement_batcher.close(Duration::from_secs(1));
-        let _ = self.store.close(Duration::from_secs(3));
     }
 }
 
@@ -1404,14 +1413,16 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
         &processed.frame.jpeg
     };
     let stats = service.pipeline.stats();
-    let state = service.state();
+    // Per frame and per monitor: read only the two counters needed instead of
+    // building the whole state (settings and profile clones, registry lock).
+    let transport = service.source_view_now().transport;
     let metadata = json!({
         "event":"frame", "frame_id":processed.frame.frame_id, "source":processed.frame.source,
         "source_width":processed.result.source_width, "source_height":processed.result.source_height,
         "crop_x":processed.crop_x, "crop_y":processed.crop_y, "mode":processed.result.mode,
-        "model_id":processed.result.model_id, "processing_fps":stats.processing_fps, "source_fps":state["source_fps"],
+        "model_id":processed.result.model_id, "processing_fps":stats.processing_fps, "source_fps":service.source_fps(),
         "dropped_input_frames":stats.dropped_input_frames, "rejected_frames":stats.rejected_frames,
-        "resolution_mismatches":stats.resolution_mismatches, "transport_dropped_frames":state["transport_dropped_frames"],
+        "resolution_mismatches":stats.resolution_mismatches, "transport_dropped_frames":transport.dropped_frames + transport.expired_frames,
         "detection":processed.result,
     });
     let bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
@@ -1683,6 +1694,48 @@ mod tests {
         let service = ReceiverService::new("b".repeat(64), data_dir.clone(), port)
             .expect("start test receiver service");
         (service, data_dir)
+    }
+
+    #[test]
+    fn apply_settings_applies_the_rest_when_the_udp_port_is_busy() {
+        let (service, data_dir) = test_service("apply-busy-port");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        let busy = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let error = service
+            .dispatch(json!({"version":1,"type":"apply_settings","commands":[
+                {"version":1,"type":"set_udp_port","port":busy_port},
+                {"version":1,"type":"set_crop_resolution","resolution":256},
+                {"version":1,"type":"set_trigger_button","button":"m5"},
+            ]}))
+            .expect_err("the busy port is reported");
+        assert!(error.contains("set_udp_port"), "{error}");
+        let state = service.state();
+        assert_eq!(state["crop_resolution"], 256);
+        assert_eq!(state["trigger_button"], "m5");
+        drop(busy);
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn startup_reclaims_old_per_frame_detection_logs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sysx-old-sessions-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let old_log = data_dir.join("sessions").join("1").join("detections.jsonl");
+        std::fs::create_dir_all(old_log.parent().unwrap()).unwrap();
+        std::fs::write(&old_log, b"{}\n").unwrap();
+        let reservation = reserve_udp_socket();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let service = ReceiverService::new("d".repeat(64), data_dir.clone(), port).unwrap();
+        let _guard = ServiceGuard(Arc::clone(&service));
+        assert!(!data_dir.join("sessions").exists());
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

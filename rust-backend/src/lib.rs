@@ -14,8 +14,9 @@ pub mod receiver;
 pub mod results;
 pub mod security;
 pub mod service;
-pub mod storage;
 pub mod targeting;
+#[path = "../../native-shared/timer_resolution.rs"]
+pub mod timer_resolution;
 pub mod udp;
 pub mod web_config;
 

@@ -53,10 +53,24 @@ pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
     target.is_fresh().then_some(target)
 }
 
+/// Put back the part of a target delta that one command could not carry, so
+/// it is applied with the next command instead of being lost: the backend
+/// counts every delta it sends as applied. It still expires after 100 ms.
+pub fn restore_remainder(state: &MovementState, remainder: MovementTarget) {
+    if remainder.dx == 0 && remainder.dy == 0 {
+        return;
+    }
+    if let Ok(mut pending) = state.0.lock() {
+        *pending = Some(match pending.take() {
+            Some(newer) => MovementTarget::merge_pending(Some(remainder), newer),
+            None => remainder,
+        });
+    }
+}
+
 pub fn trigger_button_index(button: &str) -> Option<u16> {
     match button {
         "right" => Some(1),
-        "middle" => Some(2),
         "m4" => Some(3),
         "m5" => Some(4),
         _ => None,
@@ -98,13 +112,26 @@ impl MovementTarget {
             && self.timestamp_ms <= now_ms.saturating_add(TARGET_FRESHNESS_MS)
     }
 
-    pub fn device_delta(&self, recoil_y: i64) -> (i16, i16) {
+    /// The clamped command and the target delta it leaves for the next one.
+    /// Clipped recoil is not carried over: it is sampled fresh every command.
+    pub fn device_move(&self, recoil_y: i64) -> ((i16, i16), Self) {
         let x = self.dx.clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA);
-        let y = self
-            .dy
-            .saturating_add(recoil_y)
-            .clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA);
-        (x as i16, y as i16)
+        let wanted_y = self.dy.saturating_add(recoil_y);
+        let y = wanted_y.clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA);
+        // The clipped part of Y belongs to the target only as far as the
+        // target's own delta points the same way.
+        let clipped_y = wanted_y - y;
+        let rest_y = if clipped_y.signum() == self.dy.signum() {
+            clipped_y.signum() * clipped_y.abs().min(self.dy.abs())
+        } else {
+            0
+        };
+        let remainder = Self {
+            dx: self.dx - x,
+            dy: rest_y,
+            ..self.clone()
+        };
+        ((x as i16, y as i16), remainder)
     }
 }
 
@@ -143,16 +170,20 @@ impl VerticalAdjustmentClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_apply_target, trigger_button_index, MovementTarget, RecoilSettings,
-        VerticalAdjustmentClock,
+        restore_remainder, set_target, should_apply_target, trigger_button_index, MovementState,
+        MovementTarget, RecoilSettings, VerticalAdjustmentClock,
     };
     use std::time::{Duration, Instant};
 
     #[test]
-    fn trigger_mapping_excludes_left_and_uses_four_supported_buttons() {
+    fn trigger_mapping_excludes_left_and_middle() {
         assert_eq!(trigger_button_index("left"), None);
         assert_eq!(trigger_button_index("right"), Some(1));
-        assert_eq!(trigger_button_index("middle"), Some(2));
+        assert_eq!(
+            trigger_button_index("middle"),
+            None,
+            "middle cycles profiles"
+        );
         assert_eq!(trigger_button_index("m4"), Some(3));
         assert_eq!(trigger_button_index("m5"), Some(4));
     }
@@ -226,7 +257,7 @@ mod tests {
             dy: 28,
             ..MovementTarget::default()
         };
-        assert_eq!(target.device_delta(10), (32, 32));
+        assert_eq!(target.device_move(10).0, (32, 32));
     }
 
     #[test]
@@ -272,6 +303,71 @@ mod tests {
             ..MovementTarget::default()
         }
         .is_fresh_at(1_000));
+    }
+
+    #[test]
+    fn deltas_beyond_one_command_carry_over_but_clipped_recoil_does_not() {
+        let target = MovementTarget {
+            target_valid: true,
+            dx: 45,
+            dy: -40,
+            ..MovementTarget::default()
+        };
+        let (command, remainder) = target.device_move(0);
+        assert_eq!(command, (32, -32));
+        assert_eq!((remainder.dx, remainder.dy), (13, -8));
+
+        // Recoil pushes Y past the clamp: only the target's share carries over.
+        let target = MovementTarget {
+            target_valid: true,
+            dx: 0,
+            dy: 10,
+            ..MovementTarget::default()
+        };
+        let (command, remainder) = target.device_move(30);
+        assert_eq!(command, (0, 32));
+        assert_eq!((remainder.dx, remainder.dy), (0, 8));
+        let (_, remainder) = MovementTarget {
+            dy: -5,
+            ..target.clone()
+        }
+        .device_move(40);
+        assert_eq!(remainder.dy, 0, "recoil alone overflowed");
+
+        let state = MovementState::default();
+        restore_remainder(
+            &state,
+            MovementTarget {
+                timestamp_ms: 1_000,
+                dx: 13,
+                dy: -8,
+                ..target.clone()
+            },
+        );
+        let event = |valid: bool, dx: i64, dy: i64| {
+            serde_json::json!({
+                "target_valid": valid, "dx": dx, "dy": dy, "motion_enabled": true,
+                "motion_always_on": false, "trigger_button": "right",
+                "timestamp_ms": 1_004, "recoil": {},
+            })
+        };
+        set_target(&state, &event(true, 2, 1));
+        let merged = state.0.lock().unwrap().clone().unwrap();
+        assert_eq!((merged.dx, merged.dy, merged.timestamp_ms), (15, -7, 1_004));
+
+        // A newer lost target discards the remainder.
+        let state = MovementState::default();
+        set_target(&state, &event(false, 0, 0));
+        restore_remainder(
+            &state,
+            MovementTarget {
+                timestamp_ms: 1_000,
+                dx: 13,
+                ..target
+            },
+        );
+        let merged = state.0.lock().unwrap().clone().unwrap();
+        assert_eq!((merged.dx, merged.dy, merged.target_valid), (0, 0, false));
     }
 
     #[test]

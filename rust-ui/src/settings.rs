@@ -105,8 +105,8 @@ impl Default for AutoSettings {
 
 impl AutoSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
-            return Err("Choose Right, Middle, M4, or M5 for the Auto trigger key.");
+        if !["right", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+            return Err("Choose Right, M4, or M5 for the Auto trigger key.");
         }
         if !(1..=360).contains(&self.fov_degrees) {
             return Err("Auto FOV must be from 1 to 360 degrees.");
@@ -269,8 +269,8 @@ impl AppSettings {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
-            return Err("Choose Right, Middle, M4, or M5 for the trigger button.");
+        if !["right", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+            return Err("Choose Right, M4, or M5 for the trigger button.");
         }
         if self.strategy != "pixel_seek" {
             return Err("Choose Pixel Seek. Object Detection is not available yet.");

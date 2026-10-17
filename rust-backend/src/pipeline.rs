@@ -5,7 +5,6 @@ use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntim
 use crate::pixel_seek::{color_mask, process_pixel_seek, PixelSeekOutput, PixelTargetColor};
 use crate::receiver::SourceFrame;
 use crate::results::{DetectionMode, DetectionResult};
-use crate::storage::DetectionDataStore;
 use crate::targeting::{
     object_detection_candidates, object_detection_target, ExponentialTargetSmoother,
     FrameCoordinate, PriorTarget, SmoothingRange, TargetCandidate,
@@ -105,7 +104,6 @@ pub struct LatestFramePipeline {
 impl LatestFramePipeline {
     pub fn new(
         config: PipelineConfig,
-        store: Option<Arc<DetectionDataStore>>,
         on_processed: Option<Arc<dyn Fn(&ProcessedFrame) + Send + Sync>>,
     ) -> Self {
         let shared = Arc::new(Shared {
@@ -123,7 +121,7 @@ impl LatestFramePipeline {
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("sysx-frame-processing".into())
-            .spawn(move || processing_loop(worker_shared, store, on_processed))
+            .spawn(move || processing_loop(worker_shared, on_processed))
             .expect("processing worker thread");
         Self {
             shared,
@@ -222,7 +220,6 @@ impl LatestFramePipeline {
 
 fn processing_loop(
     shared: Arc<Shared>,
-    store: Option<Arc<DetectionDataStore>>,
     on_processed: Option<Arc<dyn Fn(&ProcessedFrame) + Send + Sync>>,
 ) {
     let mut smoother = None;
@@ -309,13 +306,6 @@ fn processing_loop(
                 drop(state);
                 if let Some(callback) = &on_processed {
                     callback(&processed);
-                }
-                if let Some(store) = &store {
-                    if !store.submit(processed.result.clone()) {
-                        eprintln!(
-                            "Detection result was not persisted (store queue full or closed)"
-                        );
-                    }
                 }
             }
             Err(error) => {

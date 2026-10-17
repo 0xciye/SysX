@@ -45,7 +45,7 @@ References:
 - Cap Preview at 640 × 640 px; preserve aspect ratio and enlarge smaller frames with smooth or nearest-neighbor scaling.
 - Keep a circle-only FOV overlay always enabled; expose its size as a 1–360° setting in the local config page, with no enable/disable control. Scale its diameter against the shorter side of the displayed image so it stays proportional across source resolutions; 360° is the largest inscribed circle.
 - Persist `offsetX` and `offsetY` as signed crop-pixel settings and display them relative to the selected target in the web config. Movement adds these offsets to the selected point before calculating crop-center error.
-- Persist a Trigger button preference in the web config with Right, Middle, M4, and M5 choices; exclude Left. Device output is sent only while that physical button is held. Start with one `Default` profile and persist up to three independent settings profiles in `app-settings.json`; users can create, clone, rename, delete, and select them, while a middle-button rising edge cycles only through profiles that exist and immediately reconfigures the pipeline.
+- Persist a Trigger button preference in the web config with Right, M4, and M5 choices; exclude Left, and exclude Middle because it cycles profiles (also for the Auto trigger key; older files that select Middle load as Right). Device output is sent only while that physical button is held. Start with one `Default` profile and persist up to three independent settings profiles in `app-settings.json`; users can create, clone, rename, delete, and select them, while a middle-button rising edge cycles only through profiles that exist and immediately reconfigures the pipeline.
 - Provide independent X/Y exponential-smoothing alpha sliders in the local config. The backend applies `previous + alpha * (current - previous)` to selected target coordinates; the filtered point feeds Preview and device movement while raw detections remain intact. Alpha `1.0` disables filtering. Clear smoothing history when a target is lost or pipeline configuration changes.
 - Provide persisted user-entered sensitivity (`0.01..10`) in the local config. DPI is not a SysX setting because injected device counts are calibrated against measured image pixels per count.
 - Reflect backend IPC readiness in the connection status; show “Waiting for sender” after the authenticated socket connects and reserve “Starting receiver” for startup.
@@ -64,14 +64,14 @@ References:
 - Packet reassembly and JPEG boundary validation live in `rust-backend/src/udp.rs`; UDP receive and JPEG decode live in `receiver.rs`; centered crop geometry is isolated in `crop.rs`.
 - Bounded latest-frame processing lives in `pipeline.rs`. Pixel Seek profiles and target selection live in `pixel_seek.rs` and `targeting.rs`.
 - Model loading, NCHW RGB preprocessing, runtime adapters, YOLOv8 output decoding, confidence/IoU filtering, and class-aware NMS live in `inference.rs`. The pipeline caches the selected runtime and uses model artifact paths plus backend/compute selection to choose it.
-- Movement conversion/batching, persistence, and loopback web configuration live in `movement.rs`, `storage.rs`, and `web_config.rs`.
+- Movement conversion/batching and loopback web configuration live in `movement.rs` and `web_config.rs`. Per-frame detection results are not persisted.
 - User settings live in `app-settings.json` under the operating system's app-data directory. The backend creates a defaults file on first launch, loads it at startup, and the local page reads and atomically updates the same file through `GET/PUT /api/settings` when Apply Changes is used.
 - Development-only, unavailable Object Detection path: import one bundle with ONNX `.onnx`, TensorRT `.engine`/`.plan`, and OpenVINO IR `.xml`/`.bin`. ONNX Runtime is CPU-only; OpenVINO requests CPU/GPU/NPU from the installed runtime; TensorRT is compiled only when TensorRT headers and `CUDA_PATH` are set during backend build and needs GPU hardware. Inference rejects crop dimensions that differ from the configured model input; it does not resize.
 - The supported decoder expects raw YOLOv8 output shaped `[1, 4+classes, anchors]` or `[1, anchors, 4+classes]`. Confidence and IoU come from the model registry; class-aware NMS precedes the common FOV/prior-box/anchor selector. The Precision selector is saved UI preference only.
 - Runtime adapters compile, the pure output decoder and crop mismatch path have unit coverage, but no user model is present. Actual model inference and accelerator/runtime availability remain unverified.
 - `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the native executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
 
-The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pixel Seek (Object Detection is unavailable development work), persists detections, and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
+The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pixel Seek (Object Detection is unavailable development work), and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
 
 ### Frame flow
 
@@ -79,8 +79,7 @@ The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pix
 2. Reassemble UDP frames with bounded memory and timeout.
 3. Keep queues bounded and discard stale frames under load.
 4. Process every frame still admitted to the processing queue.
-5. Persist detection output asynchronously.
-6. Forward every processed frame to Preview (event-driven, original sender JPEG, no re-encode) so preview FPS matches input FPS; report processing FPS and preview FPS separately. With a 240 FPS libobs source (headless, 2026-10-15) the monitor page received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
+5. Forward every processed frame to Preview (event-driven, original sender JPEG, no re-encode) so preview FPS matches input FPS; report processing FPS and preview FPS separately. With a 240 FPS libobs source (headless, 2026-10-15) the monitor page received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
 
 ### Target selection and mouse output
 
@@ -316,6 +315,8 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 147. [x] Replaced the receiver WebView with native Slint while retaining the current design. Removed Wry/Tao, browser-monitor fallback, WASM monitor/preview components and the config boot preview. Added bounded native IPC/JPEG workers, Slint overlays/HUD/button state, native close/reopen lifecycle, config-only HTTP regression, native IPC fixture and headless wait/live/narrow captures. The separate browser config and persistence remain. No Windows build was dispatched; cross-target compilation and headless tests do not validate Windows GPU performance or physical devices.
 
 148. [x] Updated the sole device SDK to Medius 3.4.6 after reviewing the official Rust API. Discovery uses the SDK's CH343 scan and `Device::open` handshake before waiting for mouse-clone health, so reconnect detection does not depend on clone enumeration timing. SysX gates input/output on `query_health()` reporting link, mouse and clone readiness. Kept public `input_events`, `move_rel`, and press/release injection calls. Mock-backed host tests cover the readiness gate; physical Windows hardware remains unvalidated.
+
+149. [x] Audit fixes (on `4e0743e`): removed the per-frame JSONL detection log (~290 MB/h at 240 FPS, never read; old `sessions` folders are deleted at startup); `apply_settings` applies every command and reports all failures; 1 ms Windows timer resolution for host and backend; the host keeps the part of a target delta beyond ±32 for the next command; the host socket reads with a 2 ms timeout; preview metadata no longer builds the full state per frame; Middle is no longer a Motion/Auto trigger (it cycles profiles; files that select it load as Right); a fast least-squares check raises px/count within a few frames after zooming in (ADS/scope), cutting the simulated 4× still-target oscillation peak from 119 to 34 px. Backend, UI and host tests pass on Linux; `x86_64-pc-windows-msvc` checks pass. Not run on Windows or hardware.
 
 
 ### Pixel Seek Motion / Auto contract correction (2026-10-16)

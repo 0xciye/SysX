@@ -269,6 +269,16 @@ const UNCALIBRATED_LEAD_S: f64 = 0.016;
 /// errors: too high only slows tracking a little, too low can make the loop
 /// oscillate, so the uncertainty is spent on the safe side.
 const CALIBRATION_SAFETY_SIGMAS: f64 = 1.5;
+/// Zooming in (ADS, scope) multiplies px/count at once, and a loop running
+/// with too low a px/count oscillates. A second estimate with this short
+/// memory (about 0.15 s at 240 FPS) may raise px/count straight away, never
+/// lower it: too high only slows tracking until the slow estimate catches up.
+const FAST_CALIBRATION_FORGET: f64 = 0.97;
+const FAST_CALIBRATION_MIN_WEIGHT: f64 = 12.0;
+const FAST_RAISE_RATIO: f64 = 2.0;
+const FAST_RAISE_REL_ERROR: f64 = 0.2;
+/// Consecutive calibration samples that must agree before a raise.
+const FAST_RAISE_SAMPLES: u32 = 4;
 /// A loaded calibration is kept until this much new evidence (a few seconds
 /// of held trigger) has been gathered; a calibration is only dropped then too.
 const CALIBRATION_TRUST_WEIGHT: f64 = 400.0;
@@ -297,11 +307,13 @@ struct MotionCalibrator {
     sxy: [f64; LATENCY_STEPS],
     syy: f64,
     weight: f64,
+    forget: f64,
 }
 
 impl Default for MotionCalibrator {
     fn default() -> Self {
         Self {
+            forget: CALIBRATION_FORGET,
             szz: [0.0; LATENCY_STEPS],
             szy: [0.0; LATENCY_STEPS],
             szx: [0.0; LATENCY_STEPS],
@@ -314,20 +326,27 @@ impl Default for MotionCalibrator {
 }
 
 impl MotionCalibrator {
+    fn fast() -> Self {
+        Self {
+            forget: FAST_CALIBRATION_FORGET,
+            ..Self::default()
+        }
+    }
+
     /// One sample: `y` per axis, `xs`/`zs` per latency and axis. Samples taken
     /// every frame over overlapping spans count as `w` (< 1) of a sample each.
     fn add(&mut self, y: (f64, f64), xs: &LatencyRates, zs: &LatencyRates, w: f64) {
-        const F: f64 = CALIBRATION_FORGET;
+        let forget = self.forget;
         for j in 0..LATENCY_STEPS {
             let (x, z) = (xs[j], zs[j]);
-            self.szz[j] = self.szz[j] * F + w * (z.0 * z.0 + z.1 * z.1);
-            self.szy[j] = self.szy[j] * F + w * (z.0 * y.0 + z.1 * y.1);
-            self.szx[j] = self.szx[j] * F + w * (z.0 * x.0 + z.1 * x.1);
-            self.sxx[j] = self.sxx[j] * F + w * (x.0 * x.0 + x.1 * x.1);
-            self.sxy[j] = self.sxy[j] * F + w * (x.0 * y.0 + x.1 * y.1);
+            self.szz[j] = self.szz[j] * forget + w * (z.0 * z.0 + z.1 * z.1);
+            self.szy[j] = self.szy[j] * forget + w * (z.0 * y.0 + z.1 * y.1);
+            self.szx[j] = self.szx[j] * forget + w * (z.0 * x.0 + z.1 * x.1);
+            self.sxx[j] = self.sxx[j] * forget + w * (x.0 * x.0 + x.1 * x.1);
+            self.sxy[j] = self.sxy[j] * forget + w * (x.0 * y.0 + x.1 * y.1);
         }
-        self.syy = self.syy * F + w * (y.0 * y.0 + y.1 * y.1);
-        self.weight = self.weight * F + 2.0 * w;
+        self.syy = self.syy * forget + w * (y.0 * y.0 + y.1 * y.1);
+        self.weight = self.weight * forget + 2.0 * w;
     }
 
     /// Best estimate and its standard error relative to the estimate.
@@ -341,23 +360,45 @@ impl MotionCalibrator {
                 let unexplained = |j: usize| self.syy - self.szy[j] * self.szy[j] / self.szz[j];
                 unexplained(*a).total_cmp(&unexplained(*b))
             })?;
-        if self.szx[best] <= 1e-9 {
-            return None;
-        }
-        let k = self.szy[best] / self.szx[best];
-        if !(PX_PER_COUNT_RANGE.0..=PX_PER_COUNT_RANGE.1).contains(&k) {
-            return None;
-        }
-        let sse = self.syy - 2.0 * k * self.sxy[best] + k * k * self.sxx[best];
-        let standard_error =
-            (sse.max(0.0) / (self.weight - 1.0) * self.szz[best]).sqrt() / self.szx[best];
+        let (k, relative_error) = self.slope_at(best)?;
         Some((
             MotionCalibration {
                 px_per_count: k,
                 latency_s: best as f64 * LATENCY_STEP_S,
             },
-            standard_error / k,
+            relative_error,
         ))
+    }
+
+    /// Ordinary least-squares slope over all applied moves at latency step `j`
+    /// and its relative standard error. Biased by a moving target, but the
+    /// large moves of an oscillating loop make it precise within a few frames.
+    fn least_squares_at(&self, j: usize) -> Option<(f64, f64)> {
+        if self.weight < FAST_CALIBRATION_MIN_WEIGHT || self.sxx[j] <= 1e-9 {
+            return None;
+        }
+        let k = self.sxy[j] / self.sxx[j];
+        if !(PX_PER_COUNT_RANGE.0..=PX_PER_COUNT_RANGE.1).contains(&k) {
+            return None;
+        }
+        let sse = self.syy - k * self.sxy[j];
+        let standard_error = (sse.max(0.0) / (self.weight - 1.0) / self.sxx[j]).sqrt();
+        Some((k, standard_error / k))
+    }
+
+    /// Pixels per count and its relative standard error at latency step `j`.
+    fn slope_at(&self, j: usize) -> Option<(f64, f64)> {
+        if self.szx[j] <= 1e-9 {
+            return None;
+        }
+        let k = self.szy[j] / self.szx[j];
+        if !(PX_PER_COUNT_RANGE.0..=PX_PER_COUNT_RANGE.1).contains(&k) {
+            return None;
+        }
+        let sse = self.syy - 2.0 * k * self.sxy[j] + k * k * self.sxx[j];
+        let standard_error =
+            (sse.max(0.0) / (self.weight - 1.0) * self.szz[j]).sqrt() / self.szx[j];
+        Some((k, standard_error / k))
     }
 }
 
@@ -395,6 +436,9 @@ pub struct MovementController {
     /// apparent (target minus camera) motion before that.
     target_velocity: (f64, f64),
     calibrator: MotionCalibrator,
+    /// Short-memory twin of `calibrator` that catches a sudden zoom.
+    fast_calibrator: MotionCalibrator,
+    fast_raise_streak: u32,
     calibration: Option<MotionCalibration>,
     /// Relative standard error of `calibration` (0 for a loaded one).
     calibration_error: f64,
@@ -434,6 +478,8 @@ impl MovementController {
             smoothed: None,
             target_velocity: (0.0, 0.0),
             calibrator: MotionCalibrator::default(),
+            fast_calibrator: MotionCalibrator::fast(),
+            fast_raise_streak: 0,
             calibration: None,
             calibration_error: 0.0,
             calibration_loaded: false,
@@ -478,6 +524,7 @@ impl MovementController {
         self.config.sens = sens;
         // A new in-game sensitivity changes pixels per count: measure again.
         self.calibrator = MotionCalibrator::default();
+        self.fast_calibrator = MotionCalibrator::fast();
         self.calibration = None;
         self.calibration_error = 0.0;
         self.calibration_loaded = false;
@@ -798,6 +845,10 @@ impl MovementController {
         }
         let weight = (frame_dt / CALIBRATION_SPAN_S).min(1.0);
         self.calibrator.add(y, &xs, &zs, weight);
+        self.fast_calibrator.add(y, &xs, &zs, weight);
+        if self.raise_after_zoom() {
+            return;
+        }
         let Some((estimate, relative_error)) = self.calibrator.estimate() else {
             return;
         };
@@ -828,6 +879,49 @@ impl MovementController {
             // Plenty of new evidence and it no longer fits: measure afresh.
             self.calibration = None;
         }
+    }
+
+    /// Raise px/count at once when the short-memory estimate (at the current
+    /// latency, which a zoom does not change) is clearly above the one in use.
+    /// The slow estimate restarts from the short one's evidence so it does not
+    /// pull the value straight back down.
+    fn raise_after_zoom(&mut self) -> bool {
+        let Some(calibration) = self.calibration else {
+            self.fast_raise_streak = 0;
+            return false;
+        };
+        if self.fast_calibrator.weight < FAST_CALIBRATION_MIN_WEIGHT {
+            return false;
+        }
+        let step = (calibration.latency_s / LATENCY_STEP_S).round() as usize;
+        let Some((k, relative_error)) = self
+            .fast_calibrator
+            .least_squares_at(step.min(LATENCY_STEPS - 1))
+        else {
+            return false;
+        };
+        let raised = k * (1.0 + CALIBRATION_SAFETY_SIGMAS * relative_error);
+        if relative_error > FAST_RAISE_REL_ERROR || k < calibration.px_per_count * FAST_RAISE_RATIO
+        {
+            self.fast_raise_streak = 0;
+            return false;
+        }
+        self.fast_raise_streak += 1;
+        if self.fast_raise_streak < FAST_RAISE_SAMPLES {
+            return false;
+        }
+        self.fast_raise_streak = 0;
+        self.calibration = Some(MotionCalibration {
+            px_per_count: raised,
+            ..calibration
+        });
+        self.calibration_error = relative_error;
+        self.calibration_loaded = false;
+        self.calibrator = MotionCalibrator {
+            forget: CALIBRATION_FORGET,
+            ..self.fast_calibrator.clone()
+        };
+        true
     }
 
     /// Error expected at `now`. Calibrated: the frame shows the scene from
@@ -1799,6 +1893,19 @@ mod tests {
         smoothing: f64,
         /// Detection jitter amplitude (px, uniform ±).
         jitter: f64,
+        /// Zoom (ADS/scope) from `.0` to `.1` seconds: px/count times `.2`.
+        zoom: (f64, f64, f64),
+    }
+
+    impl World {
+        fn px_per_count_at(&self, t: f64) -> f64 {
+            let (from, to, factor) = self.zoom;
+            if (from..to).contains(&t) {
+                self.px_per_count * factor
+            } else {
+                self.px_per_count
+            }
+        }
     }
 
     const GAME: World = World {
@@ -1809,6 +1916,7 @@ mod tests {
         drift: 0.0,
         smoothing: 1.0,
         jitter: 0.7,
+        zoom: (0.0, 0.0, 1.0),
     };
 
     fn simulate(aware: bool, seed: u64) -> (f64, Option<MotionCalibration>) {
@@ -1845,6 +1953,9 @@ mod tests {
         settled_at: Option<f64>,
         /// Largest distance past the target along the initial error direction.
         overshoot: f64,
+        /// RMS and peak true error while zoomed (0 without a zoom).
+        zoom_rms: f64,
+        zoom_peak: f64,
     }
 
     fn simulate_run(
@@ -1865,6 +1976,7 @@ mod tests {
         controller.load_calibration(preset);
         let (mut early_squared, mut early_samples, mut peak) = (0.0, 0, 0.0_f64);
         let (mut settled_at, mut overshoot) = (None, 0.0_f64);
+        let (mut zoom_squared, mut zoom_samples, mut zoom_peak) = (0.0, 0, 0.0_f64);
         let initial = target(0.0);
         let initial_direction = (
             initial.0 / initial.0.hypot(initial.1),
@@ -1908,11 +2020,12 @@ mod tests {
                 first_calibrated = Some(now);
             }
             let (cx, cy) = camera.last().expect("camera").1;
+            let k = world.px_per_count_at(now);
             camera.push((
                 now,
                 (
-                    cx + dx.clamp(-32, 32) as f64 * world.px_per_count,
-                    cy + dy.clamp(-32, 32) as f64 * world.px_per_count,
+                    cx + dx.clamp(-32, 32) as f64 * k,
+                    cy + dy.clamp(-32, 32) as f64 * k,
                 ),
             ));
             {
@@ -1931,6 +2044,11 @@ mod tests {
                 }
                 let along = (tx - cx) * initial_direction.0 + (ty - cy) * initial_direction.1;
                 overshoot = overshoot.max(-along);
+                if (world.zoom.0..world.zoom.1).contains(&now) {
+                    zoom_squared += error * error;
+                    zoom_samples += 1;
+                    zoom_peak = zoom_peak.max(error);
+                }
             }
             if now >= SECONDS / 2.0 {
                 let (tx, ty) = target(now);
@@ -1947,6 +2065,84 @@ mod tests {
             first_calibrated,
             settled_at,
             overshoot,
+            zoom_rms: (zoom_squared / zoom_samples.max(1) as f64).sqrt(),
+            zoom_peak,
+        }
+    }
+
+    #[test]
+    fn zooming_in_raises_px_per_count_before_the_loop_oscillates() {
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        let zoomed = |strafe: f64, factor: f64| {
+            (600..603)
+                .map(|seed| {
+                    simulate_run(
+                        World {
+                            strafe,
+                            zoom: (3.0, 6.0, factor),
+                            ..GAME
+                        },
+                        true,
+                        seed,
+                        saved,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // A 4x zoom on a still target swung the aim about 115 px before.
+        for run in zoomed(0.0, 4.0) {
+            assert!(run.zoom_peak < 60.0, "peak {:.1} px", run.zoom_peak);
+        }
+        // Without a zoom a strafing target must not trigger a raise.
+        for run in zoomed(150.0, 1.0) {
+            assert!(
+                run.calibration.is_some_and(|c| c.px_per_count < 0.4),
+                "{:?}",
+                run.calibration
+            );
+            assert!(run.zoom_rms < 16.0, "RMS {:.1} px", run.zoom_rms);
+        }
+    }
+
+    /// Zooming in (ADS/scope) multiplies px/count while a saved calibration is
+    /// active (not a pass/fail test):
+    /// `cargo test --release --lib -- zoom_report --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn zoom_report() {
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        for factor in [1.0, 1.5, 2.0, 3.0, 4.0, 0.5] {
+            for (name, strafe) in [("strafe", 150.0), ("still", 0.0)] {
+                let runs: Vec<SimRun> = (600..610)
+                    .map(|seed| {
+                        simulate_run(
+                            World {
+                                strafe,
+                                zoom: (3.0, 6.0, factor),
+                                ..GAME
+                            },
+                            true,
+                            seed,
+                            saved,
+                        )
+                    })
+                    .collect();
+                let mean =
+                    |f: fn(&SimRun) -> f64| runs.iter().map(f).sum::<f64>() / runs.len() as f64;
+                eprintln!(
+                    "ZOOM x{factor} {name}: zoomed RMS {:.1} px, zoomed peak {:.1} px, after-zoom RMS {:.1} px, px/count at end {:.3}",
+                    mean(|run| run.zoom_rms),
+                    mean(|run| run.zoom_peak),
+                    mean(|run| run.rms),
+                    mean(|run| run.calibration.map_or(0.0, |c| c.px_per_count)),
+                );
+            }
         }
     }
 

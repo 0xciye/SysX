@@ -13,12 +13,15 @@ mod native_monitor;
 mod security;
 mod serial_queue;
 mod single_instance;
+#[path = "../../native-shared/timer_resolution.rs"]
+mod timer_resolution;
 
 fn main() {
     if let Err(error) = diagnostics::install("host") {
         eprintln!("SysX diagnostics unavailable: {error}");
     }
     security::start_release_guard();
+    timer_resolution::request_fine_timer();
     native_app::run();
     diagnostics::record("host stopped");
 }

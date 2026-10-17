@@ -70,6 +70,10 @@ pub struct AutoSettings {
 
 pub const MAX_PROFILES: usize = 3;
 
+/// Motion and Auto trigger choices. Left fires the weapon and Middle cycles
+/// profiles, so neither can be a trigger.
+pub const TRIGGER_BUTTONS: [&str; 3] = ["right", "m4", "m5"];
+
 /// Persisted snapshot for one profile. The snapshot deliberately contains
 /// only the normal AppSettings fields; profile metadata is kept by the outer
 /// AppSettings object so snapshots cannot recursively contain themselves.
@@ -104,7 +108,7 @@ impl Default for AutoSettings {
 
 impl AutoSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+        if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
             return Err("invalid Auto trigger button");
         }
         if !(1..=360).contains(&self.fov_degrees) {
@@ -344,7 +348,7 @@ impl AppSettings {
     }
 
     pub fn validate(&mut self) -> Result<(), SettingsError> {
-        if !["right", "middle", "m4", "m5"].contains(&self.trigger_button.as_str()) {
+        if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
             return Err(SettingsError::Invalid("invalid trigger button"));
         }
         if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
@@ -431,6 +435,7 @@ pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
         return default_settings_with_profiles();
     };
     migrate_smoothing(&mut json);
+    migrate_trigger_buttons(&mut json);
     let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
         return default_settings_with_profiles();
     };
@@ -446,6 +451,35 @@ fn default_settings_with_profiles() -> AppSettings {
     let mut settings = AppSettings::default();
     settings.normalize_profiles();
     settings
+}
+
+/// Middle was a trigger choice before it became the profile-cycle button;
+/// files that still select it fall back to Right, in every profile too.
+fn migrate_trigger_buttons(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        let middle = |value: &serde_json::Value| {
+            value
+                .get("triggerButton")
+                .is_some_and(|button| button == "middle")
+        };
+        if middle(settings) {
+            settings["triggerButton"] = serde_json::json!("right");
+        }
+        if settings.get("auto").is_some_and(middle) {
+            settings["auto"]["triggerButton"] = serde_json::json!("right");
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
 }
 
 /// Files from before the 1–50 scale stored one alpha per axis; strength is
@@ -804,6 +838,57 @@ mod tests {
         settings.normalize_profiles();
         assert_eq!(settings.profiles.len(), MAX_PROFILES);
         assert_eq!(settings.active_profile, 2);
+    }
+
+    #[test]
+    fn middle_is_no_trigger_and_older_middle_triggers_become_right() {
+        let mut settings = AppSettings::default();
+        settings.trigger_button = "middle".into();
+        assert!(settings.validate().is_err());
+        let mut auto = AutoSettings::default();
+        auto.trigger_button = "middle".into();
+        assert!(auto.validate().is_err());
+
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-settings-middle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-settings.json");
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        old["triggerButton"] = serde_json::json!("middle");
+        old["auto"]["triggerButton"] = serde_json::json!("middle");
+        let mut snapshot = old.clone();
+        snapshot.as_object_mut().unwrap().remove("profiles");
+        snapshot["triggerButton"] = serde_json::json!("m4");
+        old["profiles"] = serde_json::json!([
+            {"name": "Default", "settings": old.clone()},
+            {"name": "Second", "settings": snapshot},
+        ]);
+        old["profiles"][0]["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profiles");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let mut loaded = load_settings(&path);
+        assert_eq!(loaded.trigger_button, "right");
+        assert_eq!(loaded.auto.trigger_button, "right");
+        assert_eq!(
+            loaded.profiles.len(),
+            2,
+            "the file was not reset to defaults"
+        );
+        loaded.activate_profile(1).unwrap();
+        assert_eq!(loaded.trigger_button, "m4");
+        assert_eq!(loaded.auto.trigger_button, "right");
+        loaded.activate_profile(0).unwrap();
+        assert_eq!(loaded.trigger_button, "right");
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

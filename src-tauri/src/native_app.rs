@@ -292,7 +292,10 @@ fn start_host_client(
                 return;
             };
             if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+                // Button changes are sent between reads; the backend's trigger
+                // state (calibration samples only while it is held) should
+                // trail the device by about a movement tick, not 20 ms.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(2)));
             }
             let mut sent: Option<DeviceStatus> = None;
             loop {
@@ -646,11 +649,12 @@ fn monitor_medius(
                 std::time::Instant::now(),
             );
             if motion_active {
-                let (dx, dy) = target.device_delta(recoil);
+                let ((dx, dy), remainder) = target.device_move(recoil);
                 if dx != 0 || dy != 0 {
                     match serial.submit_medius_move(dx, dy) {
                         Ok(completion) => {
                             move_completion = Some(completion);
+                            crate::movement::restore_remainder(movement_state, remainder);
                             serial.pump();
                         }
                         Err(error) => {
