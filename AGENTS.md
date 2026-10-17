@@ -79,6 +79,10 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 - Keep browser configuration controls keyboard-visible and provide at least 24 CSS px pointer targets for compact switches; configuration controls must remain keyboard accessible.
 - Apply boxes and labels in display coordinates after scaling the source image.
 
+### Known-good Motion and Auto (user-confirmed, 2026-10-17)
+
+The user tested both in game and confirmed them working: Auto fires on center crossings (crosshair-aware), and Motion's per-frame Normal logic no longer shakes. The code is preserved at tag `motion-auto-stable-2026-10-17` and branch `stable/motion-auto-2026-10-17` (commit `a7d7a5b`). Before changing `rust-backend/src/movement/`, `rust-backend/src/auto_target.rs`, `src-tauri/src/auto.rs`, `src-tauri/src/medius_device.rs` or the Auto/Motion paths in `pipeline.rs`/`service.rs`, compare with that tag; to roll back only those parts: `git checkout motion-auto-stable-2026-10-17 -- <paths>`. Do not move or delete the tag or branch.
+
 ## Data and safety
 
 - Never fabricate FPS, latency, detections, model metadata, or benchmark results.
