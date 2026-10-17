@@ -81,7 +81,7 @@ The active SysX source is Rust (`rust-backend`, `rust-ui`, and `src-tauri`). The
 
 ### Known-good Motion and Auto (user-confirmed, 2026-10-17)
 
-The user tested both in game and confirmed them working: Auto fires on center crossings (crosshair-aware), and Motion's per-frame Normal logic no longer shakes. The code is preserved at tag `motion-auto-stable-2026-10-17` and branch `stable/motion-auto-2026-10-17` (commit `a7d7a5b`). Before changing `rust-backend/src/movement/`, `rust-backend/src/auto_target.rs`, `src-tauri/src/auto.rs`, `src-tauri/src/medius_device.rs` or the Auto/Motion paths in `pipeline.rs`/`service.rs`, compare with that tag; to roll back only those parts: `git checkout motion-auto-stable-2026-10-17 -- <paths>`. Do not move or delete the tag or branch.
+The user tested both in game and confirmed them working: Auto fires on center crossings (crosshair-aware), and Motion's per-frame Normal logic no longer shakes. The code is preserved on branch `stable/motion-auto-2026-10-17` (commit `a7d7a5b`; this environment cannot push tags). Before changing `rust-backend/src/movement/`, `rust-backend/src/auto_target.rs`, `src-tauri/src/auto.rs`, `src-tauri/src/medius_device.rs` or the Auto/Motion paths in `pipeline.rs`/`service.rs`, compare with that branch; to roll back only those parts: `git checkout origin/stable/motion-auto-2026-10-17 -- <paths>`. Do not move, rebase or delete that branch.
 
 ## Data and safety
 
