@@ -632,6 +632,60 @@ pub fn ConfigApp() -> impl IntoView {
                                     </label>
                                 </div>
                             </div>
+                            <div class="settings-row">
+                                <div class="setting-description"><h2>"Mode"</h2></div>
+                                <div class="settings-fields">
+                                    <label class="field"><span class="field-label">"Mode"</span>
+                                        <select prop:value=move || settings.get().auto.mode on:change=move |event| settings.update(|value| value.auto.mode = event_target_value(&event)) aria-label="Auto mode">
+                                            <option value="center">"Center crossing"</option><option value="aim">"Aim + fire"</option>
+                                        </select>
+                                    </label>
+                                </div>
+                            </div>
+                            <Show when=move || settings.get().auto.mode == "aim">
+                                <div class="settings-row">
+                                    <div class="setting-description"><h2>"Speed"</h2></div>
+                                    <div class="settings-fields">
+                                        <label class="field"><span class="field-label">"X Speed"</span>
+                                            <input class="text-input" type="number" min="0.01" max="1" step="0.005" inputmode="decimal" prop:value=move || settings.get().auto.speed_x.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.auto.speed_x = value) } aria-label="Auto X speed"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"Y Speed"</span>
+                                            <input class="text-input" type="number" min="0.01" max="1" step="0.005" inputmode="decimal" prop:value=move || settings.get().auto.speed_y.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.auto.speed_y = value) } aria-label="Auto Y speed"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"Smooth FOV (degrees)"</span>
+                                            <input class="text-input" type="number" min="0" max="360" step="1" inputmode="numeric" prop:value=move || settings.get().auto.smooth_fov_degrees.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: u16| v.min(360)) { settings.update(|settings| settings.auto.smooth_fov_degrees = value) } aria-label="Auto Smooth FOV in degrees"/>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="settings-row">
+                                    <div class="setting-description"><h2>"Smoothing"</h2></div>
+                                    <div class="settings-fields">
+                                        <label class="field"><span class="field-label">"X Min"</span>
+                                            <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().auto.smoothing(SmoothingAxis::X, SmoothingBound::Min).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.set_smoothing(SmoothingAxis::X, SmoothingBound::Min, value)) } aria-label="Auto X Min smoothing"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"X Max"</span>
+                                            <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().auto.smoothing(SmoothingAxis::X, SmoothingBound::Max).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.set_smoothing(SmoothingAxis::X, SmoothingBound::Max, value)) } aria-label="Auto X Max smoothing"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"Y Min"</span>
+                                            <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().auto.smoothing(SmoothingAxis::Y, SmoothingBound::Min).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.set_smoothing(SmoothingAxis::Y, SmoothingBound::Min, value)) } aria-label="Auto Y Min smoothing"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"Y Max"</span>
+                                            <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().auto.smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.auto.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Auto Y Max smoothing"/>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="settings-row">
+                                    <div class="setting-description"><h2>"Offset"</h2></div>
+                                    <div class="settings-fields">
+                                        <label class="field"><span class="field-label">"X Offset (px)"</span>
+                                            <input class="text-input" type="number" step="1" inputmode="decimal" prop:value=move || settings.get().auto.offset_x.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v) { if value.is_finite() { settings.update(|settings| settings.auto.offset_x = value) } } aria-label="Auto X offset in pixels"/>
+                                        </label>
+                                        <label class="field"><span class="field-label">"Y Offset (px)"</span>
+                                            <input class="text-input" type="number" step="1" inputmode="decimal" prop:value=move || settings.get().auto.offset_y.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v) { if value.is_finite() { settings.update(|settings| settings.auto.offset_y = value) } } aria-label="Auto Y offset in pixels"/>
+                                        </label>
+                                    </div>
+                                </div>
+                            </Show>
                             <div class="settings-row auto-timing-row">
                                 <div class="setting-description"><h2>"Timing"</h2></div>
                                 <div class="settings-fields auto-timing-fields">

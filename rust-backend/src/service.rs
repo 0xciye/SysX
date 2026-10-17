@@ -73,6 +73,7 @@ impl AutoEvents {
             "delay_ms": self.settings.delay_ms,
             "cooldown_ms": self.settings.cooldown_ms,
             "sleep_ms": self.settings.sleep_ms,
+            "mode": self.settings.mode,
             "target_valid": target_valid,
             "timestamp_ms": timestamp_ms,
         })
@@ -317,6 +318,7 @@ impl ReceiverService {
             fov_degrees: app.fov_degrees,
             auto_fov_degrees: app.auto.fov_degrees,
             auto_target_active: false,
+            auto_aim: false,
             auto_config_revision: 0,
             color_filter: app.color_filter,
             smoothing_x: app.smoothing_x(),
@@ -349,23 +351,14 @@ impl ReceiverService {
             Arc::new(move || {
                 let settings = ticker_settings.lock().ok()?;
                 let device = ticker_device.lock().ok()?;
-                let trigger_held = trigger_held(&device, &settings.trigger_button);
-                let auto_active = effective_detection_settings(&settings, &device).2;
-                Some(MovementRuntimeSettings {
-                    renderer_profile: ticker_renderer.lock().ok()?.profile.clone(),
-                    config_revision: ticker_auto.lock().ok()?.revision,
-                    motion_enabled: settings.motion_enabled && !auto_active,
-                    motion_always_on: settings.motion_always_on,
-                    trigger_held,
-                    sens: settings.sens,
-                    offset_x: settings.offset_x,
-                    offset_y: settings.offset_y,
-                    speed_x: settings.motion_speed_x,
-                    speed_y: settings.motion_speed_y,
-                    smooth_fov_degrees: settings.smooth_fov_degrees,
-                    trigger_button: settings.trigger_button.clone(),
-                    recoil: settings.recoil.clone(),
-                })
+                let renderer_profile = ticker_renderer.lock().ok()?.profile.clone();
+                let config_revision = ticker_auto.lock().ok()?.revision;
+                Some(movement_runtime(
+                    &settings,
+                    &device,
+                    renderer_profile,
+                    config_revision,
+                ))
             }),
             Arc::new(move |event| ticker_batcher.submit(event)),
         ));
@@ -391,7 +384,7 @@ impl ReceiverService {
                     callback_ticker.update(MovementTargetSample {
                         config_revision: processed.auto_config_revision,
                         frame_id: processed.frame.frame_id,
-                        target: if processed.result.auto_active {
+                        target: if processed.result.auto_active && !processed.result.auto_aim {
                             None
                         } else {
                             processed.result.target_xy.map(point)
@@ -713,10 +706,19 @@ impl ReceiverService {
             fov_degrees: settings.fov_degrees,
             auto_fov_degrees: settings.auto.fov_degrees,
             auto_target_active,
+            auto_aim: auto_target_active && settings.auto.aims(),
             auto_config_revision: 0, // filled atomically by reconfigure()
             color_filter: settings.color_filter,
-            smoothing_x: settings.smoothing_x(),
-            smoothing_y: settings.smoothing_y(),
+            smoothing_x: if auto_target_active && settings.auto.aims() {
+                settings.auto.smoothing_x()
+            } else {
+                settings.smoothing_x()
+            },
+            smoothing_y: if auto_target_active && settings.auto.aims() {
+                settings.auto.smoothing_y()
+            } else {
+                settings.smoothing_y()
+            },
             model,
             model_backend: settings.model_backend.clone(),
             compute_target: settings.compute_target.clone(),
@@ -1645,6 +1647,52 @@ fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
 }
 
 /// Whether the device status reports the configured trigger button as held.
+/// What the movement ticker runs with: Motion's values, or Auto's own while
+/// its aim mode holds the trigger.
+fn movement_runtime(
+    settings: &AppSettings,
+    device: &Value,
+    renderer_profile: Option<Arc<crate::movement::abcurves::Profile>>,
+    config_revision: u64,
+) -> MovementRuntimeSettings {
+    let auto_active = effective_detection_settings(settings, device).2;
+    // Auto's aim mode moves with Motion's logic and its own values
+    // while the Auto trigger is held.
+    if auto_active && settings.auto.aims() {
+        let auto = &settings.auto;
+        return MovementRuntimeSettings {
+            renderer_profile,
+            config_revision,
+            motion_enabled: true,
+            motion_always_on: false,
+            trigger_held: true,
+            sens: settings.sens,
+            offset_x: auto.offset_x,
+            offset_y: auto.offset_y,
+            speed_x: auto.speed_x,
+            speed_y: auto.speed_y,
+            smooth_fov_degrees: auto.smooth_fov_degrees,
+            trigger_button: auto.trigger_button.clone(),
+            recoil: settings.recoil.clone(),
+        };
+    }
+    MovementRuntimeSettings {
+        renderer_profile,
+        config_revision,
+        motion_enabled: settings.motion_enabled && !auto_active,
+        motion_always_on: settings.motion_always_on,
+        trigger_held: trigger_held(device, &settings.trigger_button),
+        sens: settings.sens,
+        offset_x: settings.offset_x,
+        offset_y: settings.offset_y,
+        speed_x: settings.motion_speed_x,
+        speed_y: settings.motion_speed_y,
+        smooth_fov_degrees: settings.smooth_fov_degrees,
+        trigger_button: settings.trigger_button.clone(),
+        recoil: settings.recoil.clone(),
+    }
+}
+
 fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bool {
     auto.enabled && trigger_held(device, &auto.trigger_button)
 }
@@ -2424,6 +2472,39 @@ mod tests {
             super::effective_detection_settings(&settings, &held),
             (42, "yellow".into(), false)
         );
+    }
+
+    #[test]
+    fn auto_aim_moves_with_its_own_values_only_while_its_trigger_is_held() {
+        let mut settings = AppSettings::default();
+        settings.motion_enabled = false;
+        settings.motion_speed_x = 0.05;
+        settings.offset_x = 3.0;
+        settings.auto.enabled = true;
+        settings.auto.mode = "aim".into();
+        settings.auto.trigger_button = "m4".into();
+        settings.auto.speed_x = 0.2;
+        settings.auto.speed_y = 0.3;
+        settings.auto.offset_x = -4.0;
+        settings.auto.smooth_fov_degrees = 0;
+        let released = json!({"state":"connected","buttons":[false,false,false,false,false]});
+        let held = json!({"state":"connected","buttons":[false,false,false,true,false]});
+
+        let motion = super::movement_runtime(&settings, &released, None, 7);
+        assert!(!motion.motion_enabled, "Motion is off");
+        assert_eq!((motion.speed_x, motion.offset_x), (0.05, 3.0));
+
+        let aim = super::movement_runtime(&settings, &held, None, 7);
+        assert!(aim.motion_enabled && aim.trigger_held && !aim.motion_always_on);
+        assert_eq!(aim.trigger_button, "m4");
+        assert_eq!((aim.speed_x, aim.speed_y, aim.offset_x), (0.2, 0.3, -4.0));
+        assert_eq!((aim.smooth_fov_degrees, aim.config_revision), (0, 7));
+
+        // Center crossing keeps blocking Motion while Auto is held.
+        settings.auto.mode = "center".into();
+        settings.motion_enabled = true;
+        let center = super::movement_runtime(&settings, &held, None, 7);
+        assert!(!center.motion_enabled);
     }
 
     #[test]

@@ -92,6 +92,18 @@ pub struct AutoSettings {
     pub delay_ms: u32,
     pub cooldown_ms: u32,
     pub sleep_ms: u32,
+    /// `center` fires on center crossings; `aim` also moves like Motion with
+    /// the values below.
+    pub mode: String,
+    pub speed_x: f64,
+    pub speed_y: f64,
+    pub smoothing_x_min: f32,
+    pub smoothing_x_max: f32,
+    pub smoothing_y_min: f32,
+    pub smoothing_y_max: f32,
+    pub smooth_fov_degrees: u16,
+    pub offset_x: f64,
+    pub offset_y: f64,
 }
 
 impl Default for AutoSettings {
@@ -103,12 +115,81 @@ impl Default for AutoSettings {
             delay_ms: 0,
             cooldown_ms: 0,
             sleep_ms: 0,
+            mode: "center".into(),
+            speed_x: DEFAULT_MOTION_SPEED,
+            speed_y: DEFAULT_MOTION_SPEED,
+            smoothing_x_min: 1.0,
+            smoothing_x_max: 1.0,
+            smoothing_y_min: 1.0,
+            smoothing_y_max: 1.0,
+            smooth_fov_degrees: 20,
+            offset_x: 0.0,
+            offset_y: 0.0,
         }
     }
 }
 
 impl AutoSettings {
+    pub fn smoothing(&self, axis: SmoothingAxis, bound: SmoothingBound) -> f32 {
+        match (axis, bound) {
+            (SmoothingAxis::X, SmoothingBound::Min) => self.smoothing_x_min,
+            (SmoothingAxis::X, SmoothingBound::Max) => self.smoothing_x_max,
+            (SmoothingAxis::Y, SmoothingBound::Min) => self.smoothing_y_min,
+            (SmoothingAxis::Y, SmoothingBound::Max) => self.smoothing_y_max,
+        }
+    }
+
+    /// Same rules as Motion's smoothing: clamped to 1..50, and the other bound
+    /// follows so Min never exceeds Max.
+    pub fn set_smoothing(&mut self, axis: SmoothingAxis, bound: SmoothingBound, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        let value = value.clamp(SMOOTHING_LIMITS.0, SMOOTHING_LIMITS.1);
+        let (min, max) = match axis {
+            SmoothingAxis::X => (&mut self.smoothing_x_min, &mut self.smoothing_x_max),
+            SmoothingAxis::Y => (&mut self.smoothing_y_min, &mut self.smoothing_y_max),
+        };
+        match bound {
+            SmoothingBound::Min => {
+                *min = value;
+                *max = max.max(value);
+            }
+            SmoothingBound::Max => {
+                *max = value;
+                *min = min.min(value);
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !["center", "aim"].contains(&self.mode.as_str()) {
+            return Err("Choose an Auto mode.");
+        }
+        if ![self.speed_x, self.speed_y]
+            .iter()
+            .all(|speed| speed.is_finite() && (0.01..=1.0).contains(speed))
+        {
+            return Err("Auto speed must be from 0.01 to 1.");
+        }
+        let range = |min: f32, max: f32| {
+            min.is_finite()
+                && max.is_finite()
+                && SMOOTHING_LIMITS.0 <= min
+                && min <= max
+                && max <= SMOOTHING_LIMITS.1
+        };
+        if !range(self.smoothing_x_min, self.smoothing_x_max)
+            || !range(self.smoothing_y_min, self.smoothing_y_max)
+        {
+            return Err("Auto smoothing must be from 1 to 50 with Min no greater than Max.");
+        }
+        if self.smooth_fov_degrees > 360 {
+            return Err("Auto Smooth FOV must be from 0 to 360 degrees.");
+        }
+        if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
+            return Err("Auto offsets must be numbers.");
+        }
         if !["right", "m4", "m5"].contains(&self.trigger_button.as_str()) {
             return Err("Choose Right, M4, or M5 for the Auto trigger key.");
         }

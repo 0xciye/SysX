@@ -456,7 +456,8 @@ fn target_layer(
     color: &str,
 ) -> Option<TargetLayer> {
     use std::fmt::Write;
-    if meta.detection.auto_active {
+    // Center-crossing Auto has no target; its aim mode does.
+    if meta.detection.auto_active && !meta.detection.auto_aim {
         return None;
     }
     let (pw, ph, cx, cy) = (

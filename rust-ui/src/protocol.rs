@@ -159,6 +159,8 @@ pub struct Detection {
     /// Frame-level routing intent, independent of center-pixel validity.
     #[serde(default)]
     pub auto_active: bool,
+    #[serde(default)]
+    pub auto_aim: bool,
     /// FOV used for this frame's active feature and preview circle.
     #[serde(default)]
     pub fov_degrees: u16,

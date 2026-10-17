@@ -18,6 +18,8 @@ pub(crate) struct AutoTargetEvent {
     delay_ms: u32,
     cooldown_ms: u32,
     sleep_ms: u32,
+    /// `center` only fires; `aim` also lets the backend's movement through.
+    mode: String,
     target_valid: bool,
     timestamp_ms: u64,
 }
@@ -26,7 +28,8 @@ impl AutoTargetEvent {
     pub(crate) fn blocks_motion(&self, trigger_held: bool) -> bool {
         // Routing follows the held feature, not a center hit or sample freshness.
         // The backend publishes enabled=false while Motion Always-on has priority.
-        self.enabled && trigger_held
+        // In aim mode the movement is Auto's own (sent with its trigger key).
+        self.enabled && trigger_held && self.mode != "aim"
     }
 
     pub(crate) fn config_revision(&self) -> u64 {
@@ -241,6 +244,23 @@ fn millis(value: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_center_mode_blocks_motion_while_the_auto_trigger_is_held() {
+        let center: super::AutoTargetEvent =
+            serde_json::from_value(serde_json::json!({"enabled": true, "mode": "center"})).unwrap();
+        assert!(center.blocks_motion(true));
+        assert!(!center.blocks_motion(false));
+        let older: super::AutoTargetEvent =
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+        assert!(older.blocks_motion(true), "no mode: center");
+        let aim: super::AutoTargetEvent =
+            serde_json::from_value(serde_json::json!({"enabled": true, "mode": "aim"})).unwrap();
+        assert!(
+            !aim.blocks_motion(true),
+            "aim mode moves with Auto's own values"
+        );
+    }
+
     use super::{AutoAction, AutoState, AutoTiming};
     use std::time::{Duration, Instant};
 

@@ -24,6 +24,9 @@ pub struct PipelineConfig {
     /// True only while the enabled Auto trigger is held. In that state the
     /// Pixel Seek mask feeds only Auto's center-crossing validity gate.
     pub auto_target_active: bool,
+    /// Auto's aim mode (only with `auto_target_active`): Pixel Seek also
+    /// selects a target inside Auto FOV for movement.
+    pub auto_aim: bool,
     /// Shared control/routing revision used to reject callbacks and Motion samples
     /// completed before a configuration or Auto trigger transition.
     pub auto_config_revision: u64,
@@ -46,6 +49,7 @@ impl Default for PipelineConfig {
             fov_degrees: 36,
             auto_fov_degrees: 36,
             auto_target_active: false,
+            auto_aim: false,
             auto_config_revision: 0,
             color_filter: false,
             smoothing_x: SmoothingRange::NONE,
@@ -414,6 +418,7 @@ fn process_frame(
             smoothed_target_xy: None,
             auto_target_valid: false,
             auto_active: false,
+            auto_aim: false,
             fov_degrees: config.fov_degrees,
         };
         let candidates = object_detection_candidates(&result, model.confidence);
@@ -455,8 +460,10 @@ fn process_frame(
         .filter(|_| previous_is_fresh)
         .and_then(|previous| previous.bbox_xyxy);
     // Auto owns this frame while active. Never run Motion selection or retain
-    // its coordinates/lock during Auto, even when no pixel touches the center.
-    let output = if config.auto_target_active {
+    // its coordinates/lock during Auto, even when no pixel touches the center;
+    // Auto's aim mode selects its own target inside Auto FOV.
+    let auto_aim = config.auto_target_active && config.auto_aim;
+    let output = if config.auto_target_active && !auto_aim {
         PixelSeekOutput {
             objects: Vec::new(),
             target: None,
@@ -467,7 +474,11 @@ fn process_frame(
             processed,
             rect,
             config.pixel_color,
-            config.fov_degrees,
+            if auto_aim {
+                config.auto_fov_degrees
+            } else {
+                config.fov_degrees
+            },
             locked,
         )
     };
@@ -476,7 +487,12 @@ fn process_frame(
     let crosshair_px = crosshair.radius_px();
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
-    let auto_target_valid = if config.auto_target_active {
+    // Aim mode fires on the target it aims at, as Motion selects it inside
+    // Auto FOV; center-crossing mode needs the target to pass the center.
+    let auto_target_valid = if auto_aim {
+        crossing.reset();
+        target_xy.is_some()
+    } else if config.auto_target_active {
         let sides = center_sides(
             &output.mask,
             processed.width(),
@@ -513,6 +529,7 @@ fn process_frame(
         smoothed_target_xy: filtered.map(|point| [point.x, point.y]),
         auto_target_valid,
         auto_active: config.auto_target_active,
+        auto_aim,
         fov_degrees: if config.auto_target_active {
             config.auto_fov_degrees
         } else {
@@ -689,6 +706,62 @@ mod tests {
                 assert!(result.objects.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn auto_aim_fires_on_the_target_it_selects_inside_auto_fov() {
+        let config = PipelineConfig {
+            pixel_color: PixelTargetColor::Red,
+            fov_degrees: 360,
+            auto_fov_degrees: 20,
+            auto_target_active: true,
+            auto_aim: true,
+            ..PipelineConfig::default()
+        };
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut cache = None;
+        let run = |image: image::RgbImage,
+                   id: u64,
+                   smoother: &mut ExponentialTargetSmoother,
+                   cache: &mut Option<_>| {
+            process_frame(
+                SourceFrame {
+                    frame_id: id,
+                    timestamp_ns: 0,
+                    image,
+                    source: "test".into(),
+                    jpeg: Default::default(),
+                    received: std::time::Instant::now(),
+                },
+                &config,
+                smoother,
+                cache,
+                None,
+                false,
+                &mut Default::default(),
+                &mut Default::default(),
+            )
+            .unwrap()
+            .result
+        };
+        // 20° Auto FOV is about 17 px: the pixel 6 px away is selected, the one
+        // 30 px away (inside the 360° Motion FOV) is not.
+        let mut image = image::RgbImage::new(64, 64);
+        image.put_pixel(38, 32, image::Rgb([255, 0, 0]));
+        image.put_pixel(32, 2, image::Rgb([255, 0, 0]));
+        let result = run(image, 1, &mut smoother, &mut cache);
+        assert!(result.auto_active && result.auto_aim);
+        assert_eq!(result.target_xy, Some([38.5, 32.5]), "pixel centers");
+        assert!(result.auto_target_valid, "a valid target fires, off center too");
+        assert_eq!(result.fov_degrees, 20);
+
+        // Only the pixel outside Auto FOV: no target, no fire.
+        let mut image = image::RgbImage::new(64, 64);
+        image.put_pixel(32, 2, image::Rgb([255, 0, 0]));
+        let result = run(image, 2, &mut smoother, &mut cache);
+        assert_eq!(result.target_xy, None);
+        assert!(!result.auto_target_valid);
     }
 
     #[test]
