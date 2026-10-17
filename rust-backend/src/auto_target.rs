@@ -327,4 +327,34 @@ mod tests {
         let beside = mask(&[(42, 26), (42, 38)]);
         assert!(!has_target_at_center(&beside, 64, 64, 2, 7.0));
     }
+
+    /// The user's crosshair (no center dot): 2 px dark lines across the whole
+    /// view through the center, over a tan wall, with a yellow target on it.
+    #[test]
+    fn a_target_under_full_length_crosshair_lines_counts() {
+        use crate::pixel_seek::{color_mask, PixelTargetColor};
+        let scene = |target: &dyn Fn(u32, u32) -> bool| {
+            RgbImage::from_fn(128, 128, |x, y| {
+                if (63..=64).contains(&x) || (63..=64).contains(&y) {
+                    Rgb([0x85, 0x70, 0x58])
+                } else if target(x, y) {
+                    Rgb([255, 230, 0])
+                } else {
+                    Rgb([0xc3, 0xa4, 0x82])
+                }
+            })
+        };
+        let filled = scene(&|x, y| (54..74).contains(&x) && (50..80).contains(&y));
+        let outline = scene(&|x, y| {
+            (54..74).contains(&x)
+                && (50..80).contains(&y)
+                && !((56..72).contains(&x) && (52..78).contains(&y))
+        });
+        let beside = scene(&|x, y| (70..90).contains(&x) && (50..80).contains(&y));
+        for (image, expected) in [(&filled, true), (&outline, true), (&beside, false)] {
+            let mask = color_mask(image, PixelTargetColor::Yellow);
+            assert_eq!(has_target_at_center(&mask, 128, 128, 90, 0.0), expected);
+        }
+    }
 }
+
