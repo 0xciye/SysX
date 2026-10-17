@@ -3,8 +3,7 @@ use crate::config::{
     RecoilSettings,
 };
 use crate::movement::{
-    CalibrationStore, MovementBatcher, MovementRuntimeSettings, MovementTargetSample,
-    MovementTicker,
+    MovementBatcher, MovementRuntimeSettings, MovementTargetSample, MovementTicker,
 };
 use crate::pipeline::{LatestFramePipeline, PipelineConfig, ProcessedFrame};
 use crate::pixel_seek::PixelTargetColor;
@@ -183,6 +182,8 @@ impl ReceiverService {
         // Per-frame detection logs were written here (about 290 MB per hour
         // at 240 FPS, never read back); reclaim what older versions left.
         let _ = std::fs::remove_dir_all(data_dir.join("sessions"));
+        // Motion no longer learns px/count online; drop the old learned values.
+        let _ = std::fs::remove_file(data_dir.join("motion-calibration.json"));
         let app = settings
             .lock()
             .map_err(|_| "settings lock poisoned")?
@@ -235,9 +236,6 @@ impl ReceiverService {
         let ticker_batcher = Arc::clone(&movement_batcher);
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
-            Arc::new(CalibrationStore::load(
-                data_dir.join("motion-calibration.json"),
-            )),
             Arc::new(move || {
                 let settings = ticker_settings.lock().ok()?;
                 let device = ticker_device.lock().ok()?;
