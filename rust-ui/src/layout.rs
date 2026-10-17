@@ -287,7 +287,10 @@ mod tests {
         };
         // Same degrees, same source pixels at every crop; drawn at display scale.
         assert_eq!(fov_diameter(rect, (480, 320), 360), Some(319.0));
-        assert_eq!(fov_diameter(rect, (640, 640), 36), Some(63.9 * 480.0 / 640.0));
+        assert_eq!(
+            fov_diameter(rect, (640, 640), 36),
+            Some(63.9 * 480.0 / 640.0)
+        );
         let small = fov_diameter(rect, (256, 256), 50).unwrap() * 256.0 / 480.0;
         let large = fov_diameter(rect, (640, 640), 50).unwrap() * 640.0 / 480.0;
         assert!((small - large).abs() < 1e-9, "{small} vs {large}");

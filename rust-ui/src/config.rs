@@ -542,20 +542,20 @@ pub fn ConfigApp() -> impl IntoView {
                                 </div>
                             </div>
                             <div class="settings-row">
-                                <div class="setting-description"><h2>"Always on"</h2><p>"Move toward detected targets without holding the trigger. Auto is unavailable while enabled."</p></div>
+                                <div class="setting-description"><h2>"Always on"</h2></div>
                                 <div class="settings-fields"><label class="field"><input type="checkbox" prop:checked=move || settings.get().motion_always_on on:change=move |_| settings.update(|value| value.motion_always_on = !value.motion_always_on) aria-label="Motion always on"/><span class="field-label">"Always on"</span></label></div>
                             </div>
-                            <div class="settings-row smoothing-settings-row">
+                            <div class="settings-row">
                                 <div class="setting-description"><h2>"Speed"</h2></div>
-                                <div class="settings-fields smoothing-fields">
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Speed"</span><output>{move || format!("{:.3}", settings.get().motion_speed_x)}</output></span>
-                                        <input type="range" min="0.01" max="1" step="0.005" prop:value=move || settings.get().motion_speed_x.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_x = value) } aria-label="X speed"/>
+                                <div class="settings-fields">
+                                    <label class="field"><span class="field-label">"X Speed"</span>
+                                        <input class="text-input" type="number" min="0.01" max="1" step="0.005" inputmode="decimal" prop:value=move || settings.get().motion_speed_x.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_x = value) } aria-label="X speed"/>
                                     </label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Speed"</span><output>{move || format!("{:.3}", settings.get().motion_speed_y)}</output></span>
-                                        <input type="range" min="0.01" max="1" step="0.005" prop:value=move || settings.get().motion_speed_y.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_y = value) } aria-label="Y speed"/>
+                                    <label class="field"><span class="field-label">"Y Speed"</span>
+                                        <input class="text-input" type="number" min="0.01" max="1" step="0.005" inputmode="decimal" prop:value=move || settings.get().motion_speed_y.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_y = value) } aria-label="Y speed"/>
                                     </label>
-                                    <label class="field smooth-control settings-wide"><span class="range-heading"><span class="field-label">"Smooth FOV"</span><output>{move || format!("{}°", settings.get().smooth_fov_degrees)}</output></span>
-                                        <input type="range" min="1" max="360" step="1" prop:value=move || settings.get().smooth_fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: u16| v.clamp(1, 360)) { settings.update(|settings| settings.smooth_fov_degrees = value) } aria-label="Smooth FOV"/>
+                                    <label class="field"><span class="field-label">"Smooth FOV (degrees)"</span>
+                                        <input class="text-input" type="number" min="0" max="360" step="1" inputmode="numeric" prop:value=move || settings.get().smooth_fov_degrees.to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: u16| v.min(360)) { settings.update(|settings| settings.smooth_fov_degrees = value) } aria-label="Smooth FOV in degrees"/>
                                     </label>
                                 </div>
                             </div>
@@ -591,20 +591,20 @@ pub fn ConfigApp() -> impl IntoView {
                                     } else { "Choose ABCurves and Apply Changes to collect a mouse profile automatically. Normal runs until capture is saved.".to_string() }}</p>
                                 </div>
                             </div>
-                            <div class="settings-row smoothing-settings-row">
-                                <div class="setting-description"><h2>"Smoothing"</h2><p>"Divides the speed inside the Smooth FOV."</p></div>
-                                <div class="settings-fields smoothing-fields">
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Min"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min))}</output></span>
-                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Min, value)) } aria-label="X Min smoothing"/>
+                            <div class="settings-row">
+                                <div class="setting-description"><h2>"Smoothing"</h2></div>
+                                <div class="settings-fields">
+                                    <label class="field"><span class="field-label">"X Min"</span>
+                                        <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Min, value)) } aria-label="X Min smoothing"/>
                                     </label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Max))}</output></span>
-                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Max, value)) } aria-label="X Max smoothing"/>
+                                    <label class="field"><span class="field-label">"X Max"</span>
+                                        <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Max).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Max, value)) } aria-label="X Max smoothing"/>
                                     </label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Min"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Min))}</output></span>
-                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Min).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Min, value)) } aria-label="Y Min smoothing"/>
+                                    <label class="field"><span class="field-label">"Y Min"</span>
+                                        <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Min).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Min, value)) } aria-label="Y Min smoothing"/>
                                     </label>
-                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Max"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max))}</output></span>
-                                        <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Y Max smoothing"/>
+                                    <label class="field"><span class="field-label">"Y Max"</span>
+                                        <input class="text-input" type="number" min="1" max="50" step="0.1" inputmode="decimal" prop:value=move || settings.get().smoothing(SmoothingAxis::Y, SmoothingBound::Max).to_string() on:change=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::Y, SmoothingBound::Max, value)) } aria-label="Y Max smoothing"/>
                                     </label>
                                 </div>
                             </div>

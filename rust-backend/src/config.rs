@@ -396,8 +396,8 @@ impl AppSettings {
         self.motion_renderer
             .validate()
             .map_err(SettingsError::Invalid)?;
-        if !(1..=360).contains(&self.smooth_fov_degrees) {
-            return Err(SettingsError::Invalid("Smooth FOV must be 1..360"));
+        if self.smooth_fov_degrees > 360 {
+            return Err(SettingsError::Invalid("Smooth FOV must be 0..360"));
         }
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err(SettingsError::Invalid("invalid preview scale"));

@@ -1099,7 +1099,7 @@ impl ReceiverService {
                 let fov = command
                     .get("smooth_fov_degrees")
                     .and_then(Value::as_u64)
-                    .filter(|fov| (1..=360).contains(fov))
+                    .filter(|fov| *fov <= 360)
                     .ok_or(INVALID)? as u16;
                 let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
                 settings.motion_speed_x = x;

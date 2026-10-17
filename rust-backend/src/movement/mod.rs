@@ -826,6 +826,17 @@ mod tests {
             (40, 0),
             "outside: full speed"
         );
+        frame.frame_id += 1;
+        frame.target = Some((42.0, 42.0));
+        let no_smooth_fov = MotionParams {
+            smooth_fov_degrees: 0,
+            ..params()
+        };
+        assert_eq!(
+            controller.delta(&frame, no_smooth_fov),
+            (4, 4),
+            "a 0° Smooth FOV never smooths"
+        );
     }
 
     /// Closed loop with capture/command latency and a px/count the default

@@ -322,8 +322,8 @@ impl AppSettings {
             return Err("Speed must be from 0.01 to 1.");
         }
         self.motion_renderer.validate()?;
-        if !(1..=360).contains(&self.smooth_fov_degrees) {
-            return Err("Smooth FOV must be from 1 to 360 degrees.");
+        if self.smooth_fov_degrees > 360 {
+            return Err("Smooth FOV must be from 0 to 360 degrees.");
         }
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err("Choose Smooth or Pixel perfect preview scaling.");
