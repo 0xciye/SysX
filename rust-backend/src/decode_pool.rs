@@ -22,7 +22,10 @@ struct Shared {
     wake: Condvar,
     stopping: AtomicBool,
     next_seq: AtomicU64,
-    newest_out: AtomicU64,
+    /// Sequence number of the newest frame delivered. Held while checking and
+    /// delivering, so two workers cannot pass the check in order and then
+    /// deliver out of order.
+    newest_out: Mutex<u64>,
     superseded: AtomicU64,
     failed: AtomicU64,
 }
@@ -116,7 +119,11 @@ fn worker(shared: &Shared, deliver: &(dyn Fn(SourceFrame) + Send + Sync)) {
         match decode_udp_frame(frame) {
             Ok(mut frame) => {
                 // Deliver only if no newer frame came out first.
-                if shared.newest_out.fetch_max(seq, Ordering::AcqRel) < seq {
+                let Ok(mut newest) = shared.newest_out.lock() else {
+                    return;
+                };
+                if *newest < seq {
+                    *newest = seq;
                     frame.received = received;
                     deliver(frame);
                 } else {
