@@ -94,6 +94,7 @@ pub fn run() {
     let movement_state = Arc::new(crate::movement::MovementState::default());
     let auto_target = Arc::new(Mutex::new(AutoTargetEvent::default()));
     let device_state = Arc::new(Mutex::new(DeviceStatus::missing()));
+    let capture = Arc::new(Mutex::new(crate::mouse_capture::Bridge::default()));
     let (runtime, port, token, data_dir, config_port) =
         match start_backend(Arc::clone(&movement_state), Arc::clone(&auto_target)) {
             Ok(value) => value,
@@ -107,6 +108,7 @@ pub fn run() {
         Arc::clone(&movement_state),
         Arc::clone(&auto_target),
         Arc::clone(&device_state),
+        Arc::clone(&capture),
     ) {
         set_device_status_with_reason(
             &device_state,
@@ -115,7 +117,13 @@ pub fn run() {
         );
     }
     let (event_tx, event_rx) = mpsc::channel();
-    start_host_client(port, token.clone(), Arc::clone(&device_state), event_tx);
+    start_host_client(
+        port,
+        token.clone(),
+        Arc::clone(&device_state),
+        Arc::clone(&capture),
+        event_tx,
+    );
     if let Some(config_port) = config_port {
         crate::single_instance::record_config_port(&data_dir, config_port);
         if !std::env::args().any(|arg| arg == "--smoke-test") {
@@ -281,6 +289,7 @@ fn start_host_client(
     port: u16,
     token: String,
     device_state: Arc<Mutex<DeviceStatus>>,
+    capture: Arc<Mutex<crate::mouse_capture::Bridge>>,
     events: Sender<HostEvent>,
 ) {
     let _ = thread::Builder::new()
@@ -310,8 +319,30 @@ fn start_host_client(
                     }
                     sent = Some(device);
                 }
+                let capture_commands = capture
+                    .lock()
+                    .map(|mut state| state.commands(Instant::now()))
+                    .unwrap_or_default();
+                let mut capture_send_failed = false;
+                for command in capture_commands {
+                    if socket
+                        .send(Message::Text(command.to_string().into()))
+                        .is_err()
+                    {
+                        capture_send_failed = true;
+                        break;
+                    }
+                }
+                if capture_send_failed {
+                    break;
+                }
                 match socket.read() {
                     Ok(Message::Text(text)) => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Ok(mut bridge) = capture.lock() {
+                                bridge.observe_state(&value);
+                            }
+                        }
                         if let Some(counts) = client_counts(&text) {
                             let _ = events.send(HostEvent::ClientCounts {
                                 monitor: counts.0,
@@ -328,6 +359,9 @@ fn start_host_client(
                         ) => {}
                     Err(_) => break,
                 }
+            }
+            if let Ok(mut bridge) = capture.lock() {
+                bridge.configure(None);
             }
             let _ = events.send(HostEvent::Disconnected);
         });
@@ -390,11 +424,12 @@ fn start_device_monitor(
     movement_state: Arc<crate::movement::MovementState>,
     auto_target: Arc<Mutex<AutoTargetEvent>>,
     device_state: Arc<Mutex<DeviceStatus>>,
+    capture: Arc<Mutex<crate::mouse_capture::Bridge>>,
 ) -> Result<(), String> {
     thread::Builder::new()
         .name("sysx-device-monitor".into())
         .spawn(move || loop {
-            if inspect_devices(&movement_state, &auto_target, &device_state) {
+            if inspect_devices(&movement_state, &auto_target, &device_state, &capture) {
                 thread::sleep(Duration::from_millis(250));
             } else {
                 thread::sleep(Duration::from_millis(500));
@@ -431,6 +466,7 @@ fn inspect_devices(
     movement_state: &crate::movement::MovementState,
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
+    capture: &Arc<Mutex<crate::mouse_capture::Bridge>>,
 ) -> bool {
     static NO_PORT_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -454,10 +490,12 @@ fn inspect_devices(
     let mut failures = Vec::new();
     for port in ports {
         match medius::Device::open(&port.path) {
-            Ok(device) => match monitor_medius(movement_state, auto_target, device_state, device) {
-                Ok(retry_scan) => return retry_scan,
-                Err(error) => failures.push(format!("{}: {error}", port.path)),
-            },
+            Ok(device) => {
+                match monitor_medius(movement_state, auto_target, device_state, capture, device) {
+                    Ok(retry_scan) => return retry_scan,
+                    Err(error) => failures.push(format!("{}: {error}", port.path)),
+                }
+            }
             Err(error) => failures.push(format!("{}: open failed: {error}", port.path)),
         }
     }
@@ -499,6 +537,7 @@ fn monitor_medius(
     movement_state: &crate::movement::MovementState,
     auto_target: &Arc<Mutex<AutoTargetEvent>>,
     device_state: &Arc<Mutex<DeviceStatus>>,
+    capture: &Arc<Mutex<crate::mouse_capture::Bridge>>,
     device: medius::Device,
 ) -> Result<bool, String> {
     use medius::{Button, CatchFilter, Class, Input};
@@ -535,6 +574,12 @@ fn monitor_medius(
 
     // Moves run on the queue's writer thread through a clone of the device handle
     // (the crate shares one link), so a slow move never delays button events.
+    // Capture owns a different SDK queue and never reads/writes from this movement loop.
+    let _capture_worker = crate::mouse_capture::Worker::start(device.clone(), Arc::clone(capture))
+        .map_err(|error| {
+            crate::diagnostics::record(&format!("Physical capture worker failed: {error}"))
+        })
+        .ok();
     let move_device = device.clone();
     let writer = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
         crate::medius_device::dispatch(&move_device, bytes)

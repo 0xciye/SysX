@@ -27,3 +27,7 @@ fn main() {
     native_app::run();
     diagnostics::record("host stopped");
 }
+
+#[path = "../../native-shared/motion_capture.rs"]
+mod motion_capture;
+mod mouse_capture;

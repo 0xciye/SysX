@@ -111,7 +111,7 @@ pub struct ProfileCache {
 impl ProfileCache {
     pub fn new(settings: &MotionRendererSettings) -> Result<Self, String> {
         settings.validate().map_err(str::to_owned)?;
-        let profile = if settings.enabled {
+        let profile = if settings.enabled && settings.reports.len() == 256 {
             Some(Profile::prepare(settings)?)
         } else {
             None

@@ -134,6 +134,60 @@ impl AutoSummary {
     }
 }
 
+#[derive(Default)]
+struct CaptureState {
+    sequence: u64,
+    current: Option<(crate::motion_capture::CaptureRequest, Value)>,
+    count: usize,
+    message: String,
+}
+impl CaptureState {
+    fn invalidate(&mut self) {
+        self.current = None;
+        self.count = 0;
+        self.message.clear();
+    }
+    fn request(
+        &mut self,
+        settings: &AppSettings,
+        connected: bool,
+        session: &str,
+    ) -> Option<crate::motion_capture::CaptureRequest> {
+        if !settings.motion_renderer.enabled || !settings.motion_renderer.reports.is_empty() {
+            self.invalidate();
+            return None;
+        }
+        if !connected {
+            self.invalidate();
+            self.message =
+                "Connect the Medius mouse to collect a profile. Normal remains active.".into();
+            return None;
+        }
+        let identity = crate::config::capture_identity(settings);
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|(_, old)| *old != identity)
+        {
+            self.sequence = self.sequence.wrapping_add(1);
+            self.current = Some((
+                crate::motion_capture::CaptureRequest {
+                    id: format!("{session}:{}", self.sequence),
+                },
+                identity,
+            ));
+            self.count = 0;
+            self.message = "Move the physical mouse continuously at 1,000 Hz to collect 256 reports. Normal remains active.".into();
+        }
+        self.current.as_ref().map(|(request, _)| request.clone())
+    }
+    fn matches(&self, id: &str, settings: &AppSettings) -> bool {
+        self.current.as_ref().is_some_and(|(request, identity)| {
+            request.id == id && *identity == crate::config::capture_identity(settings)
+        })
+    }
+}
+
 struct SourceState {
     active: Option<UdpDecodedFrameSource>,
     active_port: u16,
@@ -172,6 +226,7 @@ pub struct ReceiverService {
     movement_batcher: Arc<MovementBatcher>,
     movement_ticker: Arc<MovementTicker>,
     motion_renderer: Arc<Mutex<crate::movement::abcurves::ProfileCache>>,
+    motion_capture: Mutex<CaptureState>,
     source: Arc<Mutex<SourceState>>,
     source_times: Arc<Mutex<VecDeque<u64>>>,
     /// Decodes the frames the receiver thread reassembles.
@@ -415,6 +470,7 @@ impl ReceiverService {
             movement_batcher,
             movement_ticker,
             motion_renderer,
+            motion_capture: Mutex::new(CaptureState::default()),
             source_view: Mutex::new(SourceView::of(&source_state)),
             source: Arc::new(Mutex::new(source_state)),
             source_times,
@@ -493,6 +549,15 @@ impl ReceiverService {
             .unwrap_or_else(|_| missing_device());
         let (effective_fov_degrees, effective_pixel_color, auto_trigger_held) =
             effective_detection_settings(&settings, &device);
+        let (capture_request, capture_count, capture_message) = self
+            .motion_capture
+            .lock()
+            .map(|mut capture| {
+                let request =
+                    capture.request(&settings, device["state"] == "connected", &self.session_id);
+                (request, capture.count, capture.message.clone())
+            })
+            .unwrap_or_default();
         let profiles: Vec<Value> = settings
             .profiles
             .iter()
@@ -502,6 +567,7 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
+            "motion_capture":capture_request,"motion_capture_count":capture_count,"motion_capture_message":capture_message,
             "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
             "smooth_fov_degrees":settings.smooth_fov_degrees, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
@@ -668,6 +734,10 @@ impl ReceiverService {
         events.reconfigure(&routed_auto_settings(&settings));
         let revision = events.revision;
         drop(events);
+        self.motion_capture
+            .lock()
+            .map_err(|_| "Capture lock poisoned")?
+            .invalidate();
         // A renderer preparation error must not suppress Auto control events.
         self.motion_renderer
             .lock()
@@ -676,6 +746,64 @@ impl ReceiverService {
         let mut config = self.pipeline_config(&settings)?;
         config.auto_config_revision = revision;
         self.pipeline.configure(config).map_err(str::to_owned)
+    }
+
+    fn complete_motion_capture(&self, command: &Value) -> Result<Value, String> {
+        let captured: crate::motion_capture::CapturedProfile = serde_json::from_value(
+            command
+                .get("capture")
+                .cloned()
+                .ok_or("Physical capture is required")?,
+        )
+        .map_err(|_| "Invalid physical capture")?;
+        captured.validate()?;
+        {
+            let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+            let capture = self
+                .motion_capture
+                .lock()
+                .map_err(|_| "Capture lock poisoned")?;
+            if !capture.matches(&captured.capture_id, &settings) {
+                return Err("Capture was cancelled or belongs to a previous profile".into());
+            }
+        }
+        let renderer = crate::config::MotionRendererSettings {
+            enabled: true,
+            sample_interval_us: 1000,
+            reports: captured.reports,
+        };
+        let prepared = crate::movement::abcurves::ProfileCache::new(&renderer)?;
+        let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        let mut capture = self
+            .motion_capture
+            .lock()
+            .map_err(|_| "Capture lock poisoned")?;
+        if !capture.matches(&captured.capture_id, &settings)
+            || self.device.lock().map_err(|_| "device lock poisoned")?["state"] != "connected"
+        {
+            return Err("Capture was cancelled or device changed".into());
+        }
+        let saved =
+            match crate::config::save_captured_renderer(&self.settings_path, &settings, renderer) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    capture.message = format!(
+                        "Could not save mouse profile: {error}. Normal remains active; retrying."
+                    );
+                    return Err(error.to_string());
+                }
+            };
+        *self
+            .motion_renderer
+            .lock()
+            .map_err(|_| "Motion renderer lock poisoned")? = prepared;
+        *settings = saved;
+        capture.invalidate();
+        drop(capture);
+        drop(settings);
+        // Only the renderer profile changed. Do not reset detection/routing or
+        // Auto's control revision: a background capture must not cancel a click.
+        Ok(json!({"event":"ack","type":"complete_motion_capture","state":self.state()}))
     }
 
     fn dispatch(&self, command: Value) -> Result<Value, String> {
@@ -700,6 +828,12 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "device lock poisoned")?
                     .clone();
+                if previous["state"] != device["state"] || previous["name"] != device["name"] {
+                    self.motion_capture
+                        .lock()
+                        .map_err(|_| "Capture lock poisoned")?
+                        .invalidate();
+                }
                 let previous_auto = auto_trigger_active(&settings.auto, &previous);
                 let next_auto = auto_trigger_active(&settings.auto, &device);
                 let middle_pressed =
@@ -897,6 +1031,36 @@ impl ReceiverService {
                 drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
+            "motion_capture_progress" => {
+                let id = command
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .ok_or("Capture id is required")?;
+                let count = command
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .filter(|count| *count <= 256)
+                    .ok_or("Invalid capture progress")? as usize;
+                let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                let mut capture = self
+                    .motion_capture
+                    .lock()
+                    .map_err(|_| "Capture lock poisoned")?;
+                if capture.matches(id, &settings) {
+                    capture.count = count;
+                    capture.message = if count == 256 {
+                        "Saving mouse profile...".into()
+                    } else if command["status"] == "restart" {
+                        "Capture restarted: reports must be consecutive at 1,000 Hz. Keep moving the physical mouse; Normal remains active.".into()
+                    } else if command["status"] == "sdk_error" {
+                        "Mouse capture subscription failed. Normal remains active; reconnect the device to retry.".into()
+                    } else {
+                        format!("Collecting mouse profile: {count}/256. Move continuously at 1,000 Hz; Normal remains active.")
+                    };
+                }
+                Ok(json!({"event":"ack","type":kind}))
+            }
+            "complete_motion_capture" => self.complete_motion_capture(&command),
             "set_motion_renderer" => {
                 let renderer: crate::config::MotionRendererSettings = serde_json::from_value(
                     command
@@ -1428,6 +1592,10 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
                     .and_then(|command| command.get("type"))
                     .cloned();
                 let response = match parsed {
+                    Ok(command) if matches!(command.get("type").and_then(Value::as_str),
+                        Some("complete_motion_capture" | "motion_capture_progress")) && role != ClientRole::Host => {
+                        Err("Physical capture commands require the native host connection".into())
+                    }
                     Ok(command) => {
                         let service = Arc::clone(&service);
                         tokio::task::spawn_blocking(move || service.dispatch(command)).await
@@ -1704,6 +1872,119 @@ mod tests {
     use crate::config::{save_settings, AppSettings};
     use crate::udp::encode_jpeg_frame;
     use std::net::UdpSocket;
+
+    fn arm_physical_capture(service: &ReceiverService) -> String {
+        {
+            let mut settings = service.settings.lock().unwrap();
+            settings.motion_renderer.enabled = true;
+            settings.motion_renderer.reports.clear();
+            save_settings(&service.settings_path, &settings).unwrap();
+        }
+        service
+            .dispatch(
+                json!({"version":1,"type":"device_status","state":"connected",
+            "name":"Mock Medius","buttons":[false,false,false,false,false]}),
+            )
+            .unwrap();
+        service.reconfigure().unwrap();
+        service.state()["motion_capture"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn captured_command(id: &str) -> Value {
+        // Synthetic capture only for validation/persistence tests.
+        json!({"version":1,"type":"complete_motion_capture","capture":{
+            "capture_id":id,"reports":(0..256).map(|i|[(i%9) as i16-4,(i%5) as i16-2]).collect::<Vec<_>>(),
+            "timestamps_us":(0..256).map(|i|1000+i*1000).collect::<Vec<u32>>()
+        }})
+    }
+    #[test]
+    fn physical_capture_saves_and_activates_without_resetting_auto_or_needing_frames() {
+        let (service, dir) = test_service("physical-profile-save");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let id = arm_physical_capture(&service);
+        assert!(
+            service.motion_renderer.lock().unwrap().profile.is_none(),
+            "Normal while waiting"
+        );
+        let revision = service.auto_events.lock().unwrap().revision;
+        service.dispatch(captured_command(&id)).unwrap();
+        assert_eq!(
+            service.auto_events.lock().unwrap().revision,
+            revision,
+            "capture must not cancel pending Auto"
+        );
+        assert!(service.motion_renderer.lock().unwrap().profile.is_some());
+        assert!(service.state()["motion_capture"].is_null());
+        let saved = load_settings(&service.settings_path);
+        assert!(saved.motion_renderer.enabled);
+        assert_eq!(saved.motion_renderer.reports.len(), 256);
+        assert!(
+            crate::movement::abcurves::ProfileCache::new(&saved.motion_renderer)
+                .unwrap()
+                .profile
+                .is_some()
+        );
+        assert_eq!(service.pipeline.stats().processed_frames, 0);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn stale_invalid_cancelled_and_changed_profile_captures_do_not_write() {
+        let (service, dir) = test_service("physical-profile-cancel");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let old = arm_physical_capture(&service);
+        let original = std::fs::read(&service.settings_path).unwrap();
+        let mut invalid = captured_command(&old);
+        invalid["capture"]["timestamps_us"][120] = json!(1);
+        assert!(service.dispatch(invalid).is_err());
+        service.reconfigure().unwrap();
+        let current = service.state()["motion_capture"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(old, current);
+        assert!(service.dispatch(captured_command(&old)).is_err());
+        service.create_profile(Some("Other"), false).unwrap();
+        let after_switch = std::fs::read(&service.settings_path).unwrap();
+        assert!(service.dispatch(captured_command(&current)).is_err());
+        assert_eq!(std::fs::read(&service.settings_path).unwrap(), after_switch);
+        assert_ne!(original, after_switch);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn capture_never_overwrites_a_newer_http_save_or_activates_on_write_error() {
+        let (service, dir) = test_service("physical-profile-newer-save");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let id = arm_physical_capture(&service);
+        let mut newer = load_settings(&service.settings_path);
+        newer.offset_x = 13.0;
+        save_settings(&service.settings_path, &newer).unwrap();
+        let bytes = std::fs::read(&service.settings_path).unwrap();
+        assert!(service.dispatch(captured_command(&id)).is_err());
+        assert_eq!(std::fs::read(&service.settings_path).unwrap(), bytes);
+        assert!(service.motion_renderer.lock().unwrap().profile.is_none());
+        // Simulate a filesystem failure after restoring matching settings.
+        save_settings(&service.settings_path, &service.settings.lock().unwrap()).unwrap();
+        let original = std::fs::read(&service.settings_path).unwrap();
+        let blocked_temp = service.settings_path.parent().unwrap().join(format!(
+            ".{}.{}.tmp",
+            service.settings_path.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        std::fs::create_dir(&blocked_temp).unwrap();
+        let error = service.dispatch(captured_command(&id)).unwrap_err();
+        assert!(
+            error.contains("exist"),
+            "expected atomic-write failure: {error}"
+        );
+        assert_eq!(std::fs::read(&service.settings_path).unwrap(), original);
+        assert!(service.motion_renderer.lock().unwrap().profile.is_none());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn motion_renderer_profile_is_opt_in_validated_and_saved_per_profile() {

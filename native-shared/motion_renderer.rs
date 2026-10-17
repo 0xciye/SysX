@@ -7,7 +7,7 @@ pub struct MotionRendererSettings {
     pub enabled: bool,
     pub sample_interval_us: u32,
     /// Exactly 256 chronological genuine physical reports in native X-right,
-    /// Y-down counts. Empty until explicitly imported; never synthesized.
+    /// Y-down counts. Empty until automatically captured or explicitly imported; never synthesized.
     pub reports: Vec<[i16; 2]>,
 }
 
@@ -26,7 +26,7 @@ impl MotionRendererSettings {
         if self.sample_interval_us != 1000 {
             return Err("ABCurves requires physical reports sampled at exactly 1 ms.");
         }
-        if (self.enabled || !self.reports.is_empty()) && self.reports.len() != 256 {
+        if !self.reports.is_empty() && self.reports.len() != 256 {
             return Err("Import exactly 256 chronological physical mouse reports for ABCurves.");
         }
         if self.reports.iter().any(|report| report[1] == i16::MIN) {

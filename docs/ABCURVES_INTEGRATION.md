@@ -42,11 +42,25 @@ not been qualified for a particular game, device or hardware rate.
 
 ## Mouse profile
 
-In the Motion card, import a mouse-profile JSON file, then select the output and
-use the existing global **Apply Changes** action. Import never enables the addon
-by itself. Selecting Normal immediately returns to the original output path when
-the configuration is applied. The profile and enabled flag are stored per saved
-settings profile under `motionRenderer`.
+In the Motion card select **Normal + ABCurves (experimental)** and use global
+**Apply Changes**. If this settings profile has no mouse sample yet, SysX arms
+physical capture automatically. Connect Medius and move the physical mouse
+continuously at 1,000 Hz for at least 256 consecutive reports (about 256 ms).
+The card shows collection/progress or a restart/save error. No video frame or
+Motion trigger is needed for collection. Normal continues until preparation and
+saving succeed; ABCurves then becomes ready automatically.
+
+The sample is saved in local `app-settings.json` under this settings profile's
+`motionRenderer` and reused on subsequent launches. It is not continuously
+retrained. **Collect a new profile**, followed by Apply Changes, clears the current
+sample and arms a replacement. Choosing Normal and applying bypasses the renderer;
+a saved sample is retained for reuse. Switching profiles/configuration, disabling
+the option, or disconnecting cancels the in-flight capture. Automatic completion
+updates only the renderer, without resetting detection or Auto's pending clicks.
+
+The existing JSON importer remains available. Import never enables the addon by
+itself; choose the output and Apply Changes afterward. `enabled: true` with empty
+`reports` is the persisted pending-capture state, safely using Normal meanwhile.
 
 The JSON object has these fields:
 
@@ -68,11 +82,26 @@ events or interpolate physical input. The sample represents the device/setup and
 need not end at a target handoff. The importer validates the declared interval,
 shape and range, but cannot prove physical origin or actual sample cadence.
 
-There is currently **no automatic physical sampler**. The Medius movement-event
-stream has not been verified as a lossless 1 ms report source including genuine
-zero reports, so this integration does not turn it into a fabricated profile.
-No synthetic or participant dataset profile is installed by default. Synthetic
-report arrays exist only inside explicitly labeled tests.
+Automatic capture uses a separate SDK axis-watch subscription and worker;
+it does not add high-rate events to the button/output monitor. Only physical
+`Input::Motion` events stamped with `ClockDomain::HostChip` are accepted. The
+Medius 3.4.6 source suppresses all-zero motion events, so pauses do not supply zero
+reports. SysX never invents them: any gap, reordered timestamp, unsafe Y value or
+SDK queue loss restarts the window. Consecutive timestamp intervals must be
+800–1,200 µs, with a total 255-interval span within 2% of nominal 1 ms cadence.
+Timestamp wrap is handled. Other polling rates require changing the mouse to
+1,000 Hz; the collector does not resample input.
+
+The authenticated native host sends one timestamped result for its current
+session/profile ticket. The backend independently validates it, prepares the C
+profile off the ticker, compares current and saved settings, then atomically saves
+before publishing it to the renderer. A newer Apply cannot be overwritten by a
+late capture. Failed saves retain Normal and retry at two-second intervals.
+Inactive profile snapshots are preserved. UI state adoption preserves unrelated
+unsaved edits and imported samples. No OS-wide hook, generated movement or raw
+sample file is involved; only the saved profile's reports are persisted. No
+synthetic or participant dataset profile is installed by default. Synthetic report
+arrays exist only inside explicitly labeled tests.
 
 ## Source and license
 
@@ -91,9 +120,9 @@ and planner checkpoints are not redistributed here.
 
 Local Linux x86_64, Rust 1.99.1:
 
-- Backend: 106 unit and 42 integration tests passed; two existing tests ignored.
-- UI: 13 native tests passed; WASM configuration UI check passed.
-- Native host: 55 tests passed, including the headless render and mock SDK tests.
+- Backend: 112 unit and 42 integration tests passed; two existing tests ignored.
+- UI: 14 native tests passed; WASM configuration UI check passed.
+- Native host: 61 tests passed, including the headless render and mock SDK tests.
   Test-only fontconfig uses DejaVu; production UI source is unchanged.
 - Upstream C loader/API and fixed-math tests: 2 passed.
 - The wrapper matches upstream's frozen seed-123 output sequence with Y inversion.
@@ -101,6 +130,12 @@ Local Linux x86_64, Rust 1.99.1:
   reset/stall/error debt rejection, settings/profile persistence, and stale routing
   in both output modes. A synthetic feedback-loop check covers 16/30/50 ms delayed
   feedback at nominal gain; it is not a physical performance measurement.
+
+Automatic capture regressions cover timestamp wrap/rates/gaps/loss, isolated
+mock SDK subscriptions, stale/cancelled tickets, persistence and renderer readiness
+without video frames, unchanged Auto revision, write failures/newer saves, retry
+throttling, and UI draft preservation. The SDK mock sends synthetic hardware frames
+only and confirms no movement/injection frame was emitted.
 
 No Windows build workflow, physical capture, OBS/game session or device command
 was run for this change. The optional mode needs physical validation before it

@@ -535,7 +535,54 @@ fn migrate_smoothing(json: &mut serde_json::Value) {
     }
 }
 
+// All writers in this backend process share the same lock, including HTTP Apply
+// and automatic capture. Capture's compare-and-save must not overwrite a newer Apply.
+static SETTINGS_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn capture_identity(settings: &AppSettings) -> serde_json::Value {
+    let mut current = settings.clone();
+    current.profiles.clear(); // inactive snapshots are preserved from disk on save
+    serde_json::to_value(current).unwrap_or_default()
+}
+
+pub fn save_captured_renderer(
+    path: impl AsRef<Path>,
+    expected: &AppSettings,
+    renderer: MotionRendererSettings,
+) -> Result<AppSettings, SettingsError> {
+    let _guard = SETTINGS_IO_LOCK
+        .lock()
+        .map_err(|_| SettingsError::Invalid("settings file lock poisoned"))?;
+    let mut saved = load_settings(path.as_ref());
+    if !expected.motion_renderer.enabled
+        || !expected.motion_renderer.reports.is_empty()
+        || capture_identity(&saved) != capture_identity(expected)
+    {
+        return Err(SettingsError::Invalid(
+            "Settings changed while collecting; capture was not saved.",
+        ));
+    }
+    renderer.validate().map_err(SettingsError::Invalid)?;
+    if renderer.reports.len() != 256 {
+        return Err(SettingsError::Invalid("Capture is incomplete."));
+    }
+    saved.motion_renderer = renderer;
+    saved.sync_active_profile();
+    save_settings_unlocked(path, &saved)?;
+    Ok(saved)
+}
+
 pub fn save_settings(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
+    let _guard = SETTINGS_IO_LOCK
+        .lock()
+        .map_err(|_| SettingsError::Invalid("settings file lock poisoned"))?;
+    save_settings_unlocked(path, settings)
+}
+
+fn save_settings_unlocked(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+) -> Result<(), SettingsError> {
     let mut settings = settings.clone();
     settings.sync_active_profile();
     settings.validate()?;

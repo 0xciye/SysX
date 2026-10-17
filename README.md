@@ -162,20 +162,26 @@ commands.
 Main retains the confirmed Normal controller and Auto source from
 `stable/motion-auto-2026-10-17` (`a7d7a5b`); preserve that branch. Normal is still
 the default and bypasses model/resampling calls. The Motion card can opt into
-**Normal + ABCurves (experimental)** after importing exactly 256 genuine native
-mouse reports sampled at 1 ms. This adds the pinned upstream MIT C99 Renderer,
+**Normal + ABCurves (experimental)** and Apply Changes to automatically collect
+256 consecutive physical mouse reports at 1 ms through a dedicated Medius SDK
+subscription, or import a verified profile JSON. This adds the pinned upstream MIT C99 Renderer,
 not a replacement planner or Python runtime. Profile preparation is off the ticker;
 output is numerically rendered at 1 ms then aggregated through the existing
-roughly 4 ms batching/device path. There is no physical 1 kHz guarantee or automatic
-physical sampler. Do not fabricate a profile from missing events or generated
+roughly 4 ms batching/device path. There is no physical 1 kHz output guarantee.
+The sampler checks chip timestamps and queue loss; it never pads absent reports.
+Move continuously with a 1,000 Hz mouse; pauses/gaps restart collection. Normal
+runs until profile preparation and conditional disk persistence both succeed.
+Profiles are saved locally per settings profile and reused after restart. Switching
+profiles/settings, disabling the option or disconnecting cancels pending capture.
+Background completion does not reset detection or cancel pending Auto clicks. Do not fabricate a profile from missing events or generated
 movement. Renderer intent resets on inactive/stale/lost targets, revision changes
 and long scheduling gaps; runtime errors clear movement validity and surface in
 existing error status. Normal, target selection, Auto, native clamps and vendor
 output are unchanged. See [ABCurves integration](docs/ABCURVES_INTEGRATION.md) for
 profile schema, provenance, license and validation limits.
 
-Local validation: backend 106 unit + 42 integration passed (2 existing ignored),
-UI 13 tests and WASM check passed, host 55 tests passed with test-only DejaVu
-fontconfig, upstream C tests 2 passed. No Windows workflow or physical devices
+Local validation including automatic capture: backend 112 unit + 42 integration
+passed (2 existing ignored), UI 14 tests and WASM check passed, host 61 tests
+passed with test-only DejaVu fontconfig, upstream C tests 2 passed. No Windows workflow or physical devices
 were exercised. Tests and synthetic feedback checks do not establish in-game
 quality for the optional mode.

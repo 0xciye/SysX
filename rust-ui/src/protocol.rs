@@ -23,6 +23,8 @@ pub struct BackendState {
     #[serde(default)]
     pub motion_renderer: crate::settings::MotionRendererSettings,
     #[serde(default)]
+    pub motion_capture_message: String,
+    #[serde(default)]
     pub color_filter: bool,
     #[serde(default)]
     pub fov_degrees: u16,

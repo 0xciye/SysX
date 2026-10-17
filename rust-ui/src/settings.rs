@@ -412,3 +412,67 @@ mod tests {
         assert!(settings.validate().is_err(), "Min above Max");
     }
 }
+
+/// Adopt the backend's automatic sample save without overwriting unrelated
+/// drafts (including a user's unsaved switch back to Normal).
+pub fn merge_automatic_profile(
+    draft: &mut AppSettings,
+    applied: &mut AppSettings,
+    incoming: &MotionRendererSettings,
+    profile_index: u8,
+) -> bool {
+    if draft.active_profile != profile_index
+        || applied.active_profile != profile_index
+        || !applied.motion_renderer.enabled
+        || !applied.motion_renderer.reports.is_empty()
+        || !draft.motion_renderer.reports.is_empty()
+        || !incoming.enabled
+        || incoming.reports.len() != 256
+    {
+        return false;
+    }
+    draft.motion_renderer.reports = incoming.reports.clone();
+    draft.motion_renderer.sample_interval_us = incoming.sample_interval_us;
+    applied.motion_renderer = incoming.clone();
+    true
+}
+
+#[cfg(test)]
+mod automatic_profile_tests {
+    use super::*;
+    #[test]
+    fn automatic_profile_preserves_drafts_and_never_overwrites_an_import() {
+        let mut applied = AppSettings::default();
+        applied.motion_renderer.enabled = true;
+        let mut draft = applied.clone();
+        draft.motion_renderer.enabled = false;
+        draft.motion_speed_x = 0.12;
+        let incoming = MotionRendererSettings {
+            enabled: true,
+            reports: vec![[1, 2]; 256],
+            ..MotionRendererSettings::default()
+        };
+        assert!(merge_automatic_profile(
+            &mut draft,
+            &mut applied,
+            &incoming,
+            0
+        ));
+        assert!(!draft.motion_renderer.enabled);
+        assert_eq!(draft.motion_speed_x, 0.12);
+        assert_eq!(applied.motion_renderer, incoming);
+        assert_eq!(draft.motion_renderer.reports.len(), 256);
+        assert!(!merge_automatic_profile(
+            &mut draft,
+            &mut applied,
+            &incoming,
+            1
+        ));
+        assert!(!merge_automatic_profile(
+            &mut draft,
+            &mut applied,
+            &incoming,
+            0
+        ));
+    }
+}

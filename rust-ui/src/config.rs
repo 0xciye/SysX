@@ -26,6 +26,7 @@ pub fn ConfigApp() -> impl IntoView {
     let backend_connected = RwSignal::new(false);
     let backend_error = RwSignal::new(String::new());
     let apply_message = RwSignal::new(String::new());
+    let capture_message = RwSignal::new(String::new());
     let port_draft = RwSignal::new("4200".to_string());
     let crop_draft = RwSignal::new("640".to_string());
     let offset_x_draft = RwSignal::new("0".to_string());
@@ -62,6 +63,21 @@ pub fn ConfigApp() -> impl IntoView {
                     backend_connected.set(true);
                     backend_error.set(state.last_error.clone().unwrap_or_default());
                     profiles.set(state.profiles.clone());
+                    capture_message.set(state.motion_capture_message.clone());
+                    if let Ok(mut applied) =
+                        serde_json::from_str::<AppSettings>(&last_applied.get_untracked())
+                    {
+                        let mut draft = settings.get_untracked();
+                        if crate::settings::merge_automatic_profile(
+                            &mut draft,
+                            &mut applied,
+                            &state.motion_renderer,
+                            state.profile_index,
+                        ) {
+                            settings.set(draft);
+                            last_applied.set(serde_json::to_string(&applied).unwrap_or_default());
+                        }
+                    }
                     if !loaded_state_for_events.get()
                         || state.profile_index != settings.get_untracked().active_profile
                     {
@@ -550,7 +566,7 @@ pub fn ConfigApp() -> impl IntoView {
                                         <select prop:value=move || if settings.get().motion_renderer.enabled { "abcurves" } else { "normal" }
                                             on:change=move |event| settings.update(|value| value.motion_renderer.enabled = event_target_value(&event) == "abcurves")>
                                             <option value="normal">"Normal"</option>
-                                            <option value="abcurves" disabled=move || settings.get().motion_renderer.reports.len() != 256>"Normal + ABCurves (experimental)"</option>
+                                            <option value="abcurves">"Normal + ABCurves (experimental)"</option>
                                         </select>
                                     </label>
                                     <label class="text-button model-upload">"Import mouse profile"
@@ -563,10 +579,16 @@ pub fn ConfigApp() -> impl IntoView {
                                             }
                                         }/>
                                     </label>
+                                    <button type="button" class="text-button" on:click=move |_| settings.update(|value| {
+                                        value.motion_renderer.enabled = true;
+                                        value.motion_renderer.reports.clear();
+                                    })>"Collect a new profile"</button>
                                     <a class="text-button" href="/licenses/abcurves.txt" target="_blank" rel="noopener">"ABCurves license"</a>
                                     <p>{move || if settings.get().motion_renderer.reports.len() == 256 {
-                                        "Profile loaded. Choose output and Apply Changes."
-                                    } else { "ABCurves needs 256 genuine mouse reports sampled at 1 ms." }}</p>
+                                        "Mouse profile ready. Apply Changes if you edited settings.".to_string()
+                                    } else if settings.get().motion_renderer.enabled && !capture_message.get().is_empty() {
+                                        capture_message.get()
+                                    } else { "Choose ABCurves and Apply Changes to collect a mouse profile automatically. Normal runs until capture is saved.".to_string() }}</p>
                                 </div>
                             </div>
                             <div class="settings-row smoothing-settings-row">
