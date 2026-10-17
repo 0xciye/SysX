@@ -619,6 +619,7 @@ fn monitor_medius(
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {
+                    crate::diagnostics::record("auto: left click sent");
                     move_completion = Some(completion);
                     serial.pump();
                     continue;

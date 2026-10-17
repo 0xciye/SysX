@@ -1,10 +1,27 @@
 //! All Medius output uses the vendor Rust SDK, never hand-written wire frames.
 use medius::{Button, Device};
+use std::time::Duration;
+
+/// Press-to-release time of one Auto click, drawn per click. A press and
+/// release sent back to back can land in the same mouse report, and the game
+/// then sees no click at all; a real click lasts tens of milliseconds.
+const CLICK_PRESS_MS: (u64, u64) = (25, 40);
+
+fn click_press() -> Duration {
+    let mut byte = [0u8; 1];
+    let spread = CLICK_PRESS_MS.1 - CLICK_PRESS_MS.0;
+    let offset =
+        getrandom::fill(&mut byte).map_or(spread / 2, |_| u64::from(byte[0]) * spread / 255);
+    Duration::from_millis(CLICK_PRESS_MS.0 + offset)
+}
+
 pub fn dispatch(device: &Device, record: &[u8]) -> Result<(), String> {
     if crate::serial_queue::is_medius_left_click(record) {
         device
             .press(Button::LEFT)
             .map_err(|error| error.to_string())?;
+        // Runs on the output worker, so button telemetry keeps flowing.
+        std::thread::sleep(click_press());
         // Retry once: a failed release would leave the button held.
         device
             .release(Button::LEFT)
@@ -30,7 +47,13 @@ mod tests {
         mock.clear_recorded();
         expected.clear_recorded();
         dispatch(&device, &crate::serial_queue::encode_medius_move(-23, 17)).unwrap();
+        let started = std::time::Instant::now();
         dispatch(&device, &crate::serial_queue::encode_medius_left_click()).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(CLICK_PRESS_MS.0));
+        for _ in 0..50 {
+            let press = click_press().as_millis() as u64;
+            assert!((CLICK_PRESS_MS.0..=CLICK_PRESS_MS.1).contains(&press));
+        }
         reference.move_rel(-23, 17).unwrap();
         reference.press(Button::LEFT).unwrap();
         reference.release(Button::LEFT).unwrap();

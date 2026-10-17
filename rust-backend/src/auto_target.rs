@@ -2,15 +2,16 @@
 //!
 //! Auto does not rank pixels, lock onto a blob, or produce movement
 //! coordinates. It answers whether a valid target (the shared color mask,
-//! searched only inside the active Auto FOV circle) is passing through the
-//! screen center. The game's crosshair usually covers the exact center, so a
-//! target also counts as on center when its pixels lie on both sides of it.
+//! searched only inside the active Auto FOV circle) covers the screen center.
+//! The game's crosshair hides the center and its arms hide the center row
+//! and column, so the target counts as on center when its pixels surround the
+//! center: some lie left, right, above and below it (on any rows/columns).
 
 use crate::targeting::fov_radius_px;
 
 /// Returns `true` when the target covers the screen center: a nonzero mask
-/// pixel in the center cells, or mask pixels inside the Auto FOV on both sides
-/// of the center along its row (left and right) or column (above and below).
+/// pixel in the center cells, or mask pixels inside the Auto FOV on all four
+/// sides of the center (left, right, above and below).
 ///
 /// The mask is expected to be row-major with exactly `width * height` bytes.
 /// For even-sized images the crosshair falls between pixels, so the four
@@ -23,36 +24,35 @@ pub fn has_target_at_center(mask: &[u8], width: u32, height: u32, degrees: u16) 
     {
         return false;
     }
-    let left = width.saturating_sub(1) / 2;
-    let right = width / 2;
-    let top = height.saturating_sub(1) / 2;
-    let bottom = height / 2;
+    let (left, right) = (width.saturating_sub(1) / 2, width / 2);
+    let (top, bottom) = (height.saturating_sub(1) / 2, height / 2);
     let hit = |x: u32, y: u32| mask[(y * width + x) as usize] != 0;
-    for y in top..=bottom {
-        for x in left..=right {
-            if hit(x, y) {
+    if (top..=bottom).any(|y| (left..=right).any(|x| hit(x, y))) {
+        return true;
+    }
+    let radius = fov_radius_px(width, height, degrees);
+    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+    let reach = radius.ceil() as u32 + 1;
+    let (x0, x1) = (left.saturating_sub(reach), (right + reach).min(width - 1));
+    let (y0, y1) = (top.saturating_sub(reach), (bottom + reach).min(height - 1));
+    let (mut west, mut east, mut north, mut south) = (false, false, false, false);
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - cy;
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            if dx * dx + dy * dy > radius * radius || !hit(x, y) {
+                continue;
+            }
+            west |= dx < 0.0;
+            east |= dx > 0.0;
+            north |= dy < 0.0;
+            south |= dy > 0.0;
+            if west && east && north && south {
                 return true;
             }
         }
     }
-    let radius = fov_radius_px(width, height, degrees);
-    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
-    let inside = |x: u32, y: u32| {
-        let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-        dx * dx + dy * dy <= radius * radius
-    };
-    let reach = radius.ceil() as u32 + 1;
-    // Steps away from the center cells: (x, y) of step `d` in one direction.
-    let found = |cell: &dyn Fn(u32) -> (u32, u32)| {
-        (1..=reach)
-            .map(cell)
-            .any(|(x, y)| x < width && y < height && inside(x, y) && hit(x, y))
-    };
-    let across_row =
-        (top..=bottom).any(|y| found(&|d| (left.wrapping_sub(d), y)) && found(&|d| (right + d, y)));
-    let across_column =
-        (left..=right).any(|x| found(&|d| (x, top.wrapping_sub(d))) && found(&|d| (x, bottom + d)));
-    across_row || across_column
+    false
 }
 
 #[cfg(test)]
@@ -76,24 +76,35 @@ mod tests {
 
     #[test]
     fn a_target_around_a_crosshair_covered_center_counts() {
-        // Center cells hidden by the crosshair, target pixels on both sides.
-        let row = mask(&[(27, 32), (37, 32)]);
-        assert!(has_target_at_center(&row, 64, 64, 36));
-        let column = mask(&[(31, 26), (31, 38)]);
-        assert!(has_target_at_center(&column, 64, 64, 36));
+        // A head outline around the center; the crosshair hides the center
+        // cells and its arms hide the center row and column.
+        let mut points = Vec::new();
+        for d in 0..8u32 {
+            points.extend([(26 + d, 26), (26 + d, 38), (26, 26 + d), (38, 26 + d)]);
+        }
+        let outline = mask(&points);
+        assert!(has_target_at_center(&outline, 64, 64, 36));
+        // Pixels only in two diagonal corners still surround the center.
+        assert!(has_target_at_center(
+            &mask(&[(27, 27), (37, 37)]),
+            64,
+            64,
+            36
+        ));
     }
 
     #[test]
-    fn a_target_on_one_side_only_does_not_count() {
-        // Inside the FOV but not across the center.
+    fn a_target_beside_or_above_the_center_does_not_count() {
+        // Straddles the vertical line but sits entirely above the center.
         assert!(!has_target_at_center(
-            &mask(&[(37, 32), (40, 32)]),
+            &mask(&[(28, 26), (36, 26), (32, 22)]),
             64,
             64,
             90
         ));
+        // Entirely to the right.
         assert!(!has_target_at_center(
-            &mask(&[(37, 30), (37, 34)]),
+            &mask(&[(37, 28), (40, 36)]),
             64,
             64,
             90
@@ -104,8 +115,9 @@ mod tests {
     fn pixels_outside_the_fov_are_ignored() {
         // 36° is a 32 px radius (fixed 640 px reference); ±40 px is outside.
         let mut far = vec![0; 256 * 256];
-        far[128 * 256 + 88] = 1;
-        far[128 * 256 + 168] = 1;
+        for (x, y) in [(88, 88), (168, 168)] {
+            far[y * 256 + x] = 1;
+        }
         assert!(!has_target_at_center(&far, 256, 256, 36));
         assert!(has_target_at_center(&far, 256, 256, 90));
     }

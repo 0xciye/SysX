@@ -87,6 +87,47 @@ impl AutoEvents {
     }
 }
 
+/// Held-Auto-trigger summary for the diagnostics log, at most one line every
+/// two seconds: whether frames arrive and how often the target is on center.
+#[derive(Default)]
+struct AutoSummary {
+    started: Option<Instant>,
+    frames: u32,
+    on_center: u32,
+}
+
+impl AutoSummary {
+    fn add(&mut self, active: bool, on_center: bool, fov_degrees: u16) -> Option<String> {
+        if !active {
+            // Trigger released: report what was gathered, if worth a line.
+            let line = self
+                .started
+                .filter(|started| started.elapsed() >= Duration::from_millis(250))
+                .and_then(|_| self.take(fov_degrees));
+            *self = Self::default();
+            return line;
+        }
+        let started = *self.started.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.on_center += u32::from(on_center);
+        (started.elapsed() >= Duration::from_secs(2))
+            .then(|| self.take(fov_degrees))
+            .flatten()
+    }
+
+    fn take(&mut self, fov_degrees: u16) -> Option<String> {
+        let seconds = self.started?.elapsed().as_secs_f64().max(1e-3);
+        let line = format!(
+            "auto held {seconds:.1} s: {} frames ({:.0}/s), target on center in {} (Auto FOV {fov_degrees}°)",
+            self.frames,
+            f64::from(self.frames) / seconds,
+            self.on_center,
+        );
+        *self = Self::default();
+        Some(line)
+    }
+}
+
 struct SourceState {
     active: Option<UdpDecodedFrameSource>,
     active_port: u16,
@@ -261,6 +302,7 @@ impl ReceiverService {
         let callback_settings = Arc::clone(&settings);
         let callback_device = Arc::clone(&device);
         let callback_auto = Arc::clone(&auto_events);
+        let auto_summary = Mutex::new(AutoSummary::default());
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(0_u64);
         let callback: Arc<dyn Fn(&ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
             // Wake every preview socket for this frame (no timer polling:
@@ -295,10 +337,15 @@ impl ReceiverService {
                         received_s: 0.0,
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
-                    events.target(
-                        processed.auto_config_revision,
-                        auto_active && processed.result.auto_target_valid,
-                    );
+                    let on_center = auto_active && processed.result.auto_target_valid;
+                    events.target(processed.auto_config_revision, on_center);
+                    if let Ok(mut summary) = auto_summary.lock() {
+                        if let Some(line) =
+                            summary.add(auto_active, on_center, settings.auto.fov_degrees)
+                        {
+                            crate::diagnostics::record(&line);
+                        }
+                    }
                 }
             }
         });
@@ -1799,6 +1846,20 @@ mod tests {
         assert!(!data_dir.join("sessions").exists());
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn auto_summary_reports_frames_and_center_hits() {
+        let mut summary = super::AutoSummary::default();
+        assert!(summary.add(false, false, 36).is_none(), "nothing gathered");
+        for frame in 0..10 {
+            assert!(summary.add(true, frame % 5 == 0, 36).is_none());
+        }
+        summary.started = Some(Instant::now() - Duration::from_secs(1));
+        let line = summary.add(false, false, 36).expect("released: summary");
+        assert!(line.contains("10 frames"), "{line}");
+        assert!(line.contains("on center in 2"), "{line}");
+        assert!(line.contains("Auto FOV 36°"), "{line}");
     }
 
     #[test]
