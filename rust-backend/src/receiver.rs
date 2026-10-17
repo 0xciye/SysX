@@ -175,24 +175,40 @@ impl UdpDecodedFrameSource {
         self.reassembler.stats()
     }
     pub fn read(&mut self, timeout: Duration) -> Result<Option<SourceFrame>, ReceiverError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(frame) = self.read_encoded(remaining)? else {
+                return Ok(None);
+            };
+            let received = Instant::now();
+            match decode_udp_frame(frame) {
+                Ok(mut frame) => {
+                    frame.received = received;
+                    return Ok(Some(frame));
+                }
+                Err(_) => self.reassembler.reject_decoded_frame(),
+            }
+        }
+    }
+
+    /// The newest complete frame, not yet decoded (the service decodes in a
+    /// [`crate::decode_pool::DecodePool`]).
+    pub fn read_encoded(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<EncodedFrame>, ReceiverError> {
         self.open()?;
         let deadline = Instant::now() + timeout;
         loop {
             self.reassembler.expire(monotonic_ns());
             // Read everything already queued first, so only the newest
-            // complete frame is decoded: when decoding falls behind, the
+            // complete frame is handed on: when decoding falls behind, the
             // socket buffer (8 MiB) would otherwise hold seconds of old frames
             // and every frame handed on would be one of them.
             self.drain()?;
             if let Some(frame) = self.reassembler.take_latest() {
-                let received = Instant::now();
-                match decode_udp_frame(frame) {
-                    Ok(mut frame) => {
-                        frame.received = received;
-                        return Ok(Some(frame));
-                    }
-                    Err(_) => self.reassembler.reject_decoded_frame(),
-                }
+                return Ok(Some(frame));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -265,10 +281,14 @@ impl UdpDecodedFrameSource {
     }
 }
 
+/// Errors that leave the socket usable. Windows reports an ICMP "port
+/// unreachable" for an earlier SYSCFG reply (sender restarting, LAN hiccup)
+/// as `ConnectionReset` on the next receive; treating that as fatal closed
+/// the listener and stopped frames for the 3 s retry.
 fn quiet(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset
     )
 }
 
@@ -445,7 +465,10 @@ mod tests {
     fn libjpeg_turbo_decodes_the_fixture_like_the_reference_decoder() {
         let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
         let ours = crate::jpeg::decode(jpeg, 192, 192, false).unwrap();
-        let reference = image::load_from_memory(jpeg).unwrap().into_rgb8().into_raw();
+        let reference = image::load_from_memory(jpeg)
+            .unwrap()
+            .into_rgb8()
+            .into_raw();
         assert_eq!(ours.len(), reference.len());
         let worst = ours
             .iter()
@@ -456,9 +479,11 @@ mod tests {
         assert!(worst <= 4, "largest channel difference {worst}");
         assert!(matches!(
             crate::jpeg::decode(jpeg, 64, 64, false),
-            Err(crate::jpeg::JpegError::Dimensions { width: 192, height: 192 })
+            Err(crate::jpeg::JpegError::Dimensions {
+                width: 192,
+                height: 192
+            })
         ));
         assert!(crate::jpeg::decode(b"\xff\xd8junk\xff\xd9", 192, 192, false).is_err());
     }
 }
-

@@ -2,6 +2,7 @@ use crate::config::{
     load_settings, save_settings, AppSettings, AutoSettings, ModelDefinition, ModelRegistry,
     RecoilSettings,
 };
+use crate::decode_pool::DecodePool;
 use crate::movement::{
     CalibrationStore, MovementBatcher, MovementRuntimeSettings, MovementTargetSample,
     MovementTicker,
@@ -173,6 +174,8 @@ pub struct ReceiverService {
     movement_ticker: Arc<MovementTicker>,
     source: Arc<Mutex<SourceState>>,
     source_times: Arc<Mutex<VecDeque<u64>>>,
+    /// Decodes the frames the receiver thread reassembles.
+    decoder: DecodePool,
     errors: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -360,6 +363,22 @@ impl ReceiverService {
             }
         });
         let pipeline = Arc::new(LatestFramePipeline::new(config, Some(callback)));
+        let source_times = Arc::new(Mutex::new(VecDeque::with_capacity(720)));
+        let decoder = {
+            let (times, pipeline) = (Arc::clone(&source_times), Arc::clone(&pipeline));
+            DecodePool::new(
+                crate::decode_pool::default_workers(),
+                Arc::new(move |frame| {
+                    if let Ok(mut times) = times.lock() {
+                        times.push_back(monotonic_ns());
+                        if times.len() > 720 {
+                            times.pop_front();
+                        }
+                    }
+                    let _ = pipeline.submit(frame);
+                }),
+            )
+        };
         let mut initial_source = UdpDecodedFrameSource::new(
             "0.0.0.0",
             app.port.parse::<u16>().unwrap_or(requested_udp_port),
@@ -390,7 +409,8 @@ impl ReceiverService {
             movement_ticker,
             source_view: Mutex::new(SourceView::of(&source_state)),
             source: Arc::new(Mutex::new(source_state)),
-            source_times: Arc::new(Mutex::new(VecDeque::with_capacity(720))),
+            source_times,
+            decoder,
             errors: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
             reader: Mutex::new(None),
@@ -426,6 +446,7 @@ impl ReceiverService {
         let models = self.registry.lock().ok();
         let latest = self.pipeline.latest();
         let stats = self.pipeline.stats();
+        let decoded = self.decoder.stats();
         let source_name;
         let source_port;
         let transport;
@@ -483,8 +504,8 @@ impl ReceiverService {
             "expected_source_resolution":expected_source_resolution,
             "session_id":self.session_id, "processed_frames":stats.processed_frames, "dropped_input_frames":stats.dropped_input_frames,
             "rejected_frames":stats.rejected_frames, "resolution_mismatches":stats.resolution_mismatches,
-            "transport_dropped_frames":transport.dropped_frames + transport.expired_frames, "invalid_packets":transport.invalid_packets,
-            "invalid_frames":transport.invalid_frames,
+            "transport_dropped_frames":transport.dropped_frames + transport.expired_frames + decoded.superseded, "invalid_packets":transport.invalid_packets,
+            "invalid_frames":transport.invalid_frames + decoded.failed,
             "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
             "device":device,
             "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
@@ -1174,7 +1195,7 @@ fn receiver_loop(service: Weak<ReceiverService>) {
         }
         let read = service.source.lock().ok().map(|mut state| {
             let result = if let Some(source) = state.active.as_mut() {
-                source.read(Duration::from_millis(100))
+                source.read_encoded(Duration::from_millis(100))
             } else {
                 Ok(None)
             };
@@ -1186,15 +1207,7 @@ fn receiver_loop(service: Weak<ReceiverService>) {
             result
         });
         match read {
-            Some(Ok(Some(frame))) => {
-                if let Ok(mut times) = service.source_times.lock() {
-                    times.push_back(monotonic_ns());
-                    if times.len() > 720 {
-                        times.pop_front();
-                    }
-                }
-                let _ = service.pipeline.submit(frame);
-            }
+            Some(Ok(Some(frame))) => service.decoder.submit(frame, Instant::now()),
             Some(Ok(None)) => thread::sleep(Duration::from_millis(5)),
             Some(Err(error)) => {
                 let message = error.to_string();
@@ -1500,7 +1513,7 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
         "crop_x":processed.crop_x, "crop_y":processed.crop_y, "mode":processed.result.mode,
         "model_id":processed.result.model_id, "processing_fps":stats.processing_fps, "source_fps":service.source_fps(),
         "dropped_input_frames":stats.dropped_input_frames, "rejected_frames":stats.rejected_frames,
-        "resolution_mismatches":stats.resolution_mismatches, "transport_dropped_frames":transport.dropped_frames + transport.expired_frames,
+        "resolution_mismatches":stats.resolution_mismatches, "transport_dropped_frames":transport.dropped_frames + transport.expired_frames + service.decoder.stats().superseded,
         "detection":processed.result, "color_mask":color_mask,
     });
     let bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;

@@ -4,6 +4,7 @@ pub mod auto_target;
 pub mod cli;
 pub mod config;
 pub mod crop;
+pub mod decode_pool;
 #[path = "../../native-shared/diagnostics.rs"]
 pub mod diagnostics;
 pub mod inference;
