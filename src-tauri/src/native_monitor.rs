@@ -25,7 +25,14 @@ pub struct View {
     pub connected: bool,
     pub error: String,
     pub revision: u64,
+    /// Set when a decoded frame is published, cleared once the window has
+    /// drawn it: frames replaced before a redraw are never seen, so the
+    /// decoder waits (up to `DRAW_WAIT`) instead of decoding them.
+    pub awaiting_draw: Arc<AtomicBool>,
 }
+
+/// Longest the decoder waits for a redraw (hidden or stalled window).
+const DRAW_WAIT: Duration = Duration::from_millis(50);
 impl View {
     pub fn live_frame(&self) -> Option<&Frame> {
         self.frame.as_deref().filter(|f| {
@@ -185,7 +192,18 @@ impl Workers {
             std::thread::Builder::new()
                 .name("sysx-native-decode".into())
                 .spawn(move || {
+                    let awaiting = view
+                        .lock()
+                        .map(|view| Arc::clone(&view.awaiting_draw))
+                        .unwrap_or_default();
                     while !stop.load(Ordering::Acquire) {
+                        let waiting_since = Instant::now();
+                        while awaiting.load(Ordering::Acquire)
+                            && waiting_since.elapsed() < DRAW_WAIT
+                            && !stop.load(Ordering::Acquire)
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                         let frame = {
                             let Ok(slot) = inbox.pending.lock() else {
                                 break;
@@ -206,6 +224,7 @@ impl Workers {
                                         view.frame = Some(Arc::new(frame));
                                         view.error.clear();
                                         view.revision += 1;
+                                        awaiting.store(true, Ordering::Release);
                                         notify_decode();
                                     }
                                 }

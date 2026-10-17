@@ -488,16 +488,36 @@ pub fn run(
     });
     // UI closures live on the event-loop thread; worker notifications carry only a weak handle.
     let ui_update = Rc::clone(&update);
+    // Let the decoder go on once a frame is on screen. Renderers without a
+    // rendering notifier (software) release it when the frame is uploaded.
+    let awaiting = view
+        .lock()
+        .map(|view| Arc::clone(&view.awaiting_draw))
+        .unwrap_or_default();
+    let drawn = Arc::clone(&awaiting);
+    let notified = app
+        .window()
+        .set_rendering_notifier(move |state, _| {
+            if matches!(state, slint::RenderingState::AfterRendering) {
+                drawn.store(false, Ordering::Release);
+            }
+        })
+        .is_ok();
+    let release_on_upload = (!notified).then_some(awaiting);
     let display = Arc::clone(&view);
     let dirty = Arc::clone(&queued);
     let notify = Arc::new(move || {
         if !dirty.swap(true, Ordering::AcqRel) {
             let view = Arc::clone(&display);
             let dirty = Arc::clone(&dirty);
+            let release_on_upload = release_on_upload.clone();
             let _ = weak.upgrade_in_event_loop(move |app| {
                 dirty.store(false, Ordering::Release);
                 let snapshot = view.lock().map(|v| v.clone()).unwrap_or_default();
                 UPLOAD.with(|last| refresh(&app, &snapshot, last));
+                if let Some(awaiting) = &release_on_upload {
+                    awaiting.store(false, Ordering::Release);
+                }
             });
         }
     });
