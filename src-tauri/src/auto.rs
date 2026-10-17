@@ -67,7 +67,8 @@ pub struct AutoState {
     timing: AutoTiming,
     phase: AutoPhase,
     deadline: Option<Instant>,
-    /// The last click's minimum interval survives target loss/rearming.
+    /// The last click's minimum interval survives target loss; releasing the
+    /// trigger clears it.
     cooldown_until: Option<Instant>,
     config_revision: u64,
     /// Next time the Auto state may be evaluated. Sleep is a polling cadence,
@@ -153,12 +154,15 @@ impl AutoState {
         now: Instant,
     ) -> Option<AutoAction> {
         if !self.enabled || !trigger_held {
+            // Releasing the trigger (or disabling Auto) cancels everything
+            // that would follow: a pending delayed click and the cooldown.
             self.reset();
+            self.cooldown_until = None;
             return None;
         }
 
-        // A center crossing arms one delayed click. The target need not stay
-        // at the center until it fires; target loss only rearms other phases.
+        // A valid target in the Auto FOV arms one delayed click. The target
+        // need not stay until it fires; target loss only rearms other phases.
         if !target_valid && self.phase != AutoPhase::WaitingDelay {
             self.reset();
             return None;
@@ -281,29 +285,57 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_survives_target_flicker_and_trigger_rearming() {
-        for release_trigger in [false, true] {
-            let start = Instant::now();
-            let mut state = AutoState::new();
-            state.set_enabled(true);
-            state.set_timing(AutoTiming {
-                delay_ms: 0,
-                cooldown_ms: 1000,
-                sleep_ms: 0,
-            });
-            assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
-            state.update(!release_trigger, false, start + Duration::from_millis(1));
-            for ms in [2, 500, 999] {
-                assert_eq!(
-                    state.update(true, true, start + Duration::from_millis(ms)),
-                    None
-                );
-            }
+    fn cooldown_survives_target_flicker_but_a_trigger_release_cancels_it() {
+        let start = Instant::now();
+        let timing = AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 1000,
+            sleep_ms: 0,
+        };
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(timing);
+        assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+        state.update(true, false, start + Duration::from_millis(1));
+        for ms in [2, 500, 999] {
             assert_eq!(
-                state.update(true, true, start + Duration::from_millis(1000)),
-                Some(AutoAction::LeftClick)
+                state.update(true, true, start + Duration::from_millis(ms)),
+                None
             );
         }
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(1000)),
+            Some(AutoAction::LeftClick)
+        );
+
+        // Releasing the trigger cancels what would follow, the cooldown too.
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(timing);
+        assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+        state.update(false, false, start + Duration::from_millis(1));
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(2)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn releasing_the_trigger_cancels_a_pending_delayed_click() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 50,
+            cooldown_ms: 0,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), None, "delay armed");
+        state.update(false, true, start + Duration::from_millis(20));
+        assert_eq!(
+            state.update(true, false, start + Duration::from_millis(60)),
+            None
+        );
     }
 
     #[test]

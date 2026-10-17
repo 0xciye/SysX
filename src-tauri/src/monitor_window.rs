@@ -278,7 +278,7 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
     } else {
         state.map(|s| s.fov_degrees).unwrap_or(36)
     };
-    let d = fov_diameter(rect, fov).unwrap_or(0.);
+    let d = fov_diameter(rect, (meta.source_width, meta.source_height), fov).unwrap_or(0.);
     app.set_fov_size(d as f32);
     app.set_fov_x((rect.x + (rect.width - d) / 2.) as f32);
     app.set_fov_y((rect.y + (rect.height - d) / 2.) as f32);

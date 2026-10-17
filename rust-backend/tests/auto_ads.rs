@@ -11,7 +11,7 @@ use host_auto::{AutoAction, AutoState, AutoTiming};
 use image::{Rgb, RgbImage};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::time::{Duration, Instant};
-use sysx_backend::auto_target::has_center_pixel_in_fov;
+use sysx_backend::auto_target::has_target_at_center;
 use sysx_backend::pixel_seek::{color_mask, PixelTargetColor};
 
 /// Only the pixels around the crosshair matter to the center gate; an even
@@ -122,7 +122,7 @@ fn simulate(scene: &Scene, seed: u64) -> Outcome {
             let mask = color_mask(&image, PixelTargetColor::Yellow);
             (
                 captured + RECEIVE_S,
-                has_center_pixel_in_fov(&mask, SIZE, SIZE, 36),
+                has_target_at_center(&mask, SIZE, SIZE, 36),
             )
         })
         .collect();

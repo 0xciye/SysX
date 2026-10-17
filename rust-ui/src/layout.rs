@@ -101,11 +101,24 @@ pub fn canvas_backing_size(width: f64, height: f64, pixel_ratio: f64) -> Option<
     ))
 }
 
-pub fn fov_diameter(image_rect: Rect, degrees: u16) -> Option<f64> {
-    if !dimensions_valid(&[image_rect.width, image_rect.height]) || !(1..=360).contains(&degrees) {
+/// FOV degrees map to source pixels against this fixed side (the backend's
+/// `FOV_REFERENCE_PX`), so a setting is the same circle on screen at every
+/// Crop Resolution (360° = 640 px, limited to the image).
+pub const FOV_REFERENCE_PX: f64 = 640.0;
+
+/// FOV circle diameter in display pixels for a `source` image drawn into
+/// `image_rect`.
+pub fn fov_diameter(image_rect: Rect, source: (u32, u32), degrees: u16) -> Option<f64> {
+    if !dimensions_valid(&[image_rect.width, image_rect.height])
+        || source.0 == 0
+        || source.1 == 0
+        || !(1..=360).contains(&degrees)
+    {
         return None;
     }
-    Some((image_rect.width.min(image_rect.height) - 1.0).max(0.0) * degrees as f64 / 360.0)
+    let limit = (f64::from(source.0.min(source.1)) - 1.0).max(0.0);
+    let source_px = ((FOV_REFERENCE_PX - 1.0) * f64::from(degrees) / 360.0).min(limit);
+    Some(source_px * image_rect.width / f64::from(source.0))
 }
 
 pub fn preview_detections<T>(
@@ -272,7 +285,12 @@ mod tests {
             width: 480.0,
             height: 320.0,
         };
-        assert_eq!(fov_diameter(rect, 360), Some(319.0));
+        // Same degrees, same source pixels at every crop; drawn at display scale.
+        assert_eq!(fov_diameter(rect, (480, 320), 360), Some(319.0));
+        assert_eq!(fov_diameter(rect, (640, 640), 36), Some(63.9 * 480.0 / 640.0));
+        let small = fov_diameter(rect, (256, 256), 50).unwrap() * 256.0 / 480.0;
+        let large = fov_diameter(rect, (640, 640), 50).unwrap() * 640.0 / 480.0;
+        assert!((small - large).abs() < 1e-9, "{small} vs {large}");
         assert_eq!(canvas_backing_size(480.0, 320.0, 2.0), Some((960, 640)));
     }
 

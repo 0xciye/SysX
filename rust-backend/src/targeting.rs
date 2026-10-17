@@ -21,6 +21,17 @@ pub struct PriorTarget {
     pub class_id: Option<u32>,
 }
 
+/// FOV degrees map to pixels against this fixed reference side, not the
+/// crop: the crop is a native-resolution cutout, so the same setting must be
+/// the same circle on screen at every Crop Resolution (360° = 640 px).
+pub const FOV_REFERENCE_PX: f32 = 640.0;
+
+/// FOV circle radius in image pixels, limited to the image.
+pub fn fov_radius_px(width: u32, height: u32, degrees: u16) -> f32 {
+    let limit = (width.min(height) as f32 - 1.0).max(0.0) / 2.0;
+    ((FOV_REFERENCE_PX - 1.0) * f32::from(degrees) / 720.0).min(limit)
+}
+
 pub fn highest_pixel_in_fov(
     mask: &[u8],
     width: u32,
@@ -55,7 +66,7 @@ pub fn highest_pixel_in_fov_within(
     ];
     let cx = width as f32 / 2.0;
     let cy = height as f32 / 2.0;
-    let radius = (width.min(height) as f32 - 1.0) * degrees as f32 / 720.0;
+    let radius = fov_radius_px(width, height, degrees);
     for y in top..bottom {
         let py = y as f32 + 0.5;
         let mut best_x: Option<u32> = None;
@@ -126,7 +137,7 @@ pub fn object_detection_target(
     }
     let cx = width as f32 / 2.0;
     let cy = height as f32 / 2.0;
-    let radius = (width.min(height) as f32 - 1.0) * fov_degrees as f32 / 720.0;
+    let radius = fov_radius_px(width, height, fov_degrees);
     let eligible: Vec<_> = candidates
         .iter()
         .filter(|candidate| {

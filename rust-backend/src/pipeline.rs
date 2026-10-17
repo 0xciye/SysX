@@ -1,4 +1,4 @@
-use crate::auto_target::has_center_pixel_in_fov;
+use crate::auto_target::has_target_at_center;
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
@@ -464,7 +464,7 @@ fn process_frame(
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let auto_target_valid = config.auto_target_active
-        && has_center_pixel_in_fov(
+        && has_target_at_center(
             &output.mask,
             processed.width(),
             processed.height(),
