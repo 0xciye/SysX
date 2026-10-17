@@ -110,7 +110,7 @@ impl MovementController {
                 strength(sample.smoothing_alpha.0),
                 strength(sample.smoothing_alpha.1),
             ),
-            in_smooth_fov: error.0.hypot(error.1) < f64::from(smooth_radius),
+            smooth_fov_px: f64::from(smooth_radius),
             counts_per_px: counts_per_px(self.sens),
         })
     }
