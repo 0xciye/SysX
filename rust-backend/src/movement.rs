@@ -1219,6 +1219,84 @@ pub struct MovementTicker {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Held-trigger tracking summary for the diagnostics log, at most one line
+/// every two seconds: whether calibration is on decides how fast the aim
+/// tracks in a real game, which simulation cannot show.
+#[derive(Default)]
+struct MotionSummary {
+    started: Option<Instant>,
+    ticks: u32,
+    frames: u32,
+    last_frame: Option<u64>,
+    error_px: f64,
+    counts: i64,
+}
+
+impl MotionSummary {
+    const PERIOD: Duration = Duration::from_secs(2);
+
+    fn add(
+        &mut self,
+        controller: &MovementController,
+        frame_id: u64,
+        step: (i64, i64),
+    ) -> Option<String> {
+        let started = *self.started.get_or_insert_with(Instant::now);
+        self.ticks += 1;
+        if self.last_frame != Some(frame_id) {
+            self.last_frame = Some(frame_id);
+            self.frames += 1;
+            self.error_px += controller.frame_error.0.hypot(controller.frame_error.1);
+        }
+        self.counts += step.0.abs() + step.1.abs();
+        (started.elapsed() >= Self::PERIOD).then(|| self.take(controller))
+    }
+
+    /// Trigger released: report what was gathered, if it is worth a line.
+    fn finish(&mut self, controller: &MovementController) -> Option<String> {
+        let started = self.started?;
+        if started.elapsed() < Duration::from_millis(250) {
+            *self = Self::default();
+            return None;
+        }
+        Some(self.take(controller))
+    }
+
+    fn take(&mut self, controller: &MovementController) -> String {
+        let seconds = self
+            .started
+            .map_or(0.0, |at| at.elapsed().as_secs_f64())
+            .max(1e-3);
+        let calibration = match controller.calibration {
+            Some(c) => format!(
+                "on, {:.3} px/count, latency {:.0} ms, error {:.0}%{}",
+                c.px_per_count,
+                c.latency_s * 1000.0,
+                controller.calibration_error * 100.0,
+                if controller.calibration_loaded {
+                    ", loaded"
+                } else {
+                    ""
+                }
+            ),
+            None => format!(
+                "off (uncalibrated slow path, evidence {:.0})",
+                controller.calibrator.weight
+            ),
+        };
+        let line = format!(
+            "motion held {seconds:.1} s: {} frames ({:.0}/s), {} ticks, mean target error {:.1} px, {:.0} counts/s; calibration {calibration}",
+            self.frames,
+            f64::from(self.frames) / seconds,
+            self.ticks,
+            self.error_px / f64::from(self.frames.max(1)),
+            self.counts as f64 / seconds,
+        );
+        *self = Self::default();
+        line
+    }
+}
+
 impl MovementTicker {
     pub fn new(
         initial_sens: f64,
@@ -1242,6 +1320,7 @@ impl MovementTicker {
                 let mut sens = initial_sens;
                 let mut saved: Option<(MotionCalibration, Instant)> = None;
                 let mut sent_invalid = false;
+                let mut summary = MotionSummary::default();
                 loop {
                     let (sample, updated_at) = {
                         let (lock, wake) = &*worker_shared;
@@ -1325,6 +1404,14 @@ impl MovementTicker {
                             now,
                             runtime.output_active(),
                         );
+                        if runtime.output_active() {
+                            if let Some(line) = summary.add(&controller, sample.frame_id, (dx, dy))
+                            {
+                                crate::diagnostics::record(&line);
+                            }
+                        } else if let Some(line) = summary.finish(&controller) {
+                            crate::diagnostics::record(&line);
+                        }
                         if let Some(measured) = controller.saveable_calibration() {
                             let due = saved.is_none_or(|(last, at)| {
                                 at.elapsed() >= CALIBRATION_SAVE_INTERVAL
@@ -1850,6 +1937,29 @@ mod tests {
                 .iter()
                 .all(|(x, y)| *y == 0 && *x >= 0));
         }
+    }
+
+    #[test]
+    fn held_trigger_summary_reports_frames_and_calibration_state() {
+        let mut controller = seeded(1);
+        let mut summary = MotionSummary::default();
+        assert!(summary.finish(&controller).is_none(), "nothing gathered");
+        for tick in 0..10u64 {
+            assert!(summary.add(&controller, tick / 2, (2, -1)).is_none());
+        }
+        summary.started = Some(Instant::now() - Duration::from_secs(1));
+        let line = summary.finish(&controller).expect("summary line");
+        assert!(line.contains("5 frames"), "{line}");
+        assert!(line.contains("10 ticks"), "{line}");
+        assert!(line.contains("calibration off"), "{line}");
+        controller.load_calibration(Some(MotionCalibration {
+            px_per_count: 0.31,
+            latency_s: 0.024,
+        }));
+        summary.add(&controller, 99, (0, 0));
+        summary.started = Some(Instant::now() - Duration::from_secs(1));
+        let line = summary.finish(&controller).unwrap();
+        assert!(line.contains("on, 0.310 px/count, latency 24 ms"), "{line}");
     }
 
     #[test]
