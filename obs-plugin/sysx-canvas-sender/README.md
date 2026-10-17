@@ -3,8 +3,8 @@
 A UI-less OBS global module for Windows. Once loaded it:
 
 1. reads the OBS main texture in the main-rendered callback,
-2. copies the receiver-requested centered `N × N` crop on the GPU and reads it back through a three-surface staging ring (the render thread never waits on the readback it just queued),
-3. JPEG-encodes the crop on a worker thread with libjpeg-turbo (BGRA input, 4:4:4 chroma by default so small Pixel Seek colors are not smeared),
+2. copies the receiver-requested centered `N × N` crop on the GPU and reads it back without blocking OBS's render thread (D3D11: plugin-owned staging ring mapped with `D3D11_MAP_FLAG_DO_NOT_WAIT`, newest finished copy sent, unfinished ones skipped; other renderers: libobs three-surface staging ring),
+3. JPEG-encodes the crop on two worker threads with libjpeg-turbo (frame IDs assigned in capture order; a frame finishing after a newer one is rejected by the receiver) (BGRA input, 4:4:4 chroma by default so small Pixel Seek colors are not smeared),
 4. sends it to SysX with the `RCVR` v1 UDP protocol (`docs/OBS_RECEIVER_PROTOCOL.md`): 30-byte big-endian header, 1,170-byte JPEG chunks, ≤1,200-byte datagrams.
 
 The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <resolution>` and repeats it whenever Crop Resolution changes. The plugin accepts that message only from the configured receiver address and recreates its GPU crop resources, so the receiver's Crop Resolution stays authoritative. Only the newest frame is kept; a slow encoder or network drops obsolete frames instead of queueing them.

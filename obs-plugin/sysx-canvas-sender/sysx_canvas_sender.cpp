@@ -1,13 +1,14 @@
 // SysX OBS canvas sender: captures the OBS main texture, crops the
-// receiver-requested centered square on the GPU, JPEG-encodes it off the render
-// thread and sends it to SysX using the RCVR v1 UDP protocol
-// (docs/OBS_RECEIVER_PROTOCOL.md).
+// receiver-requested centered square on the GPU, reads it back without ever
+// blocking OBS's render thread, JPEG-encodes it on worker threads and sends it
+// to SysX using the RCVR v1 UDP protocol (docs/OBS_RECEIVER_PROTOCOL.md).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <d3d11.h>
 
 #include <obs-module.h>
 #include <graphics/graphics.h>
@@ -45,6 +46,10 @@ constexpr size_t kPayloadBytes = 1170;
 constexpr size_t kHeaderBytes = 30;
 constexpr char kControlPrefix[] = "SYSCFG 1 CROP ";
 constexpr int kSendBufferBytes = 8 * 1024 * 1024;
+// JPEG encoders: a 640 x 640 4:4:4 encode takes about as long as a 240 FPS
+// frame interval, so one thread alone dropped frames whenever the game loaded
+// the CPU.
+constexpr size_t kEncoderThreads = 2;
 
 // ---- Sender configuration: edit these and rebuild the DLL. ----
 // SysX receiver IPv4 address (or hostname) and UDP port.
@@ -92,6 +97,8 @@ struct ObsApi {
   using StageDestroy = void (*)(gs_stagesurf_t *);
   using StageMap = bool (*)(gs_stagesurf_t *, uint8_t **, uint32_t *);
   using StageUnmap = void (*)(gs_stagesurf_t *);
+  using GetDeviceObj = void *(*)();
+  using TextureGetObj = void *(*)(gs_texture_t *);
 
   AddRendered add_rendered = nullptr;
   RemoveRendered remove_rendered = nullptr;
@@ -109,6 +116,10 @@ struct ObsApi {
   StageDestroy stage_destroy = nullptr;
   StageMap stage_map = nullptr;
   StageUnmap stage_unmap = nullptr;
+  // Optional: the D3D11 device and texture behind libobs objects, for the
+  // non-blocking readback. Missing (or another renderer) = libobs staging.
+  GetDeviceObj get_device_obj = nullptr;
+  TextureGetObj texture_get_obj = nullptr;
 
   template <typename T>
   static void resolve(HMODULE module, const char *name, T &out) {
@@ -134,6 +145,8 @@ struct ObsApi {
     resolve(module, "gs_stagesurface_destroy", stage_destroy);
     resolve(module, "gs_stagesurface_map", stage_map);
     resolve(module, "gs_stagesurface_unmap", stage_unmap);
+    resolve(module, "gs_get_device_obj", get_device_obj);
+    resolve(module, "gs_texture_get_obj", texture_get_obj);
     return add_rendered &&remove_rendered && get_main_texture && enter_graphics &&
            leave_graphics && texture_width && texture_height && texture_format &&
            texture_create && texture_destroy && copy_texture_region && stage_texture &&
@@ -150,6 +163,7 @@ uint64_t monotonic_ns() {
 }
 
 struct Frame {
+  uint64_t id = 0; // assigned in capture order, so encoders may finish out of order
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t timestamp = 0;
@@ -193,7 +207,7 @@ class Sender {
       return false;
     }
     stopping_ = false;
-    worker_ = std::thread([this] { run(); });
+    for (size_t i = 0; i < kEncoderThreads; ++i) workers_.emplace_back([this] { run(); });
     control_worker_ = std::thread([this] { control_loop(); });
     return true;
   }
@@ -204,8 +218,10 @@ class Sender {
       stopping_ = true;
       pending_.reset();
     }
-    condition_.notify_one();
-    if (worker_.joinable()) worker_.join();
+    condition_.notify_all();
+    for (auto &worker : workers_)
+      if (worker.joinable()) worker.join();
+    workers_.clear();
     if (control_worker_.joinable()) control_worker_.join();
     close_socket();
   }
@@ -222,6 +238,7 @@ class Sender {
       std::lock_guard<std::mutex> lock(mutex_);
       next.bgra.swap(spare_);
     }
+    next.id = next_frame_id_.fetch_add(1);
     next.width = width;
     next.height = height;
     next.timestamp = timestamp;
@@ -298,6 +315,7 @@ class Sender {
         static_cast<uint64_t>(frame.width) * frame.height > 33554432ull)
       return nullptr;
 #ifndef JCS_EXTENSIONS
+    thread_local std::vector<uint8_t> rgb_;
     rgb_.resize(static_cast<size_t>(frame.width) * 3u);
 #endif
     jpeg_compress_struct compressor{};
@@ -366,7 +384,7 @@ class Sender {
       free(jpeg);
       return;
     }
-    const uint64_t frame_id = next_frame_id_++;
+    const uint64_t frame_id = frame.id;
     std::array<uint8_t, kHeaderBytes + kPayloadBytes> packet{};
     std::memcpy(packet.data(), "RCVR", 4);
     packet[4] = 1; // version
@@ -412,22 +430,28 @@ class Sender {
   std::condition_variable condition_;
   std::optional<Frame> pending_;
   std::vector<uint8_t> spare_;
-  std::vector<uint8_t> rgb_; // only used without libjpeg-turbo extensions
   bool stopping_ = false;
   bool winsock_ready_ = false;
-  std::thread worker_;
+  std::vector<std::thread> workers_;
   std::thread control_worker_;
   std::atomic<uint32_t> crop_size_{640};
-  uint64_t next_frame_id_ = 1;
+  std::atomic<uint64_t> next_frame_id_{1};
   SOCKET socket_ = INVALID_SOCKET;
   sockaddr_in destination_{};
 };
 
 Sender sender;
 
-// GPU path: copy the centered crop of the main texture, stage it through a
-// three-surface ring so the render thread never waits on the readback it just
-// queued, and hand only the crop to the sender's worker thread.
+// GPU path: copy the centered crop of the main texture and read it back
+// without stalling OBS. libobs' gs_stagesurface_map waits for the GPU; with a
+// game loading the GPU, a copy queued two frames earlier was often not done,
+// so OBS's render thread blocked in the map and OBS dropped frames. On D3D11
+// the crop is copied into a ring of our own staging textures and mapped with
+// D3D11_MAP_FLAG_DO_NOT_WAIT: the newest finished copy is sent, unfinished
+// ones are tried again next frame, and when all are still in flight the
+// oldest is overwritten (that frame is skipped, OBS never waits). Other
+// renderers keep the libobs three-surface ring. Only the crop is handed to the
+// sender's worker threads.
 class GpuCapture {
  public:
   void render() {
@@ -450,10 +474,14 @@ class GpuCapture {
     const uint32_t left = (source_width - crop_size) / 2u;
     const uint32_t top = (source_height - crop_size) / 2u;
     obs_api.copy_texture_region(crop_texture_, 0, 0, main_texture, left, top, crop_size, crop_size);
+    last_capture_ns_ = now;
+    if (direct_ready_ || setup_direct()) {
+      render_direct(now, crop_size);
+      return;
+    }
     obs_api.stage_texture(stages_[write_index_], crop_texture_);
     written_[write_index_] = true;
     captured_ns_[write_index_] = now;
-    last_capture_ns_ = now;
 
     const size_t read_index = (write_index_ + 1) % kStageCount;
     if (written_[read_index]) {
@@ -473,6 +501,14 @@ class GpuCapture {
   }
 
   void destroy() {
+    for (auto *&texture : direct_) {
+      if (texture) texture->Release();
+      texture = nullptr;
+    }
+    direct_order_.fill(0);
+    if (context_) context_->Release();
+    context_ = nullptr;
+    direct_ready_ = false;
     for (auto *&stage : stages_) {
       if (stage) obs_api.stage_destroy(stage);
       stage = nullptr;
@@ -486,6 +522,100 @@ class GpuCapture {
 
  private:
   static constexpr size_t kStageCount = 3;
+  static constexpr size_t kDirectStages = 4;
+
+  // Own D3D11 staging ring for the crop texture; false keeps libobs staging.
+  bool setup_direct() {
+    if (direct_unavailable_ || !obs_api.get_device_obj || !obs_api.texture_get_obj) return false;
+    auto *device = static_cast<ID3D11Device *>(obs_api.get_device_obj());
+    auto *source = static_cast<ID3D11Texture2D *>(obs_api.texture_get_obj(crop_texture_));
+    if (!device || !source) {
+      direct_unavailable_ = true;
+      return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    for (auto *&texture : direct_) {
+      if (FAILED(device->CreateTexture2D(&desc, nullptr, &texture))) {
+        texture = nullptr;
+        for (auto *&created : direct_) {
+          if (created) created->Release();
+          created = nullptr;
+        }
+        direct_unavailable_ = true;
+        return false;
+      }
+    }
+    device->GetImmediateContext(&context_);
+    if (!context_) {
+      for (auto *&created : direct_) {
+        if (created) created->Release();
+        created = nullptr;
+      }
+      direct_unavailable_ = true;
+      return false;
+    }
+    direct_order_.fill(0);
+    direct_ready_ = true;
+    return true;
+  }
+
+  void render_direct(uint64_t now, uint32_t crop_size) {
+    auto *source = static_cast<ID3D11Texture2D *>(obs_api.texture_get_obj(crop_texture_));
+    if (!source) return;
+    // A free slot, else the oldest copy still in flight (its frame is skipped).
+    size_t slot = 0;
+    for (size_t i = 0; i < kDirectStages; ++i) {
+      if (direct_order_[i] == 0) {
+        slot = i;
+        break;
+      }
+      if (direct_order_[i] < direct_order_[slot]) slot = i;
+    }
+    context_->CopyResource(direct_[slot], source);
+    direct_order_[slot] = ++direct_sequence_;
+    direct_captured_ns_[slot] = now;
+
+    // The newest finished copy. The GPU runs copies in order, so once one is
+    // done every older one is too and can be dropped.
+    uint64_t below = UINT64_MAX;
+    for (;;) {
+      size_t newest = kDirectStages;
+      for (size_t i = 0; i < kDirectStages; ++i)
+        if (direct_order_[i] != 0 && direct_order_[i] < below &&
+            (newest == kDirectStages || direct_order_[i] > direct_order_[newest]))
+          newest = i;
+      if (newest == kDirectStages) return;
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      const HRESULT result =
+          context_->Map(direct_[newest], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+      if (result == DXGI_ERROR_WAS_STILL_DRAWING) {
+        below = direct_order_[newest];
+        continue;
+      }
+      if (SUCCEEDED(result)) {
+        try {
+          sender.submit_mapped(static_cast<const uint8_t *>(mapped.pData), crop_size, crop_size,
+                               mapped.RowPitch, direct_captured_ns_[newest]);
+        } catch (...) {
+          // A dropped frame must never propagate through OBS's render callback.
+        }
+        context_->Unmap(direct_[newest], 0);
+      }
+      const uint64_t done = direct_order_[newest];
+      for (auto &order : direct_order_)
+        if (order != 0 && order <= done) order = 0;
+      return;
+    }
+  }
 
   void ensure_resources(uint32_t crop_size) {
     if (crop_size_ == crop_size && crop_texture_) return;
@@ -507,6 +637,13 @@ class GpuCapture {
   uint32_t crop_size_ = 0;
   size_t write_index_ = 0;
   uint64_t last_capture_ns_ = 0;
+  ID3D11DeviceContext *context_ = nullptr;
+  std::array<ID3D11Texture2D *, kDirectStages> direct_{};
+  std::array<uint64_t, kDirectStages> direct_order_{}; // 0 = free
+  std::array<uint64_t, kDirectStages> direct_captured_ns_{};
+  uint64_t direct_sequence_ = 0;
+  bool direct_ready_ = false;
+  bool direct_unavailable_ = false;
 };
 
 GpuCapture gpu_capture;
