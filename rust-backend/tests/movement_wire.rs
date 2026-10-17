@@ -43,7 +43,7 @@ fn backend_wire_reaches_the_host_for_held_trigger_and_always_on() {
         assert_eq!(parsed.timestamp_ms, timestamp_ms);
         assert_eq!(parsed.trigger_button, "right");
         assert!(parsed.recoil.recoil_enabled);
-        assert_eq!(parsed.device_delta(0), (12, -7));
+        assert_eq!(parsed.device_move(0).0, (12, -7));
         assert!(host_movement::should_apply_target(&parsed, true));
         assert_eq!(
             host_movement::should_apply_target(&parsed, false),

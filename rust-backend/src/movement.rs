@@ -439,6 +439,9 @@ pub struct MovementController {
     /// Short-memory twin of `calibrator` that catches a sudden zoom.
     fast_calibrator: MotionCalibrator,
     fast_raise_streak: u32,
+    /// Simulation comparison only: run without the zoom raise.
+    #[cfg(test)]
+    zoom_guard_off: bool,
     calibration: Option<MotionCalibration>,
     /// Relative standard error of `calibration` (0 for a loaded one).
     calibration_error: f64,
@@ -480,6 +483,8 @@ impl MovementController {
             calibrator: MotionCalibrator::default(),
             fast_calibrator: MotionCalibrator::fast(),
             fast_raise_streak: 0,
+            #[cfg(test)]
+            zoom_guard_off: false,
             calibration: None,
             calibration_error: 0.0,
             calibration_loaded: false,
@@ -886,6 +891,10 @@ impl MovementController {
     /// The slow estimate restarts from the short one's evidence so it does not
     /// pull the value straight back down.
     fn raise_after_zoom(&mut self) -> bool {
+        #[cfg(test)]
+        if self.zoom_guard_off {
+            return false;
+        }
         let Some(calibration) = self.calibration else {
             self.fast_raise_streak = 0;
             return false;
@@ -2104,6 +2113,250 @@ mod tests {
                 run.calibration
             );
             assert!(run.zoom_rms < 16.0, "RMS {:.1} px", run.zoom_rms);
+        }
+    }
+
+    /// ADS/scope zoom as a game shows it: the camera turns `base_k` unzoomed
+    /// px per count, and the image magnifies the error, the target's motion
+    /// and the effect of every count by the zoom factor. Zoom changes ramp
+    /// linearly over 0.15 s (the ADS animation). A target outside the 256 px
+    /// crop is lost (the controller resets, nothing is sent) until it returns.
+    struct AdsScene {
+        /// (time s, zoom factor) keyframes, linear in between.
+        keys: Vec<(f64, f64)>,
+        /// Strafe amplitude in unzoomed px (0.8 Hz), 0 = still.
+        strafe: f64,
+        seconds: f64,
+        preset: Option<MotionCalibration>,
+        guard: bool,
+    }
+
+    #[derive(Default)]
+    struct AdsResult {
+        /// Unzoomed (angular) error while zoomed, after each zoom-in settles.
+        rms: f64,
+        peak: f64,
+        /// Share of zoomed time within 3 unzoomed px (a head) and lost.
+        on_target: f64,
+        lost: f64,
+        /// Time from zoom-in until the error stays under 3 unzoomed px.
+        settle_s: f64,
+    }
+
+    fn zoom_at(keys: &[(f64, f64)], t: f64) -> f64 {
+        let mut value = keys[0].1;
+        for pair in keys.windows(2) {
+            let ((t0, z0), (t1, z1)) = (pair[0], pair[1]);
+            if t >= t1 {
+                value = z1;
+            } else if t > t0 {
+                return z0 + (z1 - z0) * (t - t0) / (t1 - t0);
+            }
+        }
+        value
+    }
+
+    fn simulate_ads(scene: &AdsScene, seed: u64) -> AdsResult {
+        const BASE_K: f64 = 0.25;
+        const LATENCY_S: f64 = 0.024;
+        const FRAME_S: f64 = 1.0 / 240.0;
+        const HALF_CROP: f64 = 128.0;
+        const HEAD_PX: f64 = 3.0;
+        let target = |t: f64| {
+            (
+                10.0 + scene.strafe * (std::f64::consts::TAU * 0.8 * t).sin(),
+                -5.0 + scene.strafe / 4.0 * (std::f64::consts::TAU * 0.3 * t).cos(),
+            )
+        };
+        let mut controller = seeded(seed);
+        controller.zoom_guard_off = !scene.guard;
+        controller.load_calibration(scene.preset);
+        let mut noise = StdRng::seed_from_u64(seed ^ 0xad5);
+        let mut camera = vec![(0.0_f64, (0.0_f64, 0.0_f64))];
+        let camera_at = |camera: &[(f64, (f64, f64))], t: f64| {
+            camera
+                .iter()
+                .rev()
+                .find(|(time, _)| *time <= t)
+                .map_or((0.0, 0.0), |(_, offset)| *offset)
+        };
+        // Zoom-in moments (start of each ramp up), for settle time and the
+        // 0.25 s transient excluded from RMS/peak.
+        let zoom_ins: Vec<f64> = std::iter::once(0.0)
+            .chain(
+                scene
+                    .keys
+                    .windows(2)
+                    .filter(|pair| pair[1].1 > pair[0].1)
+                    .map(|pair| pair[0].0),
+            )
+            .collect();
+        let mut frame: Option<FrameError> = None;
+        let mut visible = true;
+        let mut next_frame = 0_u64;
+        let (mut squared, mut counted, mut peak) = (0.0, 0, 0.0_f64);
+        let (mut zoomed, mut on_target, mut lost) = (0, 0, 0);
+        let mut settle: Vec<Option<f64>> = vec![None; zoom_ins.len()];
+        let mut last_off_head: Vec<f64> = zoom_ins.clone();
+        let ticks = (scene.seconds / DEFAULT_TICK_S) as usize;
+        for tick in 1..=ticks {
+            let now = tick as f64 * DEFAULT_TICK_S;
+            while (next_frame as f64) * FRAME_S + LATENCY_S <= now {
+                let captured = next_frame as f64 * FRAME_S;
+                let zoom = zoom_at(&scene.keys, captured);
+                let (tx, ty) = target(captured);
+                let (cx, cy) = camera_at(&camera, captured);
+                let mut jitter = || noise.random_range(-0.7..=0.7);
+                let image = ((tx - cx) * zoom + jitter(), (ty - cy) * zoom + jitter());
+                visible = image.0.abs() <= HALF_CROP && image.1.abs() <= HALF_CROP;
+                frame = visible.then_some(FrameError {
+                    frame_id: next_frame,
+                    received_s: captured + LATENCY_S,
+                    raw: (image.0.trunc(), image.1.trunc()),
+                    smoothing_alpha: (1.0, 1.0),
+                });
+                next_frame += 1;
+            }
+            let (dx, dy) = match frame {
+                Some(current) => controller.track(current, now, true),
+                None => {
+                    controller.reset();
+                    (0, 0)
+                }
+            };
+            let (cx, cy) = camera.last().expect("camera").1;
+            camera.push((
+                now,
+                (
+                    cx + dx.clamp(-32, 32) as f64 * BASE_K,
+                    cy + dy.clamp(-32, 32) as f64 * BASE_K,
+                ),
+            ));
+            let zoom = zoom_at(&scene.keys, now);
+            if zoom < 1.01 && scene.keys.iter().any(|(_, z)| *z > 1.01) {
+                continue;
+            }
+            let (tx, ty) = target(now);
+            let (cx, cy) = camera.last().expect("camera").1;
+            let error = (tx - cx).hypot(ty - cy);
+            zoomed += 1;
+            if !visible {
+                lost += 1;
+            }
+            if error < HEAD_PX {
+                on_target += 1;
+            }
+            let index = zoom_ins
+                .iter()
+                .rposition(|start| *start <= now)
+                .unwrap_or(0);
+            if error >= HEAD_PX {
+                last_off_head[index] = now;
+            }
+            settle[index] = Some(last_off_head[index] - zoom_ins[index]);
+            if now - zoom_ins[index] >= 0.25 {
+                squared += error * error;
+                counted += 1;
+                peak = peak.max(error);
+            }
+        }
+        let settles: Vec<f64> = settle.iter().flatten().copied().collect();
+        AdsResult {
+            rms: (squared / counted.max(1) as f64).sqrt(),
+            peak,
+            on_target: on_target as f64 / zoomed.max(1) as f64,
+            lost: lost as f64 / zoomed.max(1) as f64,
+            settle_s: settles.iter().sum::<f64>() / settles.len().max(1) as f64,
+        }
+    }
+
+    /// ADS from the start and toggled while firing, at small (1.15–1.5×,
+    /// below the 2× raise) and large (2–5×) zooms (not a pass/fail test):
+    /// `cargo test --release --lib -- ads_report --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ads_report() {
+        let saved = Some(MotionCalibration {
+            px_per_count: 0.25,
+            latency_s: 0.024,
+        });
+        let toggled = |z: f64| {
+            vec![
+                (0.0, 1.0),
+                (1.0, 1.0),
+                (1.15, z),
+                (2.4, z),
+                (2.55, 1.0),
+                (3.3, 1.0),
+                (3.45, z),
+                (5.0, z),
+                (5.15, 1.0),
+                (6.0, 1.0),
+                (6.15, z),
+                (8.0, z),
+            ]
+        };
+        let scenes: [(
+            &str,
+            Box<dyn Fn(f64) -> Vec<(f64, f64)>>,
+            f64,
+            Option<MotionCalibration>,
+        ); 3] = [
+            (
+                "ADS from start, hip-fire calibration saved",
+                Box::new(|z| vec![(0.0, z)]),
+                6.0,
+                saved,
+            ),
+            (
+                "ADS from start, no saved calibration",
+                Box::new(|z| vec![(0.0, z)]),
+                6.0,
+                None,
+            ),
+            (
+                "ADS toggled while firing (in 1.0 s, out 2.4 s, in 3.3 s, out 5.0 s, in 6.0 s)",
+                Box::new(toggled),
+                8.0,
+                saved,
+            ),
+        ];
+        for (title, keys, seconds, preset) in &scenes {
+            for (target, strafe) in [("still", 0.0), ("strafe 20 px 0.8 Hz", 20.0)] {
+                eprintln!("ADS {title} | {target}");
+                eprintln!("ADS   zoom | guard ON: RMS  peak  head%  lost%  settle | guard OFF: RMS  peak  head%  lost%  settle");
+                for zoom in [1.0, 1.15, 1.25, 1.5, 2.0, 2.5, 3.5, 5.0] {
+                    let mut line = format!("ADS   {zoom:>4}x");
+                    for guard in [true, false] {
+                        let runs: Vec<AdsResult> = (700..710)
+                            .map(|seed| {
+                                simulate_ads(
+                                    &AdsScene {
+                                        keys: keys(zoom),
+                                        strafe,
+                                        seconds: *seconds,
+                                        preset: *preset,
+                                        guard,
+                                    },
+                                    seed,
+                                )
+                            })
+                            .collect();
+                        let mean = |f: fn(&AdsResult) -> f64| {
+                            runs.iter().map(f).sum::<f64>() / runs.len() as f64
+                        };
+                        line += &format!(
+                            " | {:>5.1} {:>5.1} {:>5.0}% {:>5.1}% {:>5.2}s",
+                            mean(|r| r.rms),
+                            mean(|r| r.peak),
+                            mean(|r| r.on_target) * 100.0,
+                            mean(|r| r.lost) * 100.0,
+                            mean(|r| r.settle_s),
+                        );
+                    }
+                    eprintln!("{line}");
+                }
+            }
         }
     }
 
