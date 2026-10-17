@@ -402,7 +402,13 @@ impl ReceiverService {
                         age_s: processed.frame.received.elapsed().as_secs_f64(),
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
-                    let on_center = auto_active && processed.result.auto_target_valid;
+                    // Aim mode fires once its move reached the locked target.
+                    let on_center = auto_active
+                        && if settings.auto.aims() {
+                            callback_ticker.flick_done()
+                        } else {
+                            processed.result.auto_target_valid
+                        };
                     events.target(processed.auto_config_revision, on_center);
                     if let Ok(mut summary) = auto_summary.lock() {
                         if let Some(line) = summary.add(
@@ -1666,6 +1672,7 @@ fn movement_runtime(
             motion_enabled: true,
             motion_always_on: false,
             trigger_held: true,
+            auto_flick: true,
             sens: settings.sens,
             offset_x: auto.offset_x,
             offset_y: auto.offset_y,
@@ -1682,6 +1689,7 @@ fn movement_runtime(
         motion_enabled: settings.motion_enabled && !auto_active,
         motion_always_on: settings.motion_always_on,
         trigger_held: trigger_held(device, &settings.trigger_button),
+        auto_flick: false,
         sens: settings.sens,
         offset_x: settings.offset_x,
         offset_y: settings.offset_y,
@@ -2496,6 +2504,7 @@ mod tests {
 
         let aim = super::movement_runtime(&settings, &held, None, 7);
         assert!(aim.motion_enabled && aim.trigger_held && !aim.motion_always_on);
+        assert!(aim.auto_flick && !motion.auto_flick);
         assert_eq!(aim.trigger_button, "m4");
         assert_eq!((aim.speed_x, aim.speed_y, aim.offset_x), (0.2, 0.3, -4.0));
         assert_eq!((aim.smooth_fov_degrees, aim.config_revision), (0, 7));

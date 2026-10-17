@@ -659,8 +659,11 @@ fn monitor_medius(
                 .iter()
                 .any(|usage| usage.id == button)
         });
-        if let Some(crate::auto::AutoAction::LeftClick) =
-            auto_input.action(&mut auto_state, auto_held, Instant::now())
+        // Aim mode clicks only once its move has fully reached the device.
+        let aim_moving = auto_input.aims() && crate::movement::has_pending_move(movement_state);
+        if let Some(crate::auto::AutoAction::LeftClick) = (!aim_moving)
+            .then(|| auto_input.action(&mut auto_state, auto_held, Instant::now()))
+            .flatten()
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {

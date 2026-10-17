@@ -48,6 +48,16 @@ pub fn set_target(state: &MovementState, value: &serde_json::Value) {
     }
 }
 
+/// A fresh target delta is still waiting to be sent: Auto's aim mode clicks
+/// only after its move has fully left.
+pub fn has_pending_move(state: &MovementState) -> bool {
+    state.0.lock().is_ok_and(|pending| {
+        pending.as_ref().is_some_and(|target| {
+            target.target_valid && (target.dx != 0 || target.dy != 0) && target.is_fresh()
+        })
+    })
+}
+
 pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
     let target = state.0.lock().ok()?.take()?;
     target.is_fresh().then_some(target)

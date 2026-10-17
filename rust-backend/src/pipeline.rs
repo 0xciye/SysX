@@ -753,7 +753,10 @@ mod tests {
         let result = run(image, 1, &mut smoother, &mut cache);
         assert!(result.auto_active && result.auto_aim);
         assert_eq!(result.target_xy, Some([38.5, 32.5]), "pixel centers");
-        assert!(result.auto_target_valid, "a valid target fires, off center too");
+        assert!(
+            result.auto_target_valid,
+            "a valid target fires, off center too"
+        );
         assert_eq!(result.fov_degrees, 20);
 
         // Only the pixel outside Auto FOV: no target, no fire.

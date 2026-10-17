@@ -32,6 +32,11 @@ impl AutoTargetEvent {
         self.enabled && trigger_held && self.mode != "aim"
     }
 
+    /// Aim mode: one locked target, one click per trigger press.
+    pub(crate) fn aims(&self) -> bool {
+        self.mode == "aim"
+    }
+
     pub(crate) fn config_revision(&self) -> u64 {
         self.config_revision
     }
@@ -54,6 +59,7 @@ impl AutoTargetEvent {
         if state.timing() != timing {
             state.set_timing(timing);
         }
+        state.set_once_per_press(self.aims());
         let wall_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
@@ -77,6 +83,8 @@ pub struct AutoState {
     /// Next time the Auto state may be evaluated. Sleep is a polling cadence,
     /// not part of the firing cooldown, so it never changes `deadline`.
     next_poll: Option<Instant>,
+    /// Aim mode: after its click, stay latched until the trigger is released.
+    once_per_press: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -110,6 +118,14 @@ impl AutoState {
             cooldown_until: None,
             config_revision: 0,
             next_poll: None,
+            once_per_press: false,
+        }
+    }
+
+    pub fn set_once_per_press(&mut self, once: bool) {
+        if self.once_per_press != once {
+            self.once_per_press = once;
+            self.reset();
         }
     }
 
@@ -166,7 +182,8 @@ impl AutoState {
 
         // A valid target in the Auto FOV arms one delayed click. The target
         // need not stay until it fires; target loss only rearms other phases.
-        if !target_valid && self.phase != AutoPhase::WaitingDelay {
+        let latched_for_press = self.once_per_press && self.phase == AutoPhase::Latched;
+        if !target_valid && self.phase != AutoPhase::WaitingDelay && !latched_for_press {
             self.reset();
             return None;
         }
@@ -202,7 +219,7 @@ impl AutoState {
 
     fn fire(&mut self, now: Instant) -> AutoAction {
         self.cooldown_until = Some(now + millis(self.timing.cooldown_ms));
-        if self.timing.cooldown_ms == 0 {
+        if self.timing.cooldown_ms == 0 || self.once_per_press {
             self.phase = AutoPhase::Latched;
             self.deadline = None;
         } else {
@@ -244,6 +261,39 @@ fn millis(value: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aim_mode_clicks_once_per_trigger_press() {
+        use super::{AutoAction, AutoState, AutoTiming};
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 50,
+            sleep_ms: 0,
+        });
+        state.set_once_per_press(true);
+        assert_eq!(state.update(true, true, at(0)), Some(AutoAction::LeftClick));
+        assert_eq!(
+            state.update(true, true, at(200)),
+            None,
+            "no repeat after cooldown"
+        );
+        assert_eq!(state.update(true, false, at(210)), None);
+        assert_eq!(
+            state.update(true, true, at(220)),
+            None,
+            "target loss does not rearm"
+        );
+        assert_eq!(state.update(false, false, at(230)), None, "release");
+        assert_eq!(
+            state.update(true, true, at(240)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
     #[test]
     fn only_center_mode_blocks_motion_while_the_auto_trigger_is_held() {
         let center: super::AutoTargetEvent =

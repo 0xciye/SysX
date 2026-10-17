@@ -7,6 +7,7 @@
 //!   once per frame, the ticker, the batcher and the IPC event.
 
 pub mod abcurves;
+pub mod flick;
 pub mod normal;
 
 /// Default Normal speed per axis: in simulation it stays stable from 16 to
@@ -17,6 +18,7 @@ use crate::config::RecoilSettings;
 use crate::targeting::fov_radius_px;
 use normal::{counts_per_px, NormalMotion, NormalStep};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -150,6 +152,9 @@ pub struct MovementRuntimeSettings {
     pub trigger_button: String,
     /// The selected physical trigger is held (from the host's device status).
     pub trigger_held: bool,
+    /// Auto's aim mode is held: take one target and move exactly onto it
+    /// (`flick`) instead of following targets.
+    pub auto_flick: bool,
     pub recoil: RecoilSettings,
 }
 
@@ -187,6 +192,7 @@ struct TickerState {
 pub struct MovementTicker {
     shared: Arc<(Mutex<TickerState>, Condvar)>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    flick_done: Arc<AtomicBool>,
 }
 
 /// Held-trigger Motion summary for the diagnostics log, at most one line
@@ -263,9 +269,12 @@ impl MovementTicker {
             Condvar::new(),
         ));
         let worker_shared = Arc::clone(&shared);
+        let flick_done = Arc::new(AtomicBool::new(false));
+        let worker_flick_done = Arc::clone(&flick_done);
         let worker = thread::Builder::new()
             .name("sysx-movement-ticker".into())
             .spawn(move || {
+                let mut flick = flick::Flick::default();
                 let mut rendered = abcurves::MotionOutput::default();
                 let mut controller = MovementController::new(initial_sens);
                 let mut sens = initial_sens;
@@ -303,6 +312,8 @@ impl MovementTicker {
                         {
                             controller.reset();
                             rendered.reset();
+                            flick.reset();
+                            worker_flick_done.store(false, Ordering::Release);
                             if !sent_invalid {
                                 on_event(MovementEvent {
                                     config_revision: runtime.config_revision,
@@ -322,6 +333,54 @@ impl MovementTicker {
                             thread::sleep(Duration::from_millis(4));
                             continue;
                         }
+                        if runtime.auto_flick {
+                            controller.reset();
+                            rendered.reset();
+                            if sens != runtime.sens {
+                                let _ = controller.set_sensitivity(runtime.sens);
+                                sens = runtime.sens;
+                            }
+                            let found = flick
+                                .searching()
+                                .then(|| flick_target(&sample, &runtime))
+                                .flatten();
+                            let (dx, dy) = flick.step(
+                                found,
+                                flick::FlickParams {
+                                    speed: (runtime.speed_x, runtime.speed_y),
+                                    smooth_radius_px: f64::from(fov_radius_px(
+                                        sample.processed_size.0,
+                                        sample.processed_size.1,
+                                        runtime.smooth_fov_degrees,
+                                    )),
+                                    counts_per_px: counts_per_px(sens),
+                                },
+                                Instant::now(),
+                            );
+                            worker_flick_done.store(flick.done(), Ordering::Release);
+                            on_event(MovementEvent {
+                                config_revision: runtime.config_revision,
+                                event: "movement_target".into(),
+                                frame_id: sample.frame_id,
+                                // Valid from the lock on, so the host keeps
+                                // the remaining counts of the move.
+                                target_valid: !flick.searching(),
+                                dx,
+                                dy,
+                                motion_enabled: true,
+                                motion_always_on: false,
+                                trigger_button: runtime.trigger_button,
+                                timestamp_ms: unix_ms(),
+                                recoil: runtime.recoil,
+                            });
+                            sent_invalid = false;
+                            // A fixed pace, not every frame wake-up: speed is a
+                            // fraction of the rest per 4 ms step.
+                            thread::sleep(Duration::from_millis(4));
+                            continue;
+                        }
+                        flick.reset();
+                        worker_flick_done.store(false, Ordering::Release);
                         if sample.target.is_none() {
                             controller.reset();
                             rendered.reset();
@@ -404,6 +463,8 @@ impl MovementTicker {
                     } else if !sent_invalid {
                         controller.reset();
                         rendered.reset();
+                        flick.reset();
+                        worker_flick_done.store(false, Ordering::Release);
                         if let Some(runtime) = settings() {
                             on_event(MovementEvent {
                                 config_revision: runtime.config_revision,
@@ -436,7 +497,13 @@ impl MovementTicker {
         Self {
             shared,
             worker: Mutex::new(Some(worker)),
+            flick_done,
         }
+    }
+
+    /// Auto's aim move reached its locked target (see [`flick`]).
+    pub fn flick_done(&self) -> bool {
+        self.flick_done.load(Ordering::Acquire)
     }
 
     pub fn update(&self, mut sample: MovementTargetSample) {
@@ -485,6 +552,33 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+/// The target Auto's aim mode locks: this frame's, as Motion selects it.
+fn flick_target(
+    sample: &MovementTargetSample,
+    runtime: &MovementRuntimeSettings,
+) -> Option<flick::FlickTarget> {
+    let target = sample.target?;
+    let strength = |alpha: f64| {
+        if alpha.is_finite() && alpha > 0.0 {
+            (1.0 / alpha).max(1.0)
+        } else {
+            1.0
+        }
+    };
+    Some(flick::FlickTarget {
+        error: crop_target_error(
+            target,
+            sample.crop_origin,
+            sample.processed_size,
+            (runtime.offset_x, runtime.offset_y),
+        ),
+        smooth: (
+            strength(sample.smoothing_alpha.0),
+            strength(sample.smoothing_alpha.1),
+        ),
+    })
 }
 
 pub fn merge_movement_events(
@@ -658,6 +752,7 @@ mod tests {
             smooth_fov_degrees: 20,
             trigger_button: "right".into(),
             trigger_held: held,
+            auto_flick: false,
             recoil: RecoilSettings::default(),
         }
     }
