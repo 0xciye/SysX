@@ -360,7 +360,16 @@ impl ReceiverService {
                     config_revision,
                 ))
             }),
-            Arc::new(move |event| ticker_batcher.submit(event)),
+            Arc::new(move |event| {
+                // Auto's aim move goes out at once, not after the 4 ms batch.
+                if event.flick && (event.dx != 0 || event.dy != 0) {
+                    if let Ok(line) = serde_json::to_string(&event) {
+                        println!("{line}");
+                    }
+                } else {
+                    ticker_batcher.submit(event);
+                }
+            }),
         ));
         let callback_ticker = Arc::clone(&movement_ticker);
         let callback_settings = Arc::clone(&settings);

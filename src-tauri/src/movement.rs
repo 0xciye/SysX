@@ -3,6 +3,8 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_DEVICE_DELTA: i64 = 32;
+/// Auto's aim move is sent in one command (the SDK takes any i16 delta).
+const MAX_FLICK_DELTA: i64 = 4096;
 const TARGET_FRESHNESS_MS: u64 = 100;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -34,11 +36,16 @@ pub struct MovementTarget {
     pub timestamp_ms: u64,
     #[serde(alias = "nativeMotion", alias = "native_motion")]
     pub recoil: RecoilSettings,
+    /// Auto's aim move: one command, kept apart from Motion's pending deltas.
+    #[serde(default)]
+    pub flick: bool,
 }
 
 #[derive(Default)]
 pub struct MovementState {
     pending: Mutex<Option<MovementTarget>>,
+    /// Auto's aim move, so no later or older Motion event can merge it away.
+    flick: Mutex<Option<MovementTarget>>,
     latest_target: Mutex<Option<MovementTarget>>,
     recoil: Mutex<RecoilSettings>,
 }
@@ -51,6 +58,12 @@ pub fn set_target(state: &MovementState, value: &serde_json::Value) {
     if let Ok(mut latest) = state.latest_target.lock() {
         *latest = Some(target.clone());
     }
+    if target.flick && (target.dx != 0 || target.dy != 0) {
+        if let Ok(mut flick) = state.flick.lock() {
+            *flick = Some(target);
+        }
+        return;
+    }
     if let Ok(mut pending) = state.pending.lock() {
         *pending = Some(MovementTarget::merge_pending(pending.take(), target));
     }
@@ -59,14 +72,23 @@ pub fn set_target(state: &MovementState, value: &serde_json::Value) {
 /// A fresh target delta is still waiting to be sent: Auto's aim mode clicks
 /// only after its move has fully left.
 pub fn has_pending_move(state: &MovementState) -> bool {
-    state.pending.lock().is_ok_and(|pending| {
-        pending.as_ref().is_some_and(|target| {
-            target.target_valid && (target.dx != 0 || target.dy != 0) && target.is_fresh()
+    let waiting = |slot: &Mutex<Option<MovementTarget>>| {
+        slot.lock().is_ok_and(|pending| {
+            pending.as_ref().is_some_and(|target| {
+                target.target_valid && (target.dx != 0 || target.dy != 0) && target.is_fresh()
+            })
         })
-    })
+    };
+    waiting(&state.flick) || waiting(&state.pending)
 }
 
 pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
+    // Auto's aim move goes first, whole.
+    if let Some(flick) = state.flick.lock().ok().and_then(|mut slot| slot.take()) {
+        if flick.is_fresh() {
+            return Some(flick);
+        }
+    }
     let target = state.pending.lock().ok()?.take()?;
     target.is_fresh().then_some(target)
 }
@@ -99,6 +121,12 @@ pub fn set_recoil_settings(state: &MovementState, settings: RecoilSettings) {
 /// counts every delta it sends as applied. It still expires after 100 ms.
 pub fn restore_remainder(state: &MovementState, remainder: MovementTarget) {
     if remainder.dx == 0 && remainder.dy == 0 {
+        return;
+    }
+    if remainder.flick {
+        if let Ok(mut flick) = state.flick.lock() {
+            flick.get_or_insert(remainder);
+        }
         return;
     }
     if let Ok(mut pending) = state.pending.lock() {
@@ -163,9 +191,14 @@ impl MovementTarget {
     /// The clamped command and the target delta it leaves for the next one.
     /// Clipped recoil is not carried over: it is sampled fresh every command.
     pub fn device_move(&self, recoil_y: i64) -> ((i16, i16), Self) {
-        let x = self.dx.clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA);
+        let limit = if self.flick {
+            MAX_FLICK_DELTA
+        } else {
+            MAX_DEVICE_DELTA
+        };
+        let x = self.dx.clamp(-limit, limit);
         let wanted_y = self.dy.saturating_add(recoil_y);
-        let y = wanted_y.clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA);
+        let y = wanted_y.clamp(-limit, limit);
         // The clipped part of Y belongs to the target only as far as the
         // target's own delta points the same way.
         let clipped_y = wanted_y - y;
@@ -338,6 +371,37 @@ mod tests {
             clock.sample(true, &settings, start + Duration::from_millis(62)),
             10
         );
+    }
+
+    #[test]
+    fn auto_aim_moves_go_out_whole_and_first_and_survive_other_events() {
+        use super::{has_pending_move, take_target};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let event = |dx: i64, valid: bool, flick: bool| {
+            serde_json::json!({
+                "target_valid": valid, "dx": dx, "dy": -300, "motion_enabled": true,
+                "motion_always_on": false, "trigger_button": "m4",
+                "timestamp_ms": now_ms, "recoil": {}, "flick": flick,
+            })
+        };
+        let state = MovementState::default();
+        set_target(&state, &event(900, true, true));
+        // A late Motion event (lost target) must not merge the move away.
+        set_target(&state, &event(0, false, false));
+        assert!(has_pending_move(&state));
+        let flick = take_target(&state).expect("the aim move");
+        assert!(flick.flick);
+        assert_eq!(flick.device_move(0).0, (900, -300), "one command");
+        assert!(!has_pending_move(&state));
+
+        let huge = MovementTarget { dx: 5000, ..flick };
+        let ((x, _), rest) = huge.device_move(0);
+        assert_eq!((x, rest.dx), (4096, 904));
+        restore_remainder(&state, rest);
+        assert!(take_target(&state).is_some_and(|t| t.flick && t.dx == 904));
     }
 
     #[test]

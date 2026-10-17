@@ -133,6 +133,9 @@ pub struct MovementEvent {
     pub trigger_button: String,
     pub timestamp_ms: u64,
     pub recoil: RecoilSettings,
+    /// Auto's aim move: the host sends it in one command instead of ±32 steps.
+    #[serde(default)]
+    pub flick: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +330,7 @@ impl MovementTicker {
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
+                                    flick: false,
                                 });
                                 sent_invalid = true;
                             }
@@ -344,27 +348,15 @@ impl MovementTicker {
                                 .searching()
                                 .then(|| flick_target(&sample, &runtime))
                                 .flatten();
-                            let (dx, dy) = flick.step(
-                                found,
-                                flick::FlickParams {
-                                    speed: (runtime.speed_x, runtime.speed_y),
-                                    smooth_radius_px: f64::from(fov_radius_px(
-                                        sample.processed_size.0,
-                                        sample.processed_size.1,
-                                        runtime.smooth_fov_degrees,
-                                    )),
-                                    counts_per_px: counts_per_px(sens),
-                                },
-                                Instant::now(),
-                            );
-                            worker_flick_done.store(flick.done(), Ordering::Release);
+                            let (dx, dy) = flick.step(found, counts_per_px(sens));
                             on_event(MovementEvent {
                                 config_revision: runtime.config_revision,
                                 event: "movement_target".into(),
                                 frame_id: sample.frame_id,
                                 // Valid from the lock on, so the host keeps
-                                // the remaining counts of the move.
+                                // the rest of the move until it is sent.
                                 target_valid: !flick.searching(),
+                                flick: true,
                                 dx,
                                 dy,
                                 motion_enabled: true,
@@ -373,10 +365,13 @@ impl MovementTicker {
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
                             });
+                            // Done only after the move was handed on, so the
+                            // click can never overtake it.
+                            worker_flick_done.store(flick.done(), Ordering::Release);
                             sent_invalid = false;
-                            // A fixed pace, not every frame wake-up: speed is a
-                            // fraction of the rest per 4 ms step.
-                            thread::sleep(Duration::from_millis(4));
+                            // Poll for the first target every 1 ms instead of
+                            // waiting for the next tick.
+                            thread::sleep(Duration::from_millis(1));
                             continue;
                         }
                         flick.reset();
@@ -397,6 +392,7 @@ impl MovementTicker {
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
+                                    flick: false,
                                 });
                                 sent_invalid = true;
                             }
@@ -458,6 +454,7 @@ impl MovementTicker {
                             trigger_button: runtime.trigger_button,
                             timestamp_ms: unix_ms(),
                             recoil: runtime.recoil,
+                            flick: false,
                         });
                         sent_invalid = false;
                     } else if !sent_invalid {
@@ -478,6 +475,7 @@ impl MovementTicker {
                                 trigger_button: runtime.trigger_button,
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
+                                flick: false,
                             });
                         }
                         sent_invalid = true;
@@ -554,31 +552,18 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The target Auto's aim mode locks: this frame's, as Motion selects it.
+/// The error Auto's aim mode locks: this frame's target, as Motion selects
+/// it, with Auto's offsets.
 fn flick_target(
     sample: &MovementTargetSample,
     runtime: &MovementRuntimeSettings,
-) -> Option<flick::FlickTarget> {
-    let target = sample.target?;
-    let strength = |alpha: f64| {
-        if alpha.is_finite() && alpha > 0.0 {
-            (1.0 / alpha).max(1.0)
-        } else {
-            1.0
-        }
-    };
-    Some(flick::FlickTarget {
-        error: crop_target_error(
-            target,
-            sample.crop_origin,
-            sample.processed_size,
-            (runtime.offset_x, runtime.offset_y),
-        ),
-        smooth: (
-            strength(sample.smoothing_alpha.0),
-            strength(sample.smoothing_alpha.1),
-        ),
-    })
+) -> Option<(f64, f64)> {
+    Some(crop_target_error(
+        sample.target?,
+        sample.crop_origin,
+        sample.processed_size,
+        (runtime.offset_x, runtime.offset_y),
+    ))
 }
 
 pub fn merge_movement_events(
@@ -593,6 +578,7 @@ pub fn merge_movement_events(
         }) {
             current.dx = previous.dx.saturating_add(current.dx);
             current.dy = previous.dy.saturating_add(current.dy);
+            current.flick |= previous.flick;
         }
     } else {
         current.dx = 0;
@@ -735,6 +721,7 @@ mod tests {
             trigger_button: trigger_button.into(),
             timestamp_ms,
             recoil: RecoilSettings::default(),
+            flick: false,
         }
     }
 
