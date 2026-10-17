@@ -1434,6 +1434,7 @@ dependencies = [
  "axum",
  "baracuda-driver",
  "baracuda-tensorrt",
+ "cc",
  "futures-util",
  "half",
  "image",

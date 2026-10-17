@@ -1,3 +1,7 @@
+#[path = "../../native-shared/motion_renderer.rs"]
+pub mod motion_renderer;
+pub use motion_renderer::MotionRendererSettings;
+
 use serde::{Deserialize, Serialize};
 
 /// Only a successful local settings API response confirms durable storage.
@@ -156,6 +160,7 @@ pub struct AppSettings {
     pub motion_enabled: bool,
     #[serde(default)]
     pub motion_always_on: bool,
+    pub motion_renderer: MotionRendererSettings,
     #[serde(default)]
     pub color_filter: bool,
     pub trigger_button: String,
@@ -199,6 +204,7 @@ impl Default for AppSettings {
             active_profile: 0,
             motion_enabled: false,
             motion_always_on: false,
+            motion_renderer: MotionRendererSettings::default(),
             color_filter: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
@@ -315,6 +321,7 @@ impl AppSettings {
         {
             return Err("Speed must be from 0.01 to 1.");
         }
+        self.motion_renderer.validate()?;
         if !(1..=360).contains(&self.smooth_fov_degrees) {
             return Err("Smooth FOV must be from 1 to 360 degrees.");
         }

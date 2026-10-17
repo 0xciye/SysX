@@ -21,6 +21,8 @@ pub struct BackendState {
     #[serde(default)]
     pub motion_always_on: bool,
     #[serde(default)]
+    pub motion_renderer: crate::settings::MotionRendererSettings,
+    #[serde(default)]
     pub color_filter: bool,
     #[serde(default)]
     pub fov_degrees: u16,

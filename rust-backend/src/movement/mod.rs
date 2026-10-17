@@ -6,6 +6,7 @@
 //! - this module: crop-target conversion, the controller wrapper that acts
 //!   once per frame, the ticker, the batcher and the IPC event.
 
+pub mod abcurves;
 pub mod normal;
 
 /// Default Normal speed per axis: in simulation it stays stable from 16 to
@@ -134,6 +135,7 @@ pub struct MovementEvent {
 
 #[derive(Clone, Debug)]
 pub struct MovementRuntimeSettings {
+    pub renderer_profile: Option<Arc<abcurves::Profile>>,
     pub config_revision: u64,
     pub motion_enabled: bool,
     pub motion_always_on: bool,
@@ -264,6 +266,7 @@ impl MovementTicker {
         let worker = thread::Builder::new()
             .name("sysx-movement-ticker".into())
             .spawn(move || {
+                let mut rendered = abcurves::MotionOutput::default();
                 let mut controller = MovementController::new(initial_sens);
                 let mut sens = initial_sens;
                 let mut sent_invalid = false;
@@ -291,6 +294,7 @@ impl MovementTicker {
                     if fresh {
                         let Some(runtime) = settings() else {
                             controller.reset();
+                            rendered.reset();
                             thread::sleep(Duration::from_millis(4));
                             continue;
                         };
@@ -298,6 +302,7 @@ impl MovementTicker {
                             || sample.config_revision != runtime.config_revision
                         {
                             controller.reset();
+                            rendered.reset();
                             if !sent_invalid {
                                 on_event(MovementEvent {
                                     config_revision: runtime.config_revision,
@@ -319,6 +324,7 @@ impl MovementTicker {
                         }
                         if sample.target.is_none() {
                             controller.reset();
+                            rendered.reset();
                             if !sent_invalid {
                                 on_event(MovementEvent {
                                     config_revision: runtime.config_revision,
@@ -341,6 +347,7 @@ impl MovementTicker {
                         if sens != runtime.sens {
                             let _ = controller.set_sensitivity(runtime.sens);
                             sens = runtime.sens;
+                            rendered.reset();
                         }
                         let (dx, dy) = controller.delta(
                             &sample,
@@ -350,6 +357,27 @@ impl MovementTicker {
                                 smooth_fov_degrees: runtime.smooth_fov_degrees,
                             },
                         );
+                        let (dx, dy) = if let Some(profile) = runtime.renderer_profile.as_ref() {
+                            if !runtime.output_active()
+                                || controller.frame_error.0.hypot(controller.frame_error.1)
+                                    <= normal::DEAD_ZONE_PX
+                            {
+                                rendered.reset();
+                                (0, 0)
+                            } else {
+                                rendered
+                                    .filter(Some(profile), (dx, dy), Instant::now())
+                                    .unwrap_or_else(|status| {
+                                        crate::diagnostics::record(&format!(
+                                            "ABCurves renderer stopped: status {status}"
+                                        ));
+                                        (0, 0)
+                                    })
+                            }
+                        } else {
+                            // Default Normal bypasses ABCurves completely.
+                            (dx, dy)
+                        };
                         if runtime.output_active() {
                             if let Some(line) = summary.add(&controller, sample.frame_id, (dx, dy))
                             {
@@ -362,7 +390,8 @@ impl MovementTicker {
                             config_revision: runtime.config_revision,
                             event: "movement_target".into(),
                             frame_id: sample.frame_id,
-                            target_valid: sample.target.is_some(),
+                            target_valid: sample.target.is_some()
+                                && (runtime.renderer_profile.is_none() || !rendered.is_failed()),
                             dx,
                             dy,
                             motion_enabled: runtime.motion_enabled,
@@ -374,6 +403,7 @@ impl MovementTicker {
                         sent_invalid = false;
                     } else if !sent_invalid {
                         controller.reset();
+                        rendered.reset();
                         if let Some(runtime) = settings() {
                             on_event(MovementEvent {
                                 config_revision: runtime.config_revision,
@@ -616,6 +646,7 @@ mod tests {
 
     fn runtime(always_on: bool, held: bool) -> MovementRuntimeSettings {
         MovementRuntimeSettings {
+            renderer_profile: None,
             config_revision: 2,
             motion_enabled: true,
             motion_always_on: always_on,
@@ -646,27 +677,42 @@ mod tests {
 
     #[test]
     fn ticker_rejects_a_previous_modes_sample_until_a_current_frame_arrives() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ticker = MovementTicker::new(
-            0.25,
-            Arc::new(|| Some(runtime(false, true))),
-            Arc::new(move |event| {
-                let _ = tx.send(event);
-            }),
-        );
-        ticker.update(sample(1));
-        let invalid = rx.recv_timeout(Duration::from_secs(2));
-        ticker.update(sample(2));
-        let valid = rx.recv_timeout(Duration::from_secs(2));
-        assert!(ticker.close(Duration::from_secs(1)));
-        let invalid = invalid.unwrap();
-        assert_eq!(invalid.config_revision, 2);
-        assert!(!invalid.target_valid);
-        assert_eq!((invalid.dx, invalid.dy), (0, 0));
-        let valid = valid.unwrap();
-        assert!(valid.target_valid);
-        assert_eq!(valid.config_revision, 2);
+        let profile = abcurves::Profile::prepare(&crate::config::MotionRendererSettings {
+            enabled: true,
+            reports: (0..256)
+                .map(|i| [(i % 9) as i16 - 4, (i % 5) as i16 - 2])
+                .collect(),
+            ..crate::config::MotionRendererSettings::default()
+        })
+        .unwrap();
+        for profile in [None, Some(profile)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ticker = MovementTicker::new(
+                0.25,
+                Arc::new(move || {
+                    let mut settings = runtime(false, true);
+                    settings.renderer_profile = profile.clone();
+                    Some(settings)
+                }),
+                Arc::new(move |event| {
+                    let _ = tx.send(event);
+                }),
+            );
+            ticker.update(sample(1));
+            let invalid = rx.recv_timeout(Duration::from_secs(2));
+            ticker.update(sample(2));
+            let valid = rx.recv_timeout(Duration::from_secs(2));
+            assert!(ticker.close(Duration::from_secs(1)));
+            let invalid = invalid.unwrap();
+            assert_eq!(invalid.config_revision, 2);
+            assert!(!invalid.target_valid);
+            assert_eq!((invalid.dx, invalid.dy), (0, 0));
+            let valid = valid.unwrap();
+            assert!(valid.target_valid);
+            assert_eq!(valid.config_revision, 2);
+        }
     }
+
     #[test]
     fn batches_do_not_sum_motion_across_control_revisions() {
         let first = event(1, 12, -7, "right", unix_ms());

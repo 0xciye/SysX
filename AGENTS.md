@@ -197,3 +197,27 @@ real backend serializer and host movement/Auto modules. The settings-to-pipeline
 separately. These checks do not validate Windows, OBS, physical Medius behavior,
 calibration accuracy on hardware or production performance. Validation did not dispatch a build workflow, merge changes or issue device
 commands.
+
+
+### Optional ABCurves texture (2026-10-17)
+
+Main retains the confirmed Normal controller and Auto source from
+`stable/motion-auto-2026-10-17` (`a7d7a5b`); preserve that branch. Normal is still
+the default and bypasses model/resampling calls. The Motion card can opt into
+**Normal + ABCurves (experimental)** after importing exactly 256 genuine native
+mouse reports sampled at 1 ms. This adds the pinned upstream MIT C99 Renderer,
+not a replacement planner or Python runtime. Profile preparation is off the ticker;
+output is numerically rendered at 1 ms then aggregated through the existing
+roughly 4 ms batching/device path. There is no physical 1 kHz guarantee or automatic
+physical sampler. Do not fabricate a profile from missing events or generated
+movement. Renderer intent resets on inactive/stale/lost targets, revision changes
+and long scheduling gaps; runtime errors clear movement validity and surface in
+existing error status. Normal, target selection, Auto, native clamps and vendor
+output are unchanged. See [ABCurves integration](docs/ABCURVES_INTEGRATION.md) for
+profile schema, provenance, license and validation limits.
+
+Local validation: backend 106 unit + 42 integration passed (2 existing ignored),
+UI 13 tests and WASM check passed, host 55 tests passed with test-only DejaVu
+fontconfig, upstream C tests 2 passed. No Windows workflow or physical devices
+were exercised. Tests and synthetic feedback checks do not establish in-game
+quality for the optional mode.

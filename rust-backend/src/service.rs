@@ -171,6 +171,7 @@ pub struct ReceiverService {
     pipeline: Arc<LatestFramePipeline>,
     movement_batcher: Arc<MovementBatcher>,
     movement_ticker: Arc<MovementTicker>,
+    motion_renderer: Arc<Mutex<crate::movement::abcurves::ProfileCache>>,
     source: Arc<Mutex<SourceState>>,
     source_times: Arc<Mutex<VecDeque<u64>>>,
     /// Decodes the frames the receiver thread reassembles.
@@ -280,6 +281,10 @@ impl ReceiverService {
             revision: 0,
             emit: Arc::new(|event| println!("{event}")),
         }));
+        let motion_renderer = Arc::new(Mutex::new(crate::movement::abcurves::ProfileCache::new(
+            &app.motion_renderer,
+        )?));
+        let ticker_renderer = Arc::clone(&motion_renderer);
         let ticker_settings = Arc::clone(&settings);
         let ticker_device = Arc::clone(&device);
         let ticker_auto = Arc::clone(&auto_events);
@@ -292,6 +297,7 @@ impl ReceiverService {
                 let trigger_held = trigger_held(&device, &settings.trigger_button);
                 let auto_active = effective_detection_settings(&settings, &device).2;
                 Some(MovementRuntimeSettings {
+                    renderer_profile: ticker_renderer.lock().ok()?.profile.clone(),
                     config_revision: ticker_auto.lock().ok()?.revision,
                     motion_enabled: settings.motion_enabled && !auto_active,
                     motion_always_on: settings.motion_always_on,
@@ -408,6 +414,7 @@ impl ReceiverService {
             pipeline,
             movement_batcher,
             movement_ticker,
+            motion_renderer,
             source_view: Mutex::new(SourceView::of(&source_state)),
             source: Arc::new(Mutex::new(source_state)),
             source_times,
@@ -473,7 +480,12 @@ impl ReceiverService {
             Some(vec![settings.crop_resolution, settings.crop_resolution]);
         // History remains available for diagnostics, but a recovered error
         // must not masquerade as a current operational failure.
-        let last_error = stats.last_error.clone().or(source_error);
+        let renderer_error = self
+            .motion_renderer
+            .lock()
+            .ok()
+            .and_then(|cache| cache.profile.as_ref().and_then(|profile| profile.error()));
+        let last_error = stats.last_error.clone().or(source_error).or(renderer_error);
         let device = self
             .device
             .lock()
@@ -490,7 +502,7 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
-            "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
+            "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
             "smooth_fov_degrees":settings.smooth_fov_degrees, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
@@ -656,6 +668,11 @@ impl ReceiverService {
         events.reconfigure(&routed_auto_settings(&settings));
         let revision = events.revision;
         drop(events);
+        // A renderer preparation error must not suppress Auto control events.
+        self.motion_renderer
+            .lock()
+            .map_err(|_| "Motion renderer lock poisoned")?
+            .configure(&settings.motion_renderer)?;
         let mut config = self.pipeline_config(&settings)?;
         config.auto_config_revision = revision;
         self.pipeline.configure(config).map_err(str::to_owned)
@@ -700,8 +717,8 @@ impl ReceiverService {
                 let commands = command
                     .get("commands")
                     .and_then(Value::as_array)
-                    .filter(|commands| !commands.is_empty() && commands.len() <= 16)
-                    .ok_or("settings command batch must contain 1..16 commands")?;
+                    .filter(|commands| !commands.is_empty() && commands.len() <= 17)
+                    .ok_or("settings command batch must contain 1..17 commands")?;
                 if commands
                     .iter()
                     .any(|item| item.get("type").and_then(Value::as_str) == Some("apply_settings"))
@@ -878,6 +895,30 @@ impl ReceiverService {
                     settings.motion_always_on = enabled;
                 }
                 drop(settings);
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "set_motion_renderer" => {
+                let renderer: crate::config::MotionRendererSettings = serde_json::from_value(
+                    command
+                        .get("settings")
+                        .cloned()
+                        .ok_or("Motion renderer settings are required")?,
+                )
+                .map_err(|_| "Invalid Motion renderer settings")?;
+                renderer.validate()?;
+                // Prepare before changing live settings. A rejected profile leaves
+                // the current output path and settings intact.
+                let prepared = crate::movement::abcurves::ProfileCache::new(&renderer)?;
+                let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                let mut current = self
+                    .motion_renderer
+                    .lock()
+                    .map_err(|_| "Motion renderer lock poisoned")?;
+                *current = prepared;
+                settings.motion_renderer = renderer;
+                drop(current);
+                drop(settings);
+                self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_motion_speed" => {
@@ -1663,6 +1704,77 @@ mod tests {
     use crate::config::{save_settings, AppSettings};
     use crate::udp::encode_jpeg_frame;
     use std::net::UdpSocket;
+
+    #[test]
+    fn motion_renderer_profile_is_opt_in_validated_and_saved_per_profile() {
+        let (service, data_dir) = test_service("motion-renderer-settings");
+        let guard = ServiceGuard(Arc::clone(&service));
+        assert!(service.motion_renderer.lock().unwrap().profile.is_none());
+        assert!(!service.settings.lock().unwrap().motion_renderer.enabled);
+        let bad = service.dispatch(json!({"version":1,"type":"set_motion_renderer",
+            "settings":{"enabled":true,"reports":[[1,2]]}}));
+        assert!(bad.is_err());
+        assert!(service.motion_renderer.lock().unwrap().profile.is_none());
+        // Synthetic profile for API/persistence testing only, never a shipped preset.
+        let reports = (0..256)
+            .map(|i| [(i % 9) as i16 - 4, (i % 5) as i16 - 2])
+            .collect::<Vec<_>>();
+        service
+            .dispatch(json!({"version":1,"type":"apply_settings","commands":[{
+            "version":1,"type":"set_motion_renderer","settings":{
+                "enabled":true,"sampleIntervalUs":1000,"reports":reports
+            }}]}))
+            .unwrap();
+        assert!(service.motion_renderer.lock().unwrap().profile.is_some());
+        // The config page persists through HTTP before applying runtime commands.
+        // Exercise that serializer here; apply_settings itself is runtime-only.
+        save_settings(
+            data_dir.join("app-settings.json"),
+            &service.settings.lock().unwrap(),
+        )
+        .unwrap();
+        let saved = load_settings(data_dir.join("app-settings.json"));
+        assert!(saved.motion_renderer.enabled);
+        assert_eq!(saved.motion_renderer.reports, reports);
+        let snapshot: AppSettings =
+            serde_json::from_value(saved.profiles[0].settings.clone()).unwrap();
+        assert_eq!(snapshot.motion_renderer, saved.motion_renderer);
+        // Auto trigger/reconfigure must reuse the prepared immutable profile.
+        let before = service
+            .motion_renderer
+            .lock()
+            .unwrap()
+            .profile
+            .clone()
+            .unwrap();
+        let mut output = crate::movement::abcurves::MotionOutput::default();
+        assert!(output
+            .filter(Some(&before), (i64::MAX, 0), Instant::now())
+            .is_err());
+        assert!(service.state()["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("ABCurves output stopped"));
+        output.reset();
+        service.reconfigure().unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            service
+                .motion_renderer
+                .lock()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap()
+        ));
+        service
+            .dispatch(json!({"version":1,"type":"set_motion_renderer",
+            "settings":{"enabled":false,"sampleIntervalUs":1000,"reports":reports}}))
+            .unwrap();
+        assert!(service.motion_renderer.lock().unwrap().profile.is_none());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     #[test]
     fn trigger_route_changes_invalidate_callbacks_even_with_unchanged_auto_settings() {

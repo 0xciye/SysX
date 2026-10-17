@@ -1,3 +1,7 @@
+#[path = "../../native-shared/motion_renderer.rs"]
+pub mod motion_renderer;
+pub use motion_renderer::MotionRendererSettings;
+
 use crate::targeting::SmoothingRange;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,6 +135,7 @@ pub struct AppSettings {
     pub profiles: Vec<ProfileSlot>,
     pub motion_enabled: bool,
     pub motion_always_on: bool,
+    pub motion_renderer: MotionRendererSettings,
     /// Preview shows only pixels of the selected target color; the rest is black.
     pub color_filter: bool,
     pub trigger_button: String,
@@ -177,6 +182,7 @@ impl Default for AppSettings {
             profiles: Vec::new(),
             motion_enabled: false,
             motion_always_on: false,
+            motion_renderer: MotionRendererSettings::default(),
             color_filter: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
@@ -387,6 +393,9 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid("motion speed must be 0.01..1"));
         }
+        self.motion_renderer
+            .validate()
+            .map_err(SettingsError::Invalid)?;
         if !(1..=360).contains(&self.smooth_fov_degrees) {
             return Err(SettingsError::Invalid("Smooth FOV must be 1..360"));
         }

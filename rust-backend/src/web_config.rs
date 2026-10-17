@@ -55,6 +55,10 @@ pub async fn start(
     };
     let app = Router::new()
         .route("/config.html", get(config_page))
+        .route(
+            "/licenses/abcurves.txt",
+            get(|| async { include_str!("../../third-party/abcurves/LICENSE") }),
+        )
         .route("/monitor.html", get(|| async { StatusCode::NOT_FOUND }))
         .route("/api/session", get(session))
         .route("/api/settings", get(get_settings).put(put_settings))

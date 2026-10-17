@@ -26,6 +26,9 @@ tensorrt-shim = ["tensorrt", "baracuda-tensorrt/shim"]
 name = "receiver-backend"
 path = "src/main.rs"
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"

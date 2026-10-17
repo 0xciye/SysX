@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/optima-manent/ABCurves",
+  "commit": "e197441f8d343d3b4a4069c7cae20764d0953d15",
+  "scope": "Unmodified C99 Renderer and frozen model only",
+  "license": "MIT",
+  "sha256": {
+    "LICENSE": "72f517523eb57a5f35f10a65ae684dbd54377d1e2bec4bd13fcd7a4968602416",
+    "include/abc_fixed.h": "e1c60e8d75ac769a63be31aabc9aac67c308e8e8a70e544688a19fd9eaede993",
+    "include/abc_online.h": "36aad00397b67b486fce43e1705534ddf9267af00f1746185def3506318a0e5d",
+    "include/abc_w5_stream.h": "18ef264383d79481f9b81ba949e8988f083c59c220c5fcb11c32bad3dda2e000",
+    "renderer_global_h80.bin": "405c34bceb55485dfd6bd3c0368bce079feea680a64c6b261904ef5b4713e240",
+    "src/abc_fixed.c": "b6a213d0908f7893f5a5a11bd0db3df1a135dcb43fdeeaa0291a6de32013347b",
+    "src/abc_fixed_internal.h": "ace03785af29aaa3cf43f716e1f5a5105e460b2bd20e60bb8172c6c7978417e4",
+    "src/abc_fixed_parts/abc_fixed_000.inc": "17d373dd3ac5b95443a7242c78d96c3a70d078486c62d02f119277200767d34f",
+    "src/abc_fixed_parts/abc_fixed_001.inc": "a294ca3482cf6d0abbf8ad14a1a7c3c380864f3e0f5bdcc52c2360b4faad6934",
+    "src/abc_fixed_parts/abc_fixed_002.inc": "19501cc74bbff68c3d752205b95df47a1a4a91a82c4d0fc5337b03038b03c0c1",
+    "src/abc_fixed_parts/abc_fixed_003.inc": "80ace17df0628eb511a5eec98098ec932dff54fd9ffc07cc286dc72f852dfb28",
+    "src/abc_fixed_parts/abc_fixed_004.inc": "6a83e48b1ffe9f9a8c3835b12016912d76bd2f2dcecfc138f0ef5aacf524a5b0",
+    "src/abc_fixed_parts/abc_fixed_005.inc": "210ea86b5273c8f886b85cd626f2190dd3a6212f701c1cb45865e21c0214f89c",
+    "src/abc_fixed_parts/abc_fixed_006.inc": "721e7ce9809dc292524e4d62aaae42197eab9ab3784cac6211987bc548649b56",
+    "src/abc_online.c": "359e187d02295c2e6b30aa3e003626d4167d0686c37946fa4e07ea35039ed2ec",
+    "src/abc_w5_stream.c": "e7ebde9d387f814a0dc54737f6920b0414bad4342e6a85fd904f6a51f21112f3"
+  }
+}

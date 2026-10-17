@@ -50,6 +50,9 @@ async fn browser_serves_settings_without_a_monitor_or_boot_preview() {
     assert!(settings.contains("Loading SysX settings"));
     assert!(!settings.contains("NO FRAME"));
     assert!(!settings.contains("<canvas"));
+    let license = get(port, "/licenses/abcurves.txt").await;
+    assert!(license.starts_with("HTTP/1.1 200"));
+    assert!(license.contains("Copyright (c) 2026 Optima Manent"));
     let monitor = get(port, "/monitor.html").await;
     assert!(monitor.starts_with("HTTP/1.1 404"));
     server.abort();
