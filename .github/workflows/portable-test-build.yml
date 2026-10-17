@@ -57,7 +57,17 @@ jobs:
         run: ./scripts/build-windows.ps1
       - name: Windows application lifecycle smoke
         shell: pwsh
+        # The hosted runner has no GPU or OpenGL 3 driver, which the default
+        # femtovg renderer needs; the smoke checks the lifecycle, not drawing.
+        env:
+          SLINT_BACKEND: winit-software
         run: ./scripts/smoke-windows-app.ps1 -ApplicationPath "$PWD/src-tauri/target/release/SysX.exe"
+      - name: Show SysX logs after a failed smoke
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem (Join-Path $env:LOCALAPPDATA 'SysX\logs') -Filter *.log -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 80 }
       - name: Verify native EXE and PDB identities
         shell: pwsh
         run: |
