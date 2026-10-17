@@ -4,8 +4,7 @@ use crate::config::{
 };
 use crate::decode_pool::DecodePool;
 use crate::movement::{
-    CalibrationStore, MovementBatcher, MovementRuntimeSettings, MovementTargetSample,
-    MovementTicker,
+    MovementBatcher, MovementRuntimeSettings, MovementTargetSample, MovementTicker,
 };
 use crate::pipeline::{LatestFramePipeline, PipelineConfig, ProcessedFrame};
 use crate::pixel_seek::PixelTargetColor;
@@ -233,6 +232,8 @@ impl ReceiverService {
         // Per-frame detection logs were written here (about 290 MB per hour
         // at 240 FPS, never read back); reclaim what older versions left.
         let _ = std::fs::remove_dir_all(data_dir.join("sessions"));
+        // Motion no longer learns; older versions saved what they learned here.
+        let _ = std::fs::remove_file(data_dir.join("motion-calibration.json"));
         let app = settings
             .lock()
             .map_err(|_| "settings lock poisoned")?
@@ -285,9 +286,6 @@ impl ReceiverService {
         let ticker_batcher = Arc::clone(&movement_batcher);
         let movement_ticker = Arc::new(MovementTicker::new(
             app.sens,
-            Arc::new(CalibrationStore::load(
-                data_dir.join("motion-calibration.json"),
-            )),
             Arc::new(move || {
                 let settings = ticker_settings.lock().ok()?;
                 let device = ticker_device.lock().ok()?;
@@ -301,6 +299,9 @@ impl ReceiverService {
                     sens: settings.sens,
                     offset_x: settings.offset_x,
                     offset_y: settings.offset_y,
+                    speed_x: settings.motion_speed_x,
+                    speed_y: settings.motion_speed_y,
+                    smooth_fov_degrees: settings.smooth_fov_degrees,
                     trigger_button: settings.trigger_button.clone(),
                     recoil: settings.recoil.clone(),
                 })
@@ -490,7 +491,8 @@ impl ReceiverService {
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
             "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
-            "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
+            "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
+            "smooth_fov_degrees":settings.smooth_fov_degrees, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "auto":settings.auto,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
@@ -875,6 +877,29 @@ impl ReceiverService {
                 if let Some(enabled) = command.get("motion_always_on").and_then(Value::as_bool) {
                     settings.motion_always_on = enabled;
                 }
+                drop(settings);
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "set_motion_speed" => {
+                const INVALID: &str = "motion speed must be 0.01..1 and Smooth FOV 1..360";
+                let speed = |key: &str| {
+                    finite_number(command.get(key), INVALID).and_then(|v| {
+                        (0.01..=1.0)
+                            .contains(&v)
+                            .then_some(v)
+                            .ok_or_else(|| INVALID.to_string())
+                    })
+                };
+                let (x, y) = (speed("x")?, speed("y")?);
+                let fov = command
+                    .get("smooth_fov_degrees")
+                    .and_then(Value::as_u64)
+                    .filter(|fov| (1..=360).contains(fov))
+                    .ok_or(INVALID)? as u16;
+                let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                settings.motion_speed_x = x;
+                settings.motion_speed_y = y;
+                settings.smooth_fov_degrees = fov;
                 drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }

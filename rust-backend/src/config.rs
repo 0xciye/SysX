@@ -145,6 +145,13 @@ pub struct AppSettings {
     pub smoothing_y_min: f32,
     pub smoothing_y_max: f32,
     pub sens: f64,
+    /// Normal motion speed per axis: the fraction of the target error moved
+    /// per frame (0.01–1).
+    pub motion_speed_x: f64,
+    pub motion_speed_y: f64,
+    /// Inside this FOV (degrees, same scale as the Motion FOV) the speed is
+    /// divided by the smoothing strength.
+    pub smooth_fov_degrees: u16,
     pub scale: String,
     pub show_preview: bool,
     pub crop_resolution: u32,
@@ -181,6 +188,9 @@ impl Default for AppSettings {
             smoothing_y_min: 1.0,
             smoothing_y_max: 1.0,
             sens: 0.25,
+            motion_speed_x: crate::movement::DEFAULT_SPEED,
+            motion_speed_y: crate::movement::DEFAULT_SPEED,
+            smooth_fov_degrees: 20,
             scale: "Smooth".into(),
             show_preview: true,
             crop_resolution: 640,
@@ -370,6 +380,15 @@ impl AppSettings {
         }
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err(SettingsError::Invalid("sensitivity must be 0.01..10"));
+        }
+        if ![self.motion_speed_x, self.motion_speed_y]
+            .iter()
+            .all(|speed| speed.is_finite() && (0.01..=1.0).contains(speed))
+        {
+            return Err(SettingsError::Invalid("motion speed must be 0.01..1"));
+        }
+        if !(1..=360).contains(&self.smooth_fov_degrees) {
+            return Err(SettingsError::Invalid("Smooth FOV must be 1..360"));
         }
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err(SettingsError::Invalid("invalid preview scale"));

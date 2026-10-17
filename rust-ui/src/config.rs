@@ -530,7 +530,21 @@ pub fn ConfigApp() -> impl IntoView {
                                 <div class="settings-fields"><label class="field"><input type="checkbox" prop:checked=move || settings.get().motion_always_on on:change=move |_| settings.update(|value| value.motion_always_on = !value.motion_always_on) aria-label="Motion always on"/><span class="field-label">"Always on"</span></label></div>
                             </div>
                             <div class="settings-row smoothing-settings-row">
-                                <div class="setting-description"><h2>"Exponential Smoothing"</h2></div>
+                                <div class="setting-description"><h2>"Speed"</h2></div>
+                                <div class="settings-fields smoothing-fields">
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Speed"</span><output>{move || format!("{:.3}", settings.get().motion_speed_x)}</output></span>
+                                        <input type="range" min="0.01" max="1" step="0.005" prop:value=move || settings.get().motion_speed_x.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_x = value) } aria-label="X speed"/>
+                                    </label>
+                                    <label class="field smooth-control"><span class="range-heading"><span class="field-label">"Y Speed"</span><output>{move || format!("{:.3}", settings.get().motion_speed_y)}</output></span>
+                                        <input type="range" min="0.01" max="1" step="0.005" prop:value=move || settings.get().motion_speed_y.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: f64| v.clamp(0.01, 1.0)) { settings.update(|settings| settings.motion_speed_y = value) } aria-label="Y speed"/>
+                                    </label>
+                                    <label class="field smooth-control settings-wide"><span class="range-heading"><span class="field-label">"Smooth FOV"</span><output>{move || format!("{}°", settings.get().smooth_fov_degrees)}</output></span>
+                                        <input type="range" min="1" max="360" step="1" prop:value=move || settings.get().smooth_fov_degrees.to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse().map(|v: u16| v.clamp(1, 360)) { settings.update(|settings| settings.smooth_fov_degrees = value) } aria-label="Smooth FOV"/>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="settings-row smoothing-settings-row">
+                                <div class="setting-description"><h2>"Smoothing"</h2><p>"Divides the speed inside the Smooth FOV."</p></div>
                                 <div class="settings-fields smoothing-fields">
                                     <label class="field smooth-control"><span class="range-heading"><span class="field-label">"X Min"</span><output>{move || format!("{:.1}", settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min))}</output></span>
                                         <input type="range" min="1" max="50" step="0.1" prop:value=move || settings.get().smoothing(SmoothingAxis::X, SmoothingBound::Min).to_string() on:input=move |event| if let Ok(value) = event_target_value(&event).parse() { settings.update(|settings| settings.set_smoothing(SmoothingAxis::X, SmoothingBound::Min, value)) } aria-label="X Min smoothing"/>
@@ -698,6 +712,14 @@ fn send_settings_commands(
                 "x_max": settings.smoothing_x_max,
                 "y_min": settings.smoothing_y_min,
                 "y_max": settings.smoothing_y_max,
+            }),
+        ),
+        command(
+            "set_motion_speed",
+            serde_json::json!({
+                "x": settings.motion_speed_x,
+                "y": settings.motion_speed_y,
+                "smooth_fov_degrees": settings.smooth_fov_degrees,
             }),
         ),
         command(
