@@ -52,6 +52,11 @@ slint::slint! {
         in property <[MouseKey]> mouse-keys;
         in property <string> detection-summary;
         in property <bool> has-target;
+        in property <image> target-layer;
+        in property <float> target-x;
+        in property <float> target-y;
+        in property <float> target-w;
+        in property <float> target-h;
         in property <color> target-ink: #e3bf4d;
         out property <float> feed-size: feed.width / 1px;
         callback viewport-changed();
@@ -98,6 +103,10 @@ slint::slint! {
                 border-radius: self.width / 2; border-width: 1px; border-color: root.fov-ink.with-alpha(0.8); background: transparent;
             }
             if root.has-frame: Image { x: 0px; y: 0px; width: parent.width; height: parent.height; source: root.overlay; image-fit: fill; }
+            if root.has-frame && root.has-target: Image {
+                x: root.target-x * 1px; y: root.target-y * 1px; width: root.target-w * 1px; height: root.target-h * 1px;
+                source: root.target-layer; image-fit: fill;
+            }
             if root.has-frame && root.detection-summary != "": Rectangle {
                 x: 10px; y: parent.height - 39px; width: parent.width - 20px; height: 29px;
                 background: #06090cdb; border-width: 1px; border-color: root.target-ink;
@@ -147,6 +156,7 @@ fn ink(rgb: u32) -> slint::Color {
 struct RenderCache {
     uploaded: Option<Instant>,
     overlay: String,
+    target: String,
 }
 
 fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
@@ -210,6 +220,7 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         app.set_has_target(false);
         last.borrow_mut().uploaded = None;
         last.borrow_mut().overlay.clear();
+        last.borrow_mut().target.clear();
         return;
     };
     let received = frame.received;
@@ -302,32 +313,30 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         _ => 0xe3bf4d,
     });
     app.set_target_ink(color);
-    let (pw, ph, cx, cy) = (
-        meta.detection.processed_width as f64,
-        meta.detection.processed_height as f64,
-        meta.crop_x as f64,
-        meta.crop_y as f64,
-    );
-    let overlay = overlay_svg(
-        meta,
-        rect,
-        side,
-        match color_name(state) {
-            "red" => "#e26868",
-            "purple" => "#a682dc",
-            _ => "#e3bf4d",
-        },
-    );
+    let overlay = overlay_svg(meta, rect, side, target_hex(color_name(state)));
     if last.borrow().overlay != overlay {
         if let Ok(image) = slint::Image::load_from_svg_data(overlay.as_bytes()) {
             app.set_overlay(image);
             last.borrow_mut().overlay = overlay;
         }
     }
-    let target = (!meta.detection.auto_active)
-        .then(|| target_point(meta))
-        .flatten()
-        .and_then(|t| map_detection_point(t.map(f64::from), pw, ph, rect, cx, cy));
+    // The line and ring move every frame while there is a target. They are
+    // rasterized into a small image around them: re-rasterizing and
+    // uploading the whole full-size overlay at the frame rate made weak
+    // machines stutter while Motion tracked.
+    let layer = target_layer(meta, rect, target_hex(color_name(state)));
+    if let Some(layer) = &layer {
+        if last.borrow().target != layer.svg {
+            if let Ok(image) = slint::Image::load_from_svg_data(layer.svg.as_bytes()) {
+                app.set_target_layer(image);
+                last.borrow_mut().target = layer.svg.clone();
+            }
+        }
+        app.set_target_x(layer.x as f32);
+        app.set_target_y(layer.y as f32);
+        app.set_target_w(layer.width as f32);
+        app.set_target_h(layer.height as f32);
+    }
     app.set_detection_summary(
         if meta.mode == "object_detection" {
             sysx_ui::layout::detection_summary(&meta.detection.objects)
@@ -336,7 +345,7 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         }
         .into(),
     );
-    app.set_has_target(target.is_some());
+    app.set_has_target(layer.is_some());
 }
 
 /// The ring marks the pixel being targeted; Object Detection keeps its
@@ -364,6 +373,8 @@ fn color_name(state: Option<&sysx_ui::protocol::BackendState>) -> &str {
 }
 /// Native SVG image primitives preserve the old corner/reticle geometry on
 /// both Slint's GPU and software renderers (software Path items are unsupported).
+/// This full-size layer holds only Object Detection boxes; the target line and
+/// ring are a separate small layer (`target_layer`).
 fn overlay_svg(
     meta: &sysx_ui::protocol::LiveFrame,
     rect: sysx_ui::layout::Rect,
@@ -414,61 +425,114 @@ fn overlay_svg(
             h - c
         );
     }
-    if !meta.detection.auto_active {
-        if let Some(t) = target_point(meta)
-            .and_then(|t| map_detection_point(t.map(f64::from), pw, ph, rect, cx, cy))
-        {
-            let (x, y) = (t[0], t[1]);
-            let center = [rect.x + rect.width / 2., rect.y + rect.height / 2.];
-            let distance = (x - center[0]).hypot(y - center[1]);
-            if distance > 12. {
-                let end = [
-                    x - (x - center[0]) / distance * 12.,
-                    y - (y - center[1]) / distance * 12.,
-                ];
-                let _ = write!(
-                    svg,
-                    r##"<defs><linearGradient id="lead" gradientUnits="userSpaceOnUse" x1="{}" y1="{}" x2="{}" y2="{}"><stop stop-color="{color}" stop-opacity=".1"/><stop offset="1" stop-color="{color}" stop-opacity=".95"/></linearGradient></defs><path d="M{} {}L{} {}" stroke="#040708" stroke-opacity=".85" stroke-width="3"/><path d="M{} {}L{} {}" stroke="url(#lead)" stroke-width="1.25"/>"##,
-                    center[0],
-                    center[1],
-                    end[0],
-                    end[1],
-                    center[0],
-                    center[1],
-                    end[0],
-                    end[1],
-                    center[0],
-                    center[1],
-                    end[0],
-                    end[1]
-                );
-            }
-            for (width, stroke, opacity) in [(3.5, "#040708", 0.85), (1.5, color, 1.)] {
-                let _ = write!(
-                    svg,
-                    r#"<g fill="none" stroke="{stroke}" stroke-opacity="{opacity}" stroke-width="{width}" stroke-linecap="round"><circle cx="{x}" cy="{y}" r="8"/>"#
-                );
-                for (ux, uy) in [(0., -1.), (0., 1.), (-1., 0.), (1., 0.)] {
-                    let _ = write!(
-                        svg,
-                        r#"<path d="M{} {}L{} {}"/>"#,
-                        x + ux * 11.,
-                        y + uy * 11.,
-                        x + ux * 16.,
-                        y + uy * 16.
-                    );
-                }
-                svg.push_str("</g>");
-            }
-            let _ = write!(
-                svg,
-                r#"<circle cx="{x}" cy="{y}" r="1.6" fill="{color}"/><circle cx="{}" cy="{}" r="2" fill="{color}" fill-opacity=".7"/>"#,
-                center[0], center[1]
-            );
-        }
-    }
     svg.push_str("</svg>");
     svg
+}
+
+fn target_hex(color: &str) -> &'static str {
+    match color {
+        "red" => "#e26868",
+        "purple" => "#a682dc",
+        _ => "#e3bf4d",
+    }
+}
+
+/// The line from the center to the target and the ring on it, as an SVG
+/// covering only their bounding box (preview coordinates).
+struct TargetLayer {
+    svg: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Reach of the ring, its ticks and their outline around the target point.
+const TARGET_LAYER_PAD: f64 = 20.;
+
+fn target_layer(
+    meta: &sysx_ui::protocol::LiveFrame,
+    rect: sysx_ui::layout::Rect,
+    color: &str,
+) -> Option<TargetLayer> {
+    use std::fmt::Write;
+    if meta.detection.auto_active {
+        return None;
+    }
+    let (pw, ph, cx, cy) = (
+        meta.detection.processed_width as f64,
+        meta.detection.processed_height as f64,
+        meta.crop_x as f64,
+        meta.crop_y as f64,
+    );
+    let t = target_point(meta)
+        .and_then(|t| map_detection_point(t.map(f64::from), pw, ph, rect, cx, cy))?;
+    let center = [rect.x + rect.width / 2., rect.y + rect.height / 2.];
+    let x0 = (t[0].min(center[0]) - TARGET_LAYER_PAD).floor();
+    let y0 = (t[1].min(center[1]) - TARGET_LAYER_PAD).floor();
+    let width = (t[0].max(center[0]) + TARGET_LAYER_PAD).ceil() - x0;
+    let height = (t[1].max(center[1]) + TARGET_LAYER_PAD).ceil() - y0;
+    // The viewBox starts at the layer's origin, so the drawing keeps preview
+    // coordinates.
+    let mut svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{x0} {y0} {width} {height}">"#
+    );
+    {
+        let (x, y) = (t[0], t[1]);
+        let distance = (x - center[0]).hypot(y - center[1]);
+        if distance > 12. {
+            let end = [
+                x - (x - center[0]) / distance * 12.,
+                y - (y - center[1]) / distance * 12.,
+            ];
+            let _ = write!(
+                svg,
+                r##"<defs><linearGradient id="lead" gradientUnits="userSpaceOnUse" x1="{}" y1="{}" x2="{}" y2="{}"><stop stop-color="{color}" stop-opacity=".1"/><stop offset="1" stop-color="{color}" stop-opacity=".95"/></linearGradient></defs><path d="M{} {}L{} {}" stroke="#040708" stroke-opacity=".85" stroke-width="3"/><path d="M{} {}L{} {}" stroke="url(#lead)" stroke-width="1.25"/>"##,
+                center[0],
+                center[1],
+                end[0],
+                end[1],
+                center[0],
+                center[1],
+                end[0],
+                end[1],
+                center[0],
+                center[1],
+                end[0],
+                end[1]
+            );
+        }
+        for (width, stroke, opacity) in [(3.5, "#040708", 0.85), (1.5, color, 1.)] {
+            let _ = write!(
+                svg,
+                r#"<g fill="none" stroke="{stroke}" stroke-opacity="{opacity}" stroke-width="{width}" stroke-linecap="round"><circle cx="{x}" cy="{y}" r="8"/>"#
+            );
+            for (ux, uy) in [(0., -1.), (0., 1.), (-1., 0.), (1., 0.)] {
+                let _ = write!(
+                    svg,
+                    r#"<path d="M{} {}L{} {}"/>"#,
+                    x + ux * 11.,
+                    y + uy * 11.,
+                    x + ux * 16.,
+                    y + uy * 16.
+                );
+            }
+            svg.push_str("</g>");
+        }
+        let _ = write!(
+            svg,
+            r#"<circle cx="{x}" cy="{y}" r="1.6" fill="{color}"/><circle cx="{}" cy="{}" r="2" fill="{color}" fill-opacity=".7"/>"#,
+            center[0], center[1]
+        );
+    }
+    svg.push_str("</svg>");
+    Some(TargetLayer {
+        svg,
+        x: x0,
+        y: y0,
+        width,
+        height,
+    })
 }
 
 pub fn run(
@@ -606,7 +670,7 @@ pub fn run(
     app.show().map_err(|e| e.to_string())?;
     slint::run_event_loop_until_quit().map_err(|e| e.to_string())
 }
-thread_local! {static UPLOAD:RefCell<RenderCache>=const{RefCell::new(RenderCache{uploaded:None,overlay:String::new()})};}
+thread_local! {static UPLOAD:RefCell<RenderCache>=const{RefCell::new(RenderCache{uploaded:None,overlay:String::new(),target:String::new()})};}
 
 #[cfg(test)]
 mod overlay_routing_tests {
@@ -631,10 +695,13 @@ mod overlay_routing_tests {
         };
         for valid in [false, true, false] {
             meta.detection.auto_target_valid = valid;
-            assert!(!super::overlay_svg(&meta, rect, 640., "red").contains("id=\"lead\""));
+            assert!(super::target_layer(&meta, rect, "red").is_none());
         }
         meta.detection.auto_active = false;
-        assert!(super::overlay_svg(&meta, rect, 640., "red").contains("id=\"lead\""));
+        assert!(super::target_layer(&meta, rect, "red")
+            .unwrap()
+            .svg
+            .contains("id=\"lead\""));
     }
 
     #[test]
@@ -660,8 +727,20 @@ mod overlay_routing_tests {
         };
         let svg = super::overlay_svg(&meta, rect, 640., "red");
         assert!(!svg.contains("<rect"), "no box: {svg}");
-        // The ring sits on the targeted pixel, not the smoothed point.
-        assert!(svg.contains("cx=\"480\" cy=\"280\""), "{svg}");
+        // The ring sits on the targeted pixel, not the smoothed point, in a
+        // small layer covering only the line and ring.
+        let layer = super::target_layer(&meta, rect, "red").unwrap();
+        assert!(layer.svg.contains("cx=\"480\" cy=\"280\""), "{}", layer.svg);
+        assert_eq!(
+            (layer.x, layer.y, layer.width, layer.height),
+            (300., 260., 200., 80.),
+            "center (320, 320) to target (480, 280), 20 px around"
+        );
+        assert!(
+            layer.svg.contains("viewBox=\"300 260 200 80\""),
+            "{}",
+            layer.svg
+        );
         meta.mode = "object_detection".into();
         assert!(super::overlay_svg(&meta, rect, 640., "red").contains("<rect"));
     }
