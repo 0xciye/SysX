@@ -21,6 +21,8 @@ pub struct BackendState {
     #[serde(default)]
     pub motion_always_on: bool,
     #[serde(default)]
+    pub color_filter: bool,
+    #[serde(default)]
     pub fov_degrees: u16,
     #[serde(default)]
     pub target_offset_x: f64,
@@ -175,6 +177,19 @@ pub struct LiveFrame {
     pub dropped_input_frames: u64,
     pub transport_dropped_frames: u64,
     pub detection: Detection,
+    /// Color filter on: a one-bit-per-pixel mask follows the metadata.
+    #[serde(default)]
+    pub color_mask: Option<ColorMaskInfo>,
+}
+
+/// Packed color mask sent between the frame metadata and the JPEG: pixel `i`
+/// of the processed image (row-major, at `crop_x/crop_y` in the frame) is bit
+/// `i % 8` of byte `i / 8`; set means the selected target color.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ColorMaskInfo {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -156,6 +156,8 @@ pub struct AppSettings {
     pub motion_enabled: bool,
     #[serde(default)]
     pub motion_always_on: bool,
+    #[serde(default)]
+    pub color_filter: bool,
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
@@ -192,6 +194,7 @@ impl Default for AppSettings {
             active_profile: 0,
             motion_enabled: false,
             motion_always_on: false,
+            color_filter: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,

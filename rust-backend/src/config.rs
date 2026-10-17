@@ -131,6 +131,8 @@ pub struct AppSettings {
     pub profiles: Vec<ProfileSlot>,
     pub motion_enabled: bool,
     pub motion_always_on: bool,
+    /// Preview shows only pixels of the selected target color; the rest is black.
+    pub color_filter: bool,
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
@@ -168,6 +170,7 @@ impl Default for AppSettings {
             profiles: Vec::new(),
             motion_enabled: false,
             motion_always_on: false,
+            color_filter: false,
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,

@@ -491,6 +491,12 @@ pub fn ConfigApp() -> impl IntoView {
                                             <input aria-label="Enable recoil" type="checkbox" prop:checked=move || settings.get().recoil.recoil_enabled on:change=move |_| settings.update(|value| value.recoil.recoil_enabled = !value.recoil.recoil_enabled)/>
                                             <span class=move || format!("switch{}", if settings.get().recoil.recoil_enabled { " is-on" } else { "" }) aria-hidden="true"><span/></span>
                                         </label>
+                                        <label class="module-toggle">
+                                            <span class="module-toggle-name">"Color Filter"</span>
+                                            <span class="module-toggle-state">{move || if settings.get().color_filter { "On" } else { "Off" }}</span>
+                                            <input aria-label="Enable color filter" type="checkbox" prop:checked=move || settings.get().color_filter on:change=move |_| settings.update(|value| value.color_filter = !value.color_filter)/>
+                                            <span class=move || format!("switch{}", if settings.get().color_filter { " is-on" } else { "" }) aria-hidden="true"><span/></span>
+                                        </label>
                                     </div>
                                 </div>
                             </div>
@@ -621,6 +627,7 @@ fn copy_state_to_settings(
         value.active_profile = state.profile_index;
         value.motion_enabled = state.motion_enabled;
         value.motion_always_on = state.motion_always_on;
+        value.color_filter = state.color_filter;
         value.strategy = state.mode.clone();
         value.fov_degrees = state.fov_degrees.clamp(1, 360);
         value.offset_x = state.target_offset_x;
@@ -696,6 +703,10 @@ fn send_settings_commands(
         command(
             "set_movement_calibration",
             serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled,"motion_always_on":settings.motion_always_on}),
+        ),
+        command(
+            "set_color_filter",
+            serde_json::json!({"enabled":settings.color_filter}),
         ),
         command(
             "set_recoil",

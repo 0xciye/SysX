@@ -27,6 +27,9 @@ pub struct PipelineConfig {
     /// Shared control/routing revision used to reject callbacks and Motion samples
     /// completed before a configuration or Auto trigger transition.
     pub auto_config_revision: u64,
+    /// Black out every pixel but the selected target color before Motion,
+    /// Auto (and Object Detection) process the frame.
+    pub color_filter: bool,
     pub smoothing_x: SmoothingRange,
     pub smoothing_y: SmoothingRange,
     pub model: Option<ModelDefinition>,
@@ -44,6 +47,7 @@ impl Default for PipelineConfig {
             auto_fov_degrees: 36,
             auto_target_active: false,
             auto_config_revision: 0,
+            color_filter: false,
             smoothing_x: SmoothingRange::NONE,
             smoothing_y: SmoothingRange::NONE,
             model: None,
@@ -65,6 +69,9 @@ pub struct ProcessedFrame {
     /// Smoothing factors drawn for this track; movement applies them to the
     /// target's own motion (Preview uses `smoothed_target_xy`).
     pub smoothing_alpha: (f32, f32),
+    /// Color filter on: the mask it applied (nonzero = selected color,
+    /// processed size, at `crop_x/crop_y`), so Preview shows the same image.
+    pub mask: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -341,7 +348,12 @@ fn process_frame(
         width: source_width,
         height: source_height,
     };
-    let processed = &frame.image;
+    let color_filtered = config
+        .color_filter
+        .then(|| crate::pixel_seek::color_filtered(&frame.image, config.pixel_color));
+    let processed = color_filtered
+        .as_ref()
+        .map_or(&frame.image, |(image, _)| image);
     let crop_ms = 0.0;
     if config.strategy == DetectionMode::ObjectDetection {
         let model = config.model.as_ref().ok_or_else(|| {
@@ -425,6 +437,7 @@ fn process_frame(
             crop_y: rect.y,
             selected_target,
             smoothing_alpha: smoother.alphas(),
+            mask: color_filtered.map(|(_, mask)| mask),
         });
     }
     let started = Instant::now();
@@ -496,6 +509,7 @@ fn process_frame(
         crop_y: rect.y,
         selected_target: None,
         smoothing_alpha: smoother.alphas(),
+        mask: config.color_filter.then_some(output.mask),
     })
 }
 
@@ -728,6 +742,51 @@ mod tests {
             assert_eq!(target[1], (row + 20) as f32 + 0.5, "frame for row {row}");
             assert_eq!(processed.result.objects.len(), 1);
         }
+    }
+
+    #[test]
+    fn color_filter_runs_before_detection_and_hands_its_mask_to_preview() {
+        let mut image = image::RgbImage::from_pixel(64, 64, image::Rgb([40, 90, 200]));
+        for (x, y) in [(30, 20), (31, 20), (30, 21), (31, 21)] {
+            image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+        }
+        image.put_pixel(5, 5, image::Rgb([250, 250, 250]));
+        let run = |color_filter: bool| {
+            let config = PipelineConfig {
+                pixel_color: PixelTargetColor::Red,
+                fov_degrees: 360,
+                color_filter,
+                ..PipelineConfig::default()
+            };
+            let mut smoother =
+                ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+            process_frame(
+                SourceFrame {
+                    frame_id: 1,
+                    timestamp_ns: 0,
+                    image: image.clone(),
+                    source: "test".into(),
+                    jpeg: Default::default(),
+                },
+                &config,
+                &mut smoother,
+                &mut None,
+                None,
+                false,
+            )
+            .unwrap()
+        };
+        let plain = run(false);
+        let filtered = run(true);
+        assert!(plain.mask.is_none(), "no mask without the filter");
+        let mask = filtered.mask.as_ref().expect("filter mask");
+        assert_eq!(mask.len(), 64 * 64);
+        assert_eq!(mask.iter().filter(|value| **value != 0).count(), 4);
+        assert_ne!(mask[20 * 64 + 30], 0);
+        assert_eq!(mask[5 * 64 + 5], 0);
+        // Only selected-color pixels remain, so the target is the same.
+        assert_eq!(filtered.result.target_xy, plain.result.target_xy);
+        assert_eq!(filtered.result.objects.len(), 1);
     }
 
     #[test]

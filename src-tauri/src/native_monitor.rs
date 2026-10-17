@@ -8,6 +8,8 @@ pub const MAX_JPEG: usize = 64 * 1024 * 1024;
 pub const MAX_META: usize = 1024 * 1024;
 pub struct PendingFrame {
     pub metadata: LiveFrame,
+    /// Packed color-filter mask (see `ColorMaskInfo`), when the filter is on.
+    pub mask: Option<Vec<u8>>,
     pub jpeg: Vec<u8>,
     pub received: Instant,
 }
@@ -64,19 +66,55 @@ pub fn parse_frame(bytes: &[u8]) -> Result<PendingFrame, String> {
     let metadata: LiveFrame =
         serde_json::from_slice(bytes.get(4..end).ok_or("truncated preview metadata")?)
             .map_err(|e| e.to_string())?;
-    let jpeg = bytes.get(end..).ok_or("missing preview JPEG")?;
     let (w, h) = (metadata.source_width, metadata.source_height);
     if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 33_554_432 {
         return Err("preview dimensions exceed limits".into());
     }
+    let (mask, jpeg_start) = match metadata.color_mask {
+        None => (None, end),
+        Some(info) => {
+            let inside = u64::from(metadata.crop_x) + u64::from(info.width) <= u64::from(w)
+                && u64::from(metadata.crop_y) + u64::from(info.height) <= u64::from(h);
+            let expected = (info.width as usize * info.height as usize).div_ceil(8);
+            if !inside || info.bytes != expected {
+                return Err("invalid color filter mask".into());
+            }
+            let mask_end = end.checked_add(info.bytes).ok_or("preview size overflow")?;
+            let mask = bytes
+                .get(end..mask_end)
+                .ok_or("truncated color filter mask")?;
+            (Some(mask.to_vec()), mask_end)
+        }
+    };
+    let jpeg = bytes.get(jpeg_start..).ok_or("missing preview JPEG")?;
     if jpeg.len() > MAX_JPEG || !jpeg.starts_with(&[255, 216]) || !jpeg.ends_with(&[255, 217]) {
         return Err("invalid preview JPEG".into());
     }
     Ok(PendingFrame {
         metadata,
+        mask,
         jpeg: jpeg.to_vec(),
         received: Instant::now(),
     })
+}
+
+/// Color filter: keeps the pixels whose mask bit is set and turns every other
+/// pixel (including any outside the masked area) black.
+fn apply_color_filter(rgba: &mut [u8], width: u32, metadata: &LiveFrame, mask: &[u8]) {
+    let Some(info) = metadata.color_mask else {
+        return;
+    };
+    let (left, top) = (metadata.crop_x, metadata.crop_y);
+    for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (index as u32 % width, index as u32 / width);
+        let keep = x >= left && y >= top && x - left < info.width && y - top < info.height && {
+            let bit = ((y - top) * info.width + (x - left)) as usize;
+            mask[bit / 8] >> (bit % 8) & 1 == 1
+        };
+        if !keep {
+            pixel[..3].fill(0);
+        }
+    }
 }
 pub fn decode(frame: PendingFrame) -> Result<Frame, String> {
     let mut reader = image::ImageReader::with_format(
@@ -94,7 +132,10 @@ pub fn decode(frame: PendingFrame) -> Result<Frame, String> {
     {
         return Err("preview JPEG dimensions do not match metadata".into());
     }
-    let rgba = decoded.to_rgba8().into_raw();
+    let mut rgba = decoded.to_rgba8().into_raw();
+    if let Some(mask) = &frame.mask {
+        apply_color_filter(&mut rgba, decoded.width(), &frame.metadata, mask);
+    }
     Ok(Frame {
         metadata: frame.metadata,
         rgba,
@@ -350,11 +391,68 @@ mod frame_tests {
         wrong.source_width = 193;
         assert!(decode(PendingFrame {
             metadata: wrong,
+            mask: None,
             jpeg: jpeg.to_vec(),
             received: Instant::now()
         })
         .is_err());
     }
+    fn packet(metadata: &LiveFrame, mask: &[u8]) -> Vec<u8> {
+        let json = serde_json::to_vec(metadata).unwrap();
+        let mut packet = (json.len() as u32).to_be_bytes().to_vec();
+        packet.extend(json);
+        packet.extend(mask);
+        packet.extend(include_bytes!("../../src/assets/red-cube-192.jpg"));
+        packet
+    }
+
+    #[test]
+    fn color_filter_keeps_masked_pixels_and_blacks_out_the_rest() {
+        let plain = decode(parse_frame(&packet(&sample_metadata(), &[])).unwrap()).unwrap();
+        // Bits set for the left half of every row (pixel i = bit i % 8 of byte i / 8).
+        let mut mask = vec![0u8; 192 * 192 / 8];
+        for y in 0..192 {
+            for x in 0..96 {
+                let bit = y * 192 + x;
+                mask[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        let mut metadata = sample_metadata();
+        metadata.color_mask = Some(sysx_ui::protocol::ColorMaskInfo {
+            width: 192,
+            height: 192,
+            bytes: mask.len(),
+        });
+        let filtered = decode(parse_frame(&packet(&metadata, &mask)).unwrap()).unwrap();
+        for y in [0usize, 95, 191] {
+            for x in [0usize, 50, 95, 96, 150, 191] {
+                let i = (y * 192 + x) * 4;
+                if x < 96 {
+                    assert_eq!(
+                        filtered.rgba[i..i + 4],
+                        plain.rgba[i..i + 4],
+                        "({x},{y}) kept"
+                    );
+                } else {
+                    assert_eq!(filtered.rgba[i..i + 4], [0, 0, 0, 255], "({x},{y}) black");
+                }
+            }
+        }
+        // A wrong byte count or a mask outside the frame is rejected.
+        metadata.color_mask = Some(sysx_ui::protocol::ColorMaskInfo {
+            width: 192,
+            height: 192,
+            bytes: mask.len() - 1,
+        });
+        assert!(parse_frame(&packet(&metadata, &mask[1..])).is_err());
+        metadata.color_mask = Some(sysx_ui::protocol::ColorMaskInfo {
+            width: 193,
+            height: 192,
+            bytes: (193usize * 192).div_ceil(8),
+        });
+        assert!(parse_frame(&packet(&metadata, &vec![0; (193usize * 192).div_ceil(8)])).is_err());
+    }
+
     #[test]
     fn mailbox_keeps_latest_and_stale_preview_is_hidden() {
         let inbox = Inbox::default();
@@ -363,6 +461,7 @@ mod frame_tests {
             metadata.frame_id = id;
             inbox.put(PendingFrame {
                 metadata: metadata.clone(),
+                mask: None,
                 jpeg: vec![255, 216, 255, 217],
                 received: Instant::now(),
             });

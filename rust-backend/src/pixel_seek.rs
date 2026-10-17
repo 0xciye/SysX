@@ -49,6 +49,31 @@ pub fn color_mask(image: &RgbImage, color: PixelTargetColor) -> Vec<u8> {
         .collect()
 }
 
+/// Color filter: the image with every pixel outside the color's profile
+/// turned black, and the mask that decided it.
+pub fn color_filtered(image: &RgbImage, color: PixelTargetColor) -> (RgbImage, Vec<u8>) {
+    let mask = color_mask(image, color);
+    let mut filtered = image.clone();
+    for (pixel, keep) in filtered.as_mut().chunks_exact_mut(3).zip(&mask) {
+        if *keep == 0 {
+            pixel.fill(0);
+        }
+    }
+    (filtered, mask)
+}
+
+/// Packs a color mask to one bit per pixel, row-major, least significant bit
+/// first (pixel `i` is bit `i % 8` of byte `i / 8`) for the Preview color filter.
+pub fn pack_mask(mask: &[u8]) -> Vec<u8> {
+    mask.chunks(8)
+        .map(|pixels| {
+            pixels.iter().enumerate().fold(0u8, |byte, (bit, value)| {
+                byte | (u8::from(*value != 0) << bit)
+            })
+        })
+        .collect()
+}
+
 /// Minimum lock margin around the previous target box, in crop pixels.
 const LOCK_MARGIN_PX: f32 = 12.0;
 /// Lock margin as a fraction of the previous box's larger side.
@@ -241,6 +266,35 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_filter_keeps_only_the_selected_color() {
+        let mut image = RgbImage::from_pixel(4, 2, image::Rgb([30, 200, 60]));
+        image.put_pixel(1, 0, image::Rgb([255, 255, 0]));
+        image.put_pixel(3, 1, image::Rgb([255, 0, 0]));
+        let (filtered, mask) = color_filtered(&image, PixelTargetColor::Yellow);
+        assert_eq!(mask.iter().filter(|value| **value != 0).count(), 1);
+        for (x, y, pixel) in filtered.enumerate_pixels() {
+            let expected = if (x, y) == (1, 0) {
+                [255, 255, 0]
+            } else {
+                [0, 0, 0]
+            };
+            assert_eq!(pixel.0, expected, "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn packed_mask_puts_pixel_i_in_bit_i_mod_8_of_byte_i_div_8() {
+        let mut mask = vec![0u8; 19];
+        for index in [0, 3, 7, 8, 18] {
+            mask[index] = 1;
+        }
+        assert_eq!(
+            super::pack_mask(&mask),
+            vec![0b1000_1001, 0b0000_0001, 0b0000_0100]
+        );
+    }
     use image::Rgb;
 
     #[test]

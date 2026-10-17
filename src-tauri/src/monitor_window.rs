@@ -649,6 +649,7 @@ mod render_tests {
                 view.frame = Some(Arc::new(
                     crate::native_monitor::decode(crate::native_monitor::PendingFrame {
                         metadata: crate::native_monitor::sample_metadata(),
+                        mask: None,
                         jpeg: include_bytes!("../../src/assets/red-cube-192.jpg").to_vec(),
                         received: Instant::now(),
                     })

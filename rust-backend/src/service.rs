@@ -211,6 +211,7 @@ impl ReceiverService {
             auto_fov_degrees: app.auto.fov_degrees,
             auto_target_active: false,
             auto_config_revision: 0,
+            color_filter: app.color_filter,
             smoothing_x: app.smoothing_x(),
             smoothing_y: app.smoothing_y(),
             model,
@@ -410,7 +411,7 @@ impl ReceiverService {
         json!({
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
-            "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
+            "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "auto":settings.auto,
@@ -555,6 +556,7 @@ impl ReceiverService {
             auto_fov_degrees: settings.auto.fov_degrees,
             auto_target_active,
             auto_config_revision: 0, // filled atomically by reconfigure()
+            color_filter: settings.color_filter,
             smoothing_x: settings.smoothing_x(),
             smoothing_y: settings.smoothing_y(),
             model,
@@ -736,6 +738,18 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
                     .trigger_button = value.into();
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
+            "set_color_filter" => {
+                let enabled = command
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("color filter enabled flag is required")?;
+                self.settings
+                    .lock()
+                    .map_err(|_| "settings lock poisoned")?
+                    .color_filter = enabled;
+                self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_recoil" => {
@@ -1416,6 +1430,13 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
     // Per frame and per monitor: read only the two counters needed instead of
     // building the whole state (settings and profile clones, registry lock).
     let transport = service.source_view_now().transport;
+    // Color filter: the mask applied before processing, one bit per pixel,
+    // sent between the metadata and the original JPEG; Preview blacks out the
+    // same pixels, so it shows exactly the image Motion/Auto processed.
+    let mask = processed.mask.as_deref().map(crate::pixel_seek::pack_mask);
+    let color_mask = mask.as_ref().map(|bits| {
+        json!({"width":processed.result.processed_width, "height":processed.result.processed_height, "bytes":bits.len()})
+    });
     let metadata = json!({
         "event":"frame", "frame_id":processed.frame.frame_id, "source":processed.frame.source,
         "source_width":processed.result.source_width, "source_height":processed.result.source_height,
@@ -1423,13 +1444,15 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
         "model_id":processed.result.model_id, "processing_fps":stats.processing_fps, "source_fps":service.source_fps(),
         "dropped_input_frames":stats.dropped_input_frames, "rejected_frames":stats.rejected_frames,
         "resolution_mismatches":stats.resolution_mismatches, "transport_dropped_frames":transport.dropped_frames + transport.expired_frames,
-        "detection":processed.result,
+        "detection":processed.result, "color_mask":color_mask,
     });
     let bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
     let size = u32::try_from(bytes.len()).map_err(|_| "frame metadata too large")?;
-    let mut output = Vec::with_capacity(4 + bytes.len() + jpeg.len());
+    let mask = mask.unwrap_or_default();
+    let mut output = Vec::with_capacity(4 + bytes.len() + mask.len() + jpeg.len());
     output.extend_from_slice(&size.to_be_bytes());
     output.extend_from_slice(&bytes);
+    output.extend_from_slice(&mask);
     output.extend_from_slice(jpeg);
     Ok(output)
 }
@@ -1694,6 +1717,46 @@ mod tests {
         let service = ReceiverService::new("b".repeat(64), data_dir.clone(), port)
             .expect("start test receiver service");
         (service, data_dir)
+    }
+
+    #[test]
+    fn color_filter_command_reaches_state_and_the_pipeline() {
+        let (service, data_dir) = test_service("color-filter");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        assert_eq!(service.state()["color_filter"], false);
+        let response = service
+            .dispatch(json!({"version":1,"type":"set_color_filter","enabled":true}))
+            .unwrap();
+        assert_eq!(response["state"]["color_filter"], true);
+        // The next processed frame was filtered and carries its mask.
+        let port = service.state()["port"].as_u64().unwrap() as u16;
+        let jpeg = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/assets/red-cube-192.jpg"),
+        )
+        .unwrap();
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let started = Instant::now();
+        let mut id = 1;
+        let processed = loop {
+            if let Some(processed) = service.pipeline.latest() {
+                break processed;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "no frame processed"
+            );
+            for packet in crate::udp::encode_jpeg_frame(id, 192, 192, id, &jpeg).unwrap() {
+                sender.send_to(&packet, ("127.0.0.1", port)).unwrap();
+            }
+            id += 1;
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(processed.mask.as_ref().map(Vec::len), Some(192 * 192));
+        assert!(service
+            .dispatch(json!({"version":1,"type":"set_color_filter"}))
+            .is_err());
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

@@ -318,6 +318,8 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 
 149. [x] Audit fixes (on `4e0743e`): removed the per-frame JSONL detection log (~290 MB/h at 240 FPS, never read; old `sessions` folders are deleted at startup); `apply_settings` applies every command and reports all failures; 1 ms Windows timer resolution for host and backend; the host keeps the part of a target delta beyond ±32 for the next command; the host socket reads with a 2 ms timeout; preview metadata no longer builds the full state per frame; Middle is no longer a Motion/Auto trigger (it cycles profiles; files that select it load as Right); a fast least-squares check raises px/count within a few frames after zooming in (ADS/scope), cutting the simulated 4× still-target oscillation peak from 119 to 34 px. Backend, UI and host tests pass on Linux; `x86_64-pc-windows-msvc` checks pass. Not run on Windows or hardware.
 
+150. [x] Added Color Filter: a persisted toggle below Motion/Auto/Recoil in the Modules group. When on, the frame is filtered to the selected Pixel Seek color (everything else black) before Motion/Auto processing, and the native Preview shows the same filtered image from the original JPEG plus a packed one-bit mask (no re-encode). Backend, UI and host tests pass on Linux; Windows checks compile. Not run on Windows, OBS or hardware.
+
 
 ### Pixel Seek Motion / Auto contract correction (2026-10-16)
 
