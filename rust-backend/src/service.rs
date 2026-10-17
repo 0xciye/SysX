@@ -341,6 +341,7 @@ impl ReceiverService {
                             processed.result.processed_height,
                         ),
                         received_s: 0.0,
+                        age_s: processed.frame.received.elapsed().as_secs_f64(),
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     let on_center = auto_active && processed.result.auto_target_valid;

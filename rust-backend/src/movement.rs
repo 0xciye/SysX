@@ -1120,6 +1120,9 @@ pub struct MovementTargetSample {
     pub processed_size: (u32, u32),
     /// Monotonic receive time; set by `MovementTicker::update`.
     pub received_s: f64,
+    /// How long ago the receiver had this frame (decode and processing);
+    /// `received_s` and freshness count from then, not from publication.
+    pub age_s: f64,
 }
 
 const CALIBRATION_SAVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -1474,11 +1477,13 @@ impl MovementTicker {
     }
 
     pub fn update(&self, mut sample: MovementTargetSample) {
-        sample.received_s = monotonic_seconds();
+        let age = Duration::from_secs_f64(sample.age_s.clamp(0.0, 1.0));
+        sample.received_s = monotonic_seconds() - age.as_secs_f64();
+        let received = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         let (lock, wake) = &*self.shared;
         if let Ok(mut state) = lock.lock() {
             if !state.stopping {
-                state.latest = Some((sample, Instant::now()));
+                state.latest = Some((sample, received));
                 wake.notify_one();
             }
         }
@@ -1699,6 +1704,7 @@ mod tests {
             crop_origin: (0, 0),
             processed_size: (64, 64),
             received_s: 1.0,
+            age_s: 0.0,
         }
     }
 

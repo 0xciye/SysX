@@ -16,6 +16,9 @@ pub struct SourceFrame {
     /// The sender's original JPEG, forwarded to Preview as-is so the monitor
     /// can show every input frame without re-encoding. Empty when unknown.
     pub jpeg: Arc<Vec<u8>>,
+    /// When the receiver had the complete frame; movement measures the
+    /// frame's age from here, so decode and processing time count too.
+    pub received: Instant,
 }
 
 #[derive(Debug, Error)]
@@ -52,7 +55,7 @@ pub fn decode_udp_frame(frame: EncodedFrame) -> Result<SourceFrame, ReceiverErro
                 message: error.to_string(),
             }
         })?;
-    let image = decoded.to_rgb8();
+    let image = decoded.into_rgb8();
     if image.width() != u32::from(frame.width) || image.height() != u32::from(frame.height) {
         return Err(ReceiverError::DimensionMismatch {
             frame_id: frame.frame_id,
@@ -68,6 +71,7 @@ pub fn decode_udp_frame(frame: EncodedFrame) -> Result<SourceFrame, ReceiverErro
         image,
         source: "udp".into(),
         jpeg: Arc::new(frame.jpeg),
+        received: Instant::now(),
     })
 }
 
@@ -86,6 +90,8 @@ pub struct UdpDecodedFrameSource {
 /// sender on a stale crop, so it is repeated while the sender keeps streaming.
 const CROP_CONFIG_RESEND: Duration = Duration::from_secs(1);
 const RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// More than a full receive buffer of datagrams.
+const MAX_DRAINED_DATAGRAMS: usize = 16_384;
 
 impl UdpDecodedFrameSource {
     pub fn new(host: impl Into<String>, port: u16) -> io::Result<Self> {
@@ -171,47 +177,74 @@ impl UdpDecodedFrameSource {
         let deadline = Instant::now() + timeout;
         loop {
             self.reassembler.expire(monotonic_ns());
+            // Read everything already queued first, so only the newest
+            // complete frame is decoded: when decoding falls behind, the
+            // socket buffer (8 MiB) would otherwise hold seconds of old frames
+            // and every frame handed on would be one of them.
+            self.drain()?;
             if let Some(frame) = self.reassembler.take_latest() {
+                let received = Instant::now();
                 match decode_udp_frame(frame) {
-                    Ok(frame) => return Ok(Some(frame)),
+                    Ok(mut frame) => {
+                        frame.received = received;
+                        return Ok(Some(frame));
+                    }
                     Err(_) => self.reassembler.reject_decoded_frame(),
                 }
             }
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            match self
-                .socket
-                .as_ref()
-                .expect("socket opened")
-                .recv_from(&mut self.datagram)
-            {
-                Ok((length, sender)) => {
-                    // Only a real RCVR sender may become the crop recipient;
-                    // stray LAN datagrams must not redirect SYSCFG.
-                    if self.datagram[..length].starts_with(b"RCVR") {
-                        if self.sender != Some(sender) {
-                            self.reassembler.reset_session();
-                        }
-                        let resend_due = self
-                            .config_sent_at
-                            .is_none_or(|sent| sent.elapsed() >= CROP_CONFIG_RESEND);
-                        if self.sender != Some(sender) || resend_due {
-                            self.sender = Some(sender);
-                            self.send_crop_config();
-                        }
-                    }
-                    self.reassembler
-                        .accept(&self.datagram[..length], monotonic_ns());
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
+            let socket = self.socket.as_ref().expect("socket opened");
+            match socket.recv_from(&mut self.datagram) {
+                Ok((length, sender)) => self.accept(length, sender),
+                Err(error) if quiet(&error) => {}
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    /// Accepts every datagram already queued without waiting.
+    fn drain(&mut self) -> Result<(), ReceiverError> {
+        let socket = self.socket.as_ref().expect("socket opened");
+        socket.set_nonblocking(true)?;
+        let mut result = Ok(());
+        // Bounded so a flood cannot keep this loop from decoding.
+        for _ in 0..MAX_DRAINED_DATAGRAMS {
+            let socket = self.socket.as_ref().expect("socket opened");
+            match socket.recv_from(&mut self.datagram) {
+                Ok((length, sender)) => self.accept(length, sender),
+                Err(error) if quiet(&error) => break,
+                Err(error) => {
+                    result = Err(error.into());
+                    break;
+                }
+            }
+        }
+        self.socket
+            .as_ref()
+            .expect("socket opened")
+            .set_nonblocking(false)?;
+        result
+    }
+
+    fn accept(&mut self, length: usize, sender: std::net::SocketAddr) {
+        // Only a real RCVR sender may become the crop recipient;
+        // stray LAN datagrams must not redirect SYSCFG.
+        if self.datagram[..length].starts_with(b"RCVR") {
+            if self.sender != Some(sender) {
+                self.reassembler.reset_session();
+            }
+            let resend_due = self
+                .config_sent_at
+                .is_none_or(|sent| sent.elapsed() >= CROP_CONFIG_RESEND);
+            if self.sender != Some(sender) || resend_due {
+                self.sender = Some(sender);
+                self.send_crop_config();
+            }
+        }
+        self.reassembler
+            .accept(&self.datagram[..length], monotonic_ns());
     }
     pub fn close(&mut self) {
         self.socket = None;
@@ -228,6 +261,13 @@ impl UdpDecodedFrameSource {
         let _ = socket.send_to(message.as_bytes(), sender);
         self.config_sent_at = Some(Instant::now());
     }
+}
+
+fn quiet(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn monotonic_ns() -> u64 {
@@ -268,15 +308,18 @@ mod tests {
         let address = source.local_addr().unwrap().unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
-        for (id, size, bytes) in [
-            (1, 192, b"\xff\xd8invalid\xff\xd9".as_slice()),
-            (2, 1, jpeg.as_slice()),
-            (3, 192, jpeg.as_slice()),
-        ] {
+        let send = |id: u64, size: u16, bytes: &[u8]| {
             for packet in crate::udp::encode_jpeg_frame(id, size, size, id, bytes).unwrap() {
                 sender.send_to(&packet, address).unwrap();
             }
-        }
+        };
+        // One at a time: queued together, the newer frame supersedes the
+        // older ones before they are decoded.
+        send(1, 192, b"\xff\xd8invalid\xff\xd9");
+        assert!(source.read(Duration::from_millis(100)).unwrap().is_none());
+        send(2, 1, jpeg);
+        assert!(source.read(Duration::from_millis(100)).unwrap().is_none());
+        send(3, 192, jpeg);
         let frame = source
             .read(Duration::from_millis(500))
             .unwrap()
@@ -371,5 +414,28 @@ mod tests {
         let _ = source.read(Duration::from_millis(300)).unwrap();
         let length = sender.recv(&mut reply).expect("repeated SYSCFG");
         assert_eq!(&reply[..length], b"SYSCFG 1 CROP 256");
+    }
+
+    #[test]
+    fn a_backlog_hands_on_only_the_newest_frame() {
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.port = 0;
+        source.open().unwrap();
+        let address = source.local_addr().unwrap().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
+        // Frames that queued up while the receiver was busy decoding.
+        for id in 1..=20u64 {
+            for packet in crate::udp::encode_jpeg_frame(id, 192, 192, id, jpeg).unwrap() {
+                sender.send_to(&packet, address).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let frame = source
+            .read(Duration::from_millis(500))
+            .unwrap()
+            .expect("newest frame");
+        assert_eq!(frame.frame_id, 20);
+        assert!(source.read(Duration::from_millis(50)).unwrap().is_none());
     }
 }

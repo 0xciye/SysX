@@ -325,11 +325,7 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         }
     }
     let target = (!meta.detection.auto_active)
-        .then_some(
-            meta.detection
-                .smoothed_target_xy
-                .or(meta.detection.target_xy),
-        )
+        .then(|| target_point(meta))
         .flatten()
         .and_then(|t| map_detection_point(t.map(f64::from), pw, ph, rect, cx, cy));
     app.set_detection_summary(
@@ -341,6 +337,18 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         .into(),
     );
     app.set_has_target(target.is_some());
+}
+
+/// The ring marks the pixel being targeted; Object Detection keeps its
+/// smoothed point.
+fn target_point(meta: &sysx_ui::protocol::LiveFrame) -> Option<[f32; 2]> {
+    if meta.mode == "object_detection" {
+        meta.detection
+            .smoothed_target_xy
+            .or(meta.detection.target_xy)
+    } else {
+        meta.detection.target_xy
+    }
 }
 
 fn color_name(state: Option<&sysx_ui::protocol::BackendState>) -> &str {
@@ -372,7 +380,14 @@ fn overlay_svg(
         meta.crop_x as f64,
         meta.crop_y as f64,
     );
-    for object in &meta.detection.objects {
+    // Pixel Seek draws only the line and ring to its one target pixel (user
+    // request); boxes are for Object Detection.
+    let boxes = if meta.mode == "object_detection" {
+        meta.detection.objects.as_slice()
+    } else {
+        &[]
+    };
+    for object in boxes {
         let Some(b) = map_detection_box(object.bbox_xyxy.map(f64::from), pw, ph, rect, cx, cy)
         else {
             continue;
@@ -400,10 +415,7 @@ fn overlay_svg(
         );
     }
     if !meta.detection.auto_active {
-        if let Some(t) = meta
-            .detection
-            .smoothed_target_xy
-            .or(meta.detection.target_xy)
+        if let Some(t) = target_point(meta)
             .and_then(|t| map_detection_point(t.map(f64::from), pw, ph, rect, cx, cy))
         {
             let (x, y) = (t[0], t[1]);
@@ -603,6 +615,35 @@ mod overlay_routing_tests {
         }
         meta.detection.auto_active = false;
         assert!(super::overlay_svg(&meta, rect, 640., "red").contains("id=\"lead\""));
+    }
+
+    #[test]
+    fn pixel_seek_draws_only_the_line_and_ring_to_its_target_pixel() {
+        let mut meta: sysx_ui::protocol::LiveFrame = serde_json::from_value(serde_json::json!({
+            "frame_id":1, "source":"test", "source_width":64, "source_height":64,
+            "crop_x":0, "crop_y":0, "mode":"pixel_seek", "model_id":null,
+            "processing_fps":null, "source_fps":null, "dropped_input_frames":0,
+            "transport_dropped_frames":0,
+            "detection":{"frame_id":1,"timestamp_ns":0,"mode":"pixel_seek",
+                "model_id":null,"source_width":64,"source_height":64,
+                "processed_width":64,"processed_height":64,
+                "objects":[{"class_id":0,"class_name":"target","confidence":null,
+                    "bbox_xyxy":[40,28,56,40]}],
+                "total_processing_ms":0,"target_xy":[48,28],"smoothed_target_xy":[40,30]}
+        }))
+        .unwrap();
+        let rect = sysx_ui::layout::Rect {
+            x: 0.,
+            y: 0.,
+            width: 640.,
+            height: 640.,
+        };
+        let svg = super::overlay_svg(&meta, rect, 640., "red");
+        assert!(!svg.contains("<rect"), "no box: {svg}");
+        // The ring sits on the targeted pixel, not the smoothed point.
+        assert!(svg.contains("cx=\"480\" cy=\"280\""), "{svg}");
+        meta.mode = "object_detection".into();
+        assert!(super::overlay_svg(&meta, rect, 640., "red").contains("<rect"));
     }
 }
 

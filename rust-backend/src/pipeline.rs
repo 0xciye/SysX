@@ -658,6 +658,7 @@ mod tests {
                 image,
                 source: "test".into(),
                 jpeg: Default::default(),
+                received: std::time::Instant::now(),
             };
             let result = process_frame(
                 frame,
@@ -689,6 +690,7 @@ mod tests {
             image: image::RgbImage::new(320, 320),
             source: "udp".into(),
             jpeg: Default::default(),
+            received: std::time::Instant::now(),
         };
         let config = PipelineConfig::default();
         let mut smoother =
@@ -751,6 +753,7 @@ mod tests {
                     image: image.clone(),
                     source: "test".into(),
                     jpeg: Default::default(),
+                    received: std::time::Instant::now(),
                 },
                 &config,
                 &mut smoother,
@@ -789,6 +792,7 @@ mod tests {
                     image: image.clone(),
                     source: "test".into(),
                     jpeg: Default::default(),
+                    received: std::time::Instant::now(),
                 },
                 &config,
                 &mut smoother,
@@ -820,6 +824,7 @@ mod tests {
             image: image::RgbImage::new(640, 640),
             source: "test".into(),
             jpeg: Default::default(),
+            received: std::time::Instant::now(),
         };
         let model = ModelDefinition {
             id: "test-model".into(),
