@@ -900,7 +900,7 @@ mod tests {
         frame.smoothing_alpha = (0.25, 0.5); // strengths 4 and 2
                                              // 20° Smooth FOV = 17.75 px radius; 10 px away is inside.
         frame.target = Some((42.0, 42.0));
-        assert_eq!(controller.delta(&frame, params()), (1, 2));
+        assert_eq!(controller.delta(&frame, params()), (2, 3));
         frame.frame_id += 1;
         frame.target = Some((132.0, 32.0));
         assert_eq!(

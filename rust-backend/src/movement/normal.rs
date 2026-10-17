@@ -62,11 +62,12 @@ impl NormalMotion {
             return (0, 0);
         }
         // Smoothing is strongest at the Smooth FOV edge and fades to none at
-        // the target, so it slows the approach without making the last px
-        // take a long time.
+        // the target along (distance / radius)³ (user request: fade it out
+        // strongly), so it slows the entry without making the last px slow:
+        // half way in only 1/8 of the strength is left.
         let distance = ex.hypot(ey);
         let closeness = if distance < step.smooth_fov_px {
-            distance / step.smooth_fov_px
+            (distance / step.smooth_fov_px).powi(3)
         } else {
             1.0
         };
@@ -135,10 +136,10 @@ mod tests {
         let mut inside = step((100.0, 100.0));
         inside.smooth = (4.0, 2.0);
         assert_eq!(motion.step(inside), (40, 40), "outside: full speed");
-        // 100√2 px away, at the edge of a 150 px Smooth FOV: 94 % of the
+        // 100√2 px away in a 150 px Smooth FOV: 0.943³ = 84 % of the
         // strength applies.
         inside.smooth_fov_px = 150.0;
-        assert_eq!(motion.step(inside), (10, 21));
+        assert_eq!(motion.step(inside), (11, 22));
     }
 
     #[test]
@@ -153,8 +154,12 @@ mod tests {
         };
         // Fraction of the unsmoothed move: 1/5 at the edge, almost all near.
         assert!((at(19.9) - 1.0 / 4.98).abs() < 0.01, "{}", at(19.9));
-        assert!((at(10.0) - 1.0 / 3.0).abs() < 0.01, "{}", at(10.0));
-        assert!(at(2.0) >= 0.7, "1/1.4 at 2 px: {}", at(2.0));
+        assert!(
+            (at(10.0) - 1.0 / 1.5).abs() < 0.01,
+            "half way: {}",
+            at(10.0)
+        );
+        assert!(at(2.0) >= 0.99, "almost none at 2 px: {}", at(2.0));
     }
 
     #[test]
