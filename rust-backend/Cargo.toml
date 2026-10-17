@@ -47,6 +47,7 @@ tower-http = { version = "0.6", features = ["fs"] }
 # TensorRT development adapter is also unavailable for use.
 baracuda-driver = { version = "0.0.1-alpha.94", optional = true }
 baracuda-tensorrt = { version = "0.0.1-alpha.94", optional = true }
+turbojpeg = { version = "1.5", default-features = false, features = ["cmake", "require-simd"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_Media", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Threading"] }

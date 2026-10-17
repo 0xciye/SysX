@@ -7,6 +7,8 @@ pub mod crop;
 #[path = "../../native-shared/diagnostics.rs"]
 pub mod diagnostics;
 pub mod inference;
+#[path = "../../native-shared/jpeg.rs"]
+pub mod jpeg;
 pub mod movement;
 pub mod pipeline;
 pub mod pixel_seek;

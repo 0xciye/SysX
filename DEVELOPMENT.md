@@ -100,6 +100,7 @@ No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` (no 
 ## Build prerequisites
 
 - Node.js 20+, pnpm, Rust stable, and Trunk.
+- CMake and NASM on `PATH`: backend and host decode JPEG with libjpeg-turbo (`turbojpeg` crate, vendored source built statically with `require-simd`, so a build without NASM fails instead of silently losing SIMD). On Windows: `choco install nasm` (adds `C:\Program Files\NASM`) plus the CMake that ships with Visual Studio Build Tools; the manual EXE workflow installs NASM itself.
 - For Windows release builds: Windows x64 runner and the selected inference runtimes.
 
 ## Commands

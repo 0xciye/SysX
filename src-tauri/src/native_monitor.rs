@@ -117,24 +117,16 @@ fn apply_color_filter(rgba: &mut [u8], width: u32, metadata: &LiveFrame, mask: &
     }
 }
 pub fn decode(frame: PendingFrame) -> Result<Frame, String> {
-    let mut reader = image::ImageReader::with_format(
-        std::io::Cursor::new(&frame.jpeg),
-        image::ImageFormat::Jpeg,
-    );
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|e| e.to_string())?;
-    if decoded.width() != frame.metadata.source_width
-        || decoded.height() != frame.metadata.source_height
-    {
-        return Err("preview JPEG dimensions do not match metadata".into());
-    }
-    let mut rgba = decoded.to_rgba8().into_raw();
+    let (width, height) = (frame.metadata.source_width, frame.metadata.source_height);
+    let mut rgba =
+        crate::jpeg::decode(&frame.jpeg, width, height, true).map_err(|error| match error {
+            crate::jpeg::JpegError::Dimensions { .. } => {
+                "preview JPEG dimensions do not match metadata".to_owned()
+            }
+            crate::jpeg::JpegError::Decode(message) => message,
+        })?;
     if let Some(mask) = &frame.mask {
-        apply_color_filter(&mut rgba, decoded.width(), &frame.metadata, mask);
+        apply_color_filter(&mut rgba, width, &frame.metadata, mask);
     }
     Ok(Frame {
         metadata: frame.metadata,

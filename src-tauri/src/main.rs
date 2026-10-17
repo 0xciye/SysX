@@ -5,6 +5,8 @@ mod auto;
 mod diagnostics;
 #[cfg_attr(debug_assertions, allow(dead_code))]
 mod integrity;
+#[path = "../../native-shared/jpeg.rs"]
+mod jpeg;
 mod medius_device;
 mod monitor_window;
 mod movement;

@@ -1,4 +1,4 @@
-use image::{ImageFormat, RgbImage};
+use image::RgbImage;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
@@ -48,23 +48,25 @@ pub fn decode_udp_frame(frame: EncodedFrame) -> Result<SourceFrame, ReceiverErro
             frame_id: frame.frame_id,
         });
     }
-    let decoded =
-        image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg).map_err(|error| {
-            ReceiverError::Decode {
+    let (width, height) = (u32::from(frame.width), u32::from(frame.height));
+    let pixels =
+        crate::jpeg::decode(&frame.jpeg, width, height, false).map_err(|error| match error {
+            crate::jpeg::JpegError::Dimensions {
+                width: actual_width,
+                height: actual_height,
+            } => ReceiverError::DimensionMismatch {
                 frame_id: frame.frame_id,
-                message: error.to_string(),
-            }
+                declared_width: frame.width,
+                declared_height: frame.height,
+                actual_width,
+                actual_height,
+            },
+            crate::jpeg::JpegError::Decode(message) => ReceiverError::Decode {
+                frame_id: frame.frame_id,
+                message,
+            },
         })?;
-    let image = decoded.into_rgb8();
-    if image.width() != u32::from(frame.width) || image.height() != u32::from(frame.height) {
-        return Err(ReceiverError::DimensionMismatch {
-            frame_id: frame.frame_id,
-            declared_width: frame.width,
-            declared_height: frame.height,
-            actual_width: image.width(),
-            actual_height: image.height(),
-        });
-    }
+    let image = RgbImage::from_raw(width, height, pixels).expect("decoded RGB size");
     Ok(SourceFrame {
         frame_id: frame.frame_id,
         timestamp_ns: frame.timestamp_ns,
@@ -438,4 +440,25 @@ mod tests {
         assert_eq!(frame.frame_id, 20);
         assert!(source.read(Duration::from_millis(50)).unwrap().is_none());
     }
+
+    #[test]
+    fn libjpeg_turbo_decodes_the_fixture_like_the_reference_decoder() {
+        let jpeg = include_bytes!("../../src/assets/red-cube-192.jpg");
+        let ours = crate::jpeg::decode(jpeg, 192, 192, false).unwrap();
+        let reference = image::load_from_memory(jpeg).unwrap().into_rgb8().into_raw();
+        assert_eq!(ours.len(), reference.len());
+        let worst = ours
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 4, "largest channel difference {worst}");
+        assert!(matches!(
+            crate::jpeg::decode(jpeg, 64, 64, false),
+            Err(crate::jpeg::JpegError::Dimensions { width: 192, height: 192 })
+        ));
+        assert!(crate::jpeg::decode(b"\xff\xd8junk\xff\xd9", 192, 192, false).is_err());
+    }
 }
+
