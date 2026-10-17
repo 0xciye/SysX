@@ -97,7 +97,9 @@ $unexpected = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object 
 if ($unexpected.Count -gt 0) {
     throw "Release package contains unexpected files: $($unexpected.FullName -join ', ')"
 }
-if (@(Get-ChildItem -LiteralPath $stage -Recurse -File -Include "*.pdb", "*.map", "*.rs", "receiver-backend*.exe").Count -gt 0) {
+if (@(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
+    $_.Extension -in @('.pdb', '.map', '.rs') -or $_.Name -like 'receiver-backend*.exe'
+}).Count -gt 0) {
     throw "Release package contains debug/source/backend artifacts."
 }
 Write-Host "Package PE/layout audit passed: x86-64 SysX.exe and no sidecar/debug/source artifacts."

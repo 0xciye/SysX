@@ -560,35 +560,22 @@ pub fn ConfigApp() -> impl IntoView {
                                 </div>
                             </div>
                             <div class="settings-row">
-                                <div class="setting-description"><h2>"Motion output"</h2><p>"Normal keeps the current movement. ABCurves adds optional count texture."</p></div>
+                                <div class="setting-description"><h2>"Motion output"</h2></div>
                                 <div class="settings-fields">
                                     <label class="field"><span class="field-label">"Output"</span>
                                         <select prop:value=move || if settings.get().motion_renderer.enabled { "abcurves" } else { "normal" }
-                                            on:change=move |event| settings.update(|value| value.motion_renderer.enabled = event_target_value(&event) == "abcurves")>
+                                            on:change=move |event| settings.update(|value| {
+                                                value.motion_renderer.enabled = event_target_value(&event) == "abcurves";
+                                            })>
                                             <option value="normal">"Normal"</option>
                                             <option value="abcurves">"Normal + ABCurves (experimental)"</option>
                                         </select>
                                     </label>
-                                    <label class="text-button model-upload">"Import mouse profile"
-                                        <input type="file" accept=".json,application/json" on:change=move |event| {
-                                            if let Some(input) = event.target().and_then(|t| t.dyn_into::<HtmlInputElement>().ok()) {
-                                                if let Some(file) = input.files().and_then(|f| f.get(0)) {
-                                                    import_motion_profile(file, settings, apply_message);
-                                                }
-                                                input.set_value("");
-                                            }
-                                        }/>
-                                    </label>
-                                    <button type="button" class="text-button" on:click=move |_| settings.update(|value| {
-                                        value.motion_renderer.enabled = true;
-                                        value.motion_renderer.reports.clear();
-                                    })>"Collect a new profile"</button>
-                                    <a class="text-button" href="/licenses/abcurves.txt" target="_blank" rel="noopener">"ABCurves license"</a>
                                     <p>{move || if settings.get().motion_renderer.reports.len() == 256 {
-                                        "Mouse profile ready. Apply Changes if you edited settings.".to_string()
-                                    } else if settings.get().motion_renderer.enabled && !capture_message.get().is_empty() {
+                                        "Mouse profile ready.".to_string()
+                                    } else if settings.get().motion_renderer.enabled {
                                         capture_message.get()
-                                    } else { "Choose ABCurves and Apply Changes to collect a mouse profile automatically. Normal runs until capture is saved.".to_string() }}</p>
+                                    } else { String::new() }}</p>
                                 </div>
                             </div>
                             <div class="settings-row">
@@ -1144,24 +1131,4 @@ fn is_udp_bind_conflict(message: &str) -> bool {
     let normalized = message.to_lowercase();
     normalized.contains("address already in use")
         || normalized.contains("only one usage of each socket address")
-}
-
-fn import_motion_profile(file: File, settings: RwSignal<AppSettings>, message: RwSignal<String>) {
-    if file.size() > (16 * 1024) as f64 {
-        message.set("ABCurves profile must be at most 16 KiB.".into());
-        return;
-    }
-    spawn_local(async move {
-        let result = wasm_bindgen_futures::JsFuture::from(file.text()).await;
-        match result.ok().and_then(|value| value.as_string()) {
-            Some(text) => match crate::settings::motion_renderer::parse_profile(&text) {
-                Ok(profile) => {
-                    settings.update(|value| value.motion_renderer = profile);
-                    message.set("Mouse profile loaded. Choose output and Apply Changes.".into());
-                }
-                Err(error) => message.set(error.into()),
-            },
-            None => message.set("Could not read mouse profile.".into()),
-        }
-    });
 }

@@ -52,15 +52,14 @@ saving succeed; ABCurves then becomes ready automatically.
 
 The sample is saved in local `app-settings.json` under this settings profile's
 `motionRenderer` and reused on subsequent launches. It is not continuously
-retrained. **Collect a new profile**, followed by Apply Changes, clears the current
-sample and arms a replacement. Choosing Normal and applying bypasses the renderer;
+retrained. A settings profile without a sample arms capture automatically when
+Normal + ABCurves is selected and applied. Choosing Normal bypasses the renderer;
 a saved sample is retained for reuse. Switching profiles/configuration, disabling
 the option, or disconnecting cancels the in-flight capture. Automatic completion
 updates only the renderer, without resetting detection or Auto's pending clicks.
 
-The existing JSON importer remains available. Import never enables the addon by
-itself; choose the output and Apply Changes afterward. `enabled: true` with empty
-`reports` is the persisted pending-capture state, safely using Normal meanwhile.
+There is no profile import control. `enabled: true` with empty `reports` is the
+persisted pending-capture state, safely using Normal meanwhile.
 
 The JSON object has these fields:
 
@@ -68,7 +67,7 @@ The JSON object has these fields:
 | --- | --- |
 | `sampleIntervalUs` | `1000` |
 | `reports` | Exactly 256 chronological `[dx, dy]` physical mouse reports |
-| `enabled` | Optional; import always sets this to `false` |
+| `enabled` | Whether this settings profile has ABCurves selected |
 
 Reports use native device counts, X right and Y down; they are not screen-pixel
 coordinates, screenshots, Normal-generated deltas or a target trace. X accepts
@@ -79,8 +78,8 @@ to ABCurves' canonical Y-up convention and converts output back to Y down.
 Use exactly 256 consecutive genuine reports from a verified 1,000 Hz capture
 (about 256 ms). Preserve real zero-motion reports; do not invent zeros for absent
 events or interpolate physical input. The sample represents the device/setup and
-need not end at a target handoff. The importer validates the declared interval,
-shape and range, but cannot prove physical origin or actual sample cadence.
+need not end at a target handoff. The collector and backend validate the declared
+interval, shape and range and only accept timestamped physical Medius reports.
 
 Automatic capture uses a separate SDK axis-watch subscription and worker;
 it does not add high-rate events to the button/output monitor. Only physical
@@ -98,7 +97,7 @@ profile off the ticker, compares current and saved settings, then atomically sav
 before publishing it to the renderer. A newer Apply cannot be overwritten by a
 late capture. Failed saves retain Normal and retry at two-second intervals.
 Inactive profile snapshots are preserved. UI state adoption preserves unrelated
-unsaved edits and imported samples. No OS-wide hook, generated movement or raw
+unsaved edits and captured samples. No OS-wide hook, generated movement or raw
 sample file is involved; only the saved profile's reports are persisted. No
 synthetic or participant dataset profile is installed by default. Synthetic report
 arrays exist only inside explicitly labeled tests.
@@ -112,8 +111,9 @@ The unmodified C Renderer and frozen 44,484-byte model are vendored from
 ownership wrapper and C ABI shim are separate SysX code. No prebuilt DLL is used;
 the existing native compiler statically links the C99 core into the backend.
 
-The MIT notice is embedded and served at `/licenses/abcurves.txt`, linked from the
-Motion card, so portable distributions retain the notice. Raw ABCurves datasets
+The MIT notice is embedded and served at `/licenses/abcurves.txt` so portable
+distributions retain the required notice; it is not linked from the Motion card.
+Raw ABCurves datasets
 and planner checkpoints are not redistributed here.
 
 ## Validation

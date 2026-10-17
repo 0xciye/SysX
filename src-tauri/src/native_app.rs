@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,6 +26,7 @@ pub(crate) enum HostEvent {
 
 struct BackendRuntime {
     child: Arc<Mutex<Child>>,
+    shutdown_requested: Arc<AtomicBool>,
     runtime_dir: Option<PathBuf>,
     integrity: Option<crate::integrity::IntegrityGuard>,
 }
@@ -64,6 +66,8 @@ impl DeviceStatus {
 impl Drop for BackendRuntime {
     fn drop(&mut self) {
         drop(self.integrity.take());
+        self.shutdown_requested.store(true, Ordering::Release);
+        crate::diagnostics::record("requesting backend shutdown because the host is exiting");
         // Child::kill uses the owned OS process handle on Windows, avoiding a
         // PATH lookup and the possibility of targeting a recycled PID.
         let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
@@ -85,12 +89,16 @@ impl Drop for BackendRuntime {
 
 pub fn run() {
     let Some(_instance) = crate::single_instance::acquire() else {
+        crate::diagnostics::record(
+            "shutdown reason: another SysX instance already owns the receiver",
+        );
         // Another SysX owns the backend and UDP port: show its monitor, exit.
         if !crate::single_instance::focus_monitor_window() {
             crate::single_instance::request_monitor();
         }
         return;
     };
+    crate::diagnostics::begin_session();
     let movement_state = Arc::new(crate::movement::MovementState::default());
     let auto_target = Arc::new(Mutex::new(AutoTargetEvent::default()));
     let device_state = Arc::new(Mutex::new(DeviceStatus::missing()));
@@ -120,6 +128,7 @@ pub fn run() {
     start_host_client(
         port,
         token.clone(),
+        Arc::clone(&movement_state),
         Arc::clone(&device_state),
         Arc::clone(&capture),
         event_tx,
@@ -134,8 +143,13 @@ pub fn run() {
             "Configuration server unavailable; native receiver will still run",
         );
     }
-    if let Err(error) = crate::monitor_window::run(port, token, event_rx) {
-        crate::diagnostics::record(&format!("Native receiver failed: {error}"));
+    match crate::monitor_window::run(port, token, event_rx) {
+        Ok(()) => crate::diagnostics::record(
+            "shutdown reason: native receiver closed normally after its client lifecycle ended",
+        ),
+        Err(error) => crate::diagnostics::record(&format!(
+            "shutdown reason: native receiver returned an error: {error}"
+        )),
     }
     crate::single_instance::clear_config_port(&data_dir);
     drop(runtime);
@@ -208,6 +222,12 @@ fn start_backend(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    if let Some(path) = crate::diagnostics::log_path() {
+        command.env("SYSX_PARENT_LOG", path);
+    }
+    if let Some(path) = crate::diagnostics::backend_stderr_path() {
+        command.env("SYSX_PARENT_BACKEND_STDERR", path);
+    }
     match crate::diagnostics::backend_stderr() {
         Ok(file) => {
             command.stderr(file);
@@ -231,9 +251,14 @@ fn start_backend(
     // Any subsequent startup error now runs the ordinary owned-child cleanup.
     let mut runtime = BackendRuntime {
         child: Arc::new(Mutex::new(child)),
+        shutdown_requested: Arc::new(AtomicBool::new(false)),
         runtime_dir,
         integrity: None,
     };
+    monitor_backend_exit(
+        Arc::clone(&runtime.child),
+        Arc::clone(&runtime.shutdown_requested),
+    );
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::Builder::new()
         .name("sysx-backend-status".into())
@@ -283,11 +308,47 @@ fn start_backend(
     Ok((runtime, port, token, data_dir, config_port))
 }
 
+fn monitor_backend_exit(child: Arc<Mutex<Child>>, shutdown_requested: Arc<AtomicBool>) {
+    let result = thread::Builder::new()
+        .name("sysx-backend-watch".into())
+        .spawn(move || loop {
+            if shutdown_requested.load(Ordering::Acquire) {
+                return;
+            }
+            let result = child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .try_wait();
+            match result {
+                Ok(Some(status)) => {
+                    if !shutdown_requested.load(Ordering::Acquire) {
+                        crate::diagnostics::record(&format!(
+                            "backend exited unexpectedly: status={status}, code={:?}; inspect backend-*.log and backend-stderr-*.log for details",
+                            status.code()
+                        ));
+                    }
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(250)),
+                Err(error) => {
+                    crate::diagnostics::record(&format!(
+                        "could not monitor backend process exit: {error}"
+                    ));
+                    return;
+                }
+            }
+        });
+    if let Err(error) = result {
+        crate::diagnostics::record(&format!("could not start backend exit monitor: {error}"));
+    }
+}
+
 /// Backend connection with `role=host`: no preview frames, pushes device
 /// status changes, and reports how many monitor pages are connected.
 fn start_host_client(
     port: u16,
     token: String,
+    movement_state: Arc<crate::movement::MovementState>,
     device_state: Arc<Mutex<DeviceStatus>>,
     capture: Arc<Mutex<crate::mouse_capture::Bridge>>,
     events: Sender<HostEvent>,
@@ -339,6 +400,9 @@ fn start_host_client(
                 match socket.read() {
                     Ok(Message::Text(text)) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(settings) = recoil_settings_from_message(&value) {
+                                crate::movement::set_recoil_settings(&movement_state, settings);
+                            }
                             if let Ok(mut bridge) = capture.lock() {
                                 bridge.observe_state(&value);
                             }
@@ -390,6 +454,13 @@ fn client_counts(text: &str) -> Option<(usize, usize)> {
     let monitor = usize::try_from(value.get("monitor_clients")?.as_u64()?).ok()?;
     let config = usize::try_from(value.get("config_clients")?.as_u64()?).ok()?;
     Some((monitor, config))
+}
+
+fn recoil_settings_from_message(
+    message: &serde_json::Value,
+) -> Option<crate::movement::RecoilSettings> {
+    let state = message.get("state").unwrap_or(message);
+    serde_json::from_value(state.get("recoil")?.clone()).ok()
 }
 
 fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
@@ -615,6 +686,17 @@ fn monitor_medius(
         if !events.is_connected() {
             break;
         }
+        let recoil_settings = crate::movement::recoil_settings(movement_state);
+        let recoil_held = events
+            .held(Class::Button)
+            .iter()
+            .any(|usage| usage.id == u16::from(Button::LEFT.as_id()));
+        let recoil_target_ready = crate::movement::has_fresh_target(movement_state);
+        let recoil = vertical_adjustment.sample(
+            recoil_held && recoil_target_ready,
+            &recoil_settings,
+            Instant::now(),
+        );
         if Instant::now() >= next_health_check {
             next_health_check = Instant::now() + Duration::from_millis(250);
             let health = device.query_health();
@@ -678,7 +760,9 @@ fn monitor_medius(
                 }
             }
         }
-        if let Some(target) = crate::movement::take_target(movement_state) {
+        let target = crate::movement::take_target(movement_state);
+        let mut remainder = None;
+        let (dx, dy) = if let Some(target) = target {
             let held = crate::movement::trigger_button_index(&target.trigger_button).is_some_and(
                 |button| {
                     events
@@ -692,25 +776,28 @@ fn monitor_medius(
             let motion_active = target.config_revision == auto_input.config_revision()
                 && !auto_input.blocks_motion(auto_held)
                 && crate::movement::should_apply_target(&target, held);
-            let recoil = vertical_adjustment.sample(
-                motion_active,
-                &target.recoil,
-                std::time::Instant::now(),
-            );
             if motion_active {
-                let ((dx, dy), remainder) = target.device_move(recoil);
-                if dx != 0 || dy != 0 {
-                    match serial.submit_medius_move(dx, dy) {
-                        Ok(completion) => {
-                            move_completion = Some(completion);
-                            crate::movement::restore_remainder(movement_state, remainder);
-                            serial.pump();
-                        }
-                        Err(error) => {
-                            movement_error = Some(format!("mouse movement queue failed: {error}"));
-                            break;
-                        }
+                let (movement, rest) = target.device_move(recoil);
+                remainder = Some(rest);
+                movement
+            } else {
+                crate::movement::recoil_move(recoil)
+            }
+        } else {
+            crate::movement::recoil_move(recoil)
+        };
+        if dx != 0 || dy != 0 {
+            match serial.submit_medius_move(dx, dy) {
+                Ok(completion) => {
+                    move_completion = Some(completion);
+                    if let Some(remainder) = remainder {
+                        crate::movement::restore_remainder(movement_state, remainder);
                     }
+                    serial.pump();
+                }
+                Err(error) => {
+                    movement_error = Some(format!("mouse movement queue failed: {error}"));
+                    break;
                 }
             }
         }
@@ -952,5 +1039,21 @@ mod tests {
             None
         );
         assert_eq!(client_counts("not json"), None);
+        let recoil = recoil_settings_from_message(&serde_json::json!({
+            "event": "state",
+            "recoil": {
+                "recoilEnabled": true,
+                "recoilLevels": [2, 5],
+                "recoilStartDelayMs": 75,
+                "recoilLevelDurationMs": 35,
+                "recoilPercentage": 60
+            }
+        }))
+        .unwrap();
+        assert!(recoil.recoil_enabled);
+        assert_eq!(recoil.recoil_levels, vec![2, 5]);
+        assert_eq!(recoil.recoil_start_delay_ms, 75);
+        assert_eq!(recoil.recoil_level_duration_ms, 35);
+        assert_eq!(recoil.recoil_percentage, 60);
     }
 }

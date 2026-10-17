@@ -8,7 +8,10 @@ fn main() {
     if let Err(error) = sysx_backend::run(std::env::args().skip(1).collect()) {
         sysx_backend::diagnostics::record(&format!("fatal backend error: {error}"));
         eprintln!("{error}");
+        sysx_backend::diagnostics::finish_session(&format!(
+            "backend exited with fatal error: {error}"
+        ));
         std::process::exit(1);
     }
-    sysx_backend::diagnostics::record("backend stopped");
+    sysx_backend::diagnostics::finish_session("backend returned normally");
 }

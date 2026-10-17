@@ -37,13 +37,21 @@ pub struct MovementTarget {
 }
 
 #[derive(Default)]
-pub struct MovementState(Mutex<Option<MovementTarget>>);
+pub struct MovementState {
+    pending: Mutex<Option<MovementTarget>>,
+    latest_target: Mutex<Option<MovementTarget>>,
+    recoil: Mutex<RecoilSettings>,
+}
 
 pub fn set_target(state: &MovementState, value: &serde_json::Value) {
     let Ok(target) = serde_json::from_value::<MovementTarget>(value.clone()) else {
         return;
     };
-    if let Ok(mut pending) = state.0.lock() {
+    set_recoil_settings(state, target.recoil.clone());
+    if let Ok(mut latest) = state.latest_target.lock() {
+        *latest = Some(target.clone());
+    }
+    if let Ok(mut pending) = state.pending.lock() {
         *pending = Some(MovementTarget::merge_pending(pending.take(), target));
     }
 }
@@ -51,7 +59,7 @@ pub fn set_target(state: &MovementState, value: &serde_json::Value) {
 /// A fresh target delta is still waiting to be sent: Auto's aim mode clicks
 /// only after its move has fully left.
 pub fn has_pending_move(state: &MovementState) -> bool {
-    state.0.lock().is_ok_and(|pending| {
+    state.pending.lock().is_ok_and(|pending| {
         pending.as_ref().is_some_and(|target| {
             target.target_valid && (target.dx != 0 || target.dy != 0) && target.is_fresh()
         })
@@ -59,8 +67,31 @@ pub fn has_pending_move(state: &MovementState) -> bool {
 }
 
 pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
-    let target = state.0.lock().ok()?.take()?;
+    let target = state.pending.lock().ok()?.take()?;
     target.is_fresh().then_some(target)
+}
+
+pub fn has_fresh_target(state: &MovementState) -> bool {
+    state
+        .latest_target
+        .lock()
+        .ok()
+        .and_then(|target| target.clone())
+        .is_some_and(|target| target.target_valid && target.is_fresh())
+}
+
+pub fn recoil_settings(state: &MovementState) -> RecoilSettings {
+    state
+        .recoil
+        .lock()
+        .map(|settings| settings.clone())
+        .unwrap_or_default()
+}
+
+pub fn set_recoil_settings(state: &MovementState, settings: RecoilSettings) {
+    if let Ok(mut recoil) = state.recoil.lock() {
+        *recoil = settings;
+    }
 }
 
 /// Put back the part of a target delta that one command could not carry, so
@@ -70,7 +101,7 @@ pub fn restore_remainder(state: &MovementState, remainder: MovementTarget) {
     if remainder.dx == 0 && remainder.dy == 0 {
         return;
     }
-    if let Ok(mut pending) = state.0.lock() {
+    if let Ok(mut pending) = state.pending.lock() {
         *pending = Some(match pending.take() {
             Some(newer) => MovementTarget::merge_pending(Some(remainder), newer),
             None => remainder,
@@ -89,6 +120,13 @@ pub fn trigger_button_index(button: &str) -> Option<u16> {
 
 pub fn should_apply_target(target: &MovementTarget, trigger_held: bool) -> bool {
     target.motion_enabled && (target.motion_always_on || trigger_held) && target.target_valid
+}
+
+pub fn recoil_move(recoil_y: i64) -> (i16, i16) {
+    (
+        0,
+        recoil_y.clamp(-MAX_DEVICE_DELTA, MAX_DEVICE_DELTA) as i16,
+    )
 }
 
 impl MovementTarget {
@@ -155,8 +193,13 @@ impl VerticalAdjustmentClock {
         self.started_at = None;
     }
 
-    pub fn sample(&mut self, trigger_held: bool, settings: &RecoilSettings, now: Instant) -> i64 {
-        if !trigger_held || !settings.recoil_enabled || settings.recoil_levels.is_empty() {
+    pub fn sample(
+        &mut self,
+        left_button_held: bool,
+        settings: &RecoilSettings,
+        now: Instant,
+    ) -> i64 {
+        if !left_button_held || !settings.recoil_enabled || settings.recoil_levels.is_empty() {
             self.reset();
             return 0;
         }
@@ -180,10 +223,11 @@ impl VerticalAdjustmentClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        restore_remainder, set_target, should_apply_target, trigger_button_index, MovementState,
-        MovementTarget, RecoilSettings, VerticalAdjustmentClock,
+        has_fresh_target, recoil_move, recoil_settings, restore_remainder, set_target,
+        should_apply_target, trigger_button_index, MovementState, MovementTarget, RecoilSettings,
+        VerticalAdjustmentClock, TARGET_FRESHNESS_MS,
     };
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn trigger_mapping_excludes_left_and_middle() {
@@ -271,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn recoil_clock_resets_when_the_trigger_is_released() {
+    fn recoil_clock_resets_when_the_left_button_is_released() {
         let start = Instant::now();
         let settings = RecoilSettings {
             recoil_enabled: true,
@@ -294,6 +338,73 @@ mod tests {
             clock.sample(true, &settings, start + Duration::from_millis(62)),
             10
         );
+    }
+
+    #[test]
+    fn recoil_move_is_clamped() {
+        assert_eq!(recoil_move(12), (0, 12));
+        assert_eq!(recoil_move(100), (0, 32));
+        assert_eq!(recoil_move(-100), (0, -32));
+    }
+
+    #[test]
+    fn recoil_requires_a_fresh_valid_motion_target() {
+        let state = MovementState::default();
+        assert!(!has_fresh_target(&state));
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let target = |timestamp_ms, target_valid| {
+            serde_json::json!({
+                "target_valid": target_valid,
+                "dx": 0,
+                "dy": 0,
+                "motion_enabled": true,
+                "motion_always_on": false,
+                "trigger_button": "right",
+                "timestamp_ms": timestamp_ms,
+                "recoil": {}
+            })
+        };
+        set_target(&state, &target(now_ms, true));
+        assert!(has_fresh_target(&state));
+        set_target(&state, &target(now_ms, false));
+        assert!(!has_fresh_target(&state));
+        set_target(
+            &state,
+            &target(now_ms.saturating_sub(TARGET_FRESHNESS_MS + 1), true),
+        );
+        assert!(!has_fresh_target(&state));
+    }
+
+    #[test]
+    fn recoil_settings_update_even_when_the_target_is_invalid() {
+        let state = MovementState::default();
+        set_target(
+            &state,
+            &serde_json::json!({
+                "target_valid": false,
+                "dx": 0,
+                "dy": 0,
+                "motion_enabled": true,
+                "motion_always_on": false,
+                "trigger_button": "right",
+                "timestamp_ms": 0,
+                "recoil": {
+                    "recoilEnabled": true,
+                    "recoilLevels": [3, 7],
+                    "recoilStartDelayMs": 125,
+                    "recoilLevelDurationMs": 40,
+                    "recoilPercentage": 80
+                },
+            }),
+        );
+        let cached = recoil_settings(&state);
+        assert!(cached.recoil_enabled);
+        assert_eq!(cached.recoil_levels, vec![3, 7]);
+        assert_eq!(cached.recoil_start_delay_ms, 125);
+        assert_eq!(cached.recoil_level_duration_ms, 40);
     }
 
     #[test]
@@ -362,7 +473,7 @@ mod tests {
             })
         };
         set_target(&state, &event(true, 2, 1));
-        let merged = state.0.lock().unwrap().clone().unwrap();
+        let merged = state.pending.lock().unwrap().clone().unwrap();
         assert_eq!((merged.dx, merged.dy, merged.timestamp_ms), (15, -7, 1_004));
 
         // A newer lost target discards the remainder.
@@ -376,7 +487,7 @@ mod tests {
                 ..target
             },
         );
-        let merged = state.0.lock().unwrap().clone().unwrap();
+        let merged = state.pending.lock().unwrap().clone().unwrap();
         assert_eq!((merged.dx, merged.dy, merged.target_valid), (0, 0, false));
     }
 

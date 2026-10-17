@@ -84,7 +84,7 @@ The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pix
 ### Target selection and mouse output
 
 - Rust `targeting.rs` and `pipeline.rs` preserve full-crop detection and FOV-gated Pixel Seek/Object Detection selection, including nearest box, prior-box overlap, and the existing class anchor rule. Preview retains detections outside FOV.
-- Rust `movement.rs` stores the newest filtered crop target and runs a dedicated 4 ms ticker that recomputes deltas independently of detection cadence. `src-tauri/src/movement.rs` also sums fresh pending deltas, applies the held-trigger gate and 100 ms freshness limit, adds the sampled recoil value to Y, then caps each device command to ±32 per axis. Medius calls remain in Tauri's device monitors.
+- Rust `movement.rs` stores the newest filtered crop target and runs a dedicated 4 ms ticker that recomputes deltas independently of detection cadence. `src-tauri/src/movement.rs` sums fresh pending deltas and applies the Motion held-trigger gate and 100 ms freshness limit. Recoil is gated by both a fresh valid Motion target and physical Left-button hold (not the configured Motion trigger), then applies the configured start delay and per-level duration; commands remain capped to ±32 per axis. Medius calls remain in Tauri's device monitors.
 - `src-tauri/src/serial_queue.rs` retains type-0 asynchronous command ownership. The Medius loop submits internal movement/click records; `ThreadedSerialWriter` invokes `medius_device.rs` on a cloned SDK handle without blocking physical-button telemetry. The loop only takes a new target when idle; fresh deltas keep summing in `MovementState`. Library I/O timeouts apply; the forwarded `request_ms` hint cannot cancel SDK calls or establish USB/game execution time. No raw-port writer remains.
 
 The CapkfaPlus mapping in [`docs/CAPKFA_RECONSTRUCTION_MAPPING.md`](docs/CAPKFA_RECONSTRUCTION_MAPPING.md) is reference material only. SysX does not expose or run the reconstructed active-state, mode-predicate, direct-offset, or timed-click branches because their live state producers are unavailable. The supported output path uses fresh summed deltas, the configured physical trigger, sampled recoil on Y, and the documented Medius relative-move APIs.
@@ -234,7 +234,7 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 91. [x] Added a web-config upload/commit integration test for all four files in the selected model bundle: ONNX, TensorRT engine, and OpenVINO XML/BIN. The test verifies that the committed artifacts exist at the paths returned to the model registry. Current full suites: backend 30, Tauri 9, UI 4 passed; TensorRT feature `cargo check`, Trunk release build, per-crate `cargo fmt --check`, and `git diff --check` pass. No model was supplied, so actual inference remains unverified.
 92. [x] Added explicit reconstructed movement state and timed-action settings. This milestone is superseded by milestone 94: those state/timed branches were removed because their state producers and behavior are not available in the active source. Recoil remains in the normal movement path.
 93. [x] Changed Windows output to a portable single `SysX.exe` with no installer. The Rust backend and local configuration assets are embedded, extracted to per-process app data at launch, and removed on normal shutdown. Updated the Windows smoke path to check the standalone executable and removed the NSIS installer smoke script. The macOS release app compiles with embedded assets; Windows output and runtime validation remain pending.
-94. [x] Removed Native Motion State and Timed Action from the active UI/runtime. Restored the Tauri movement module with fresh pending-delta summing, selected-trigger gating, recoil sampling into Y, and ±32 command clamps. The backend now creates `app-settings.json` on first launch; the web config reads and writes that file through its local settings API. Added persistence and movement regression tests; Windows and hardware movement remain unverified.
+94. [x] Removed Native Motion State and Timed Action from the active UI/runtime. Restored the Tauri movement module with fresh pending-delta summing, selected-trigger gating, recoil sampling into Y only while a fresh valid target and physical left button are present, and ±32 command clamps. The backend now creates `app-settings.json` on first launch; the web config reads and writes that file through its local settings API. Added persistence and movement regression tests; Windows and hardware movement remain unverified.
 95. [x] Fixed packaged WebView startup: production CSP now permits the Trunk WASM bootstrap, and the embedded page includes a visible `NO FRAME` startup fallback if a platform WebView cannot initialize WASM. Rebuilt and opened the release macOS bundle successfully; it shows the SysX startup state instead of a black window. The fallback does not replace the Rust UI when WASM initializes normally.
 96. [x] Made the native Preview viewport square at up to 640 × 640 CSS pixels and kept its HUD to the three requested measured fields: resolution, FPS, and latency. The startup fallback follows the same square preview and HUD shape.
 97. [x] Replaced the Tauri/WebView desktop shell with a native `eframe/egui` receiver window. The Rust host connects directly to the authenticated preview WebSocket, embeds the backend/config assets, opens only the loopback config page in the browser, and restores native Medius monitoring with five-button telemetry and movement output. `cargo fmt --check`, native tests (5), backend tests (35), `git diff --check`, and the Windows release build pass; no runtime window was opened during this validation because the user was actively gaming.
@@ -365,7 +365,7 @@ Main retains the confirmed Normal controller and Auto source from
 the default and bypasses model/resampling calls. The Motion card can opt into
 **Normal + ABCurves (experimental)** and Apply Changes to automatically collect
 256 consecutive physical mouse reports at 1 ms through a dedicated Medius SDK
-subscription, or import a verified profile JSON. This adds the pinned upstream MIT C99 Renderer,
+subscription. Profile import is not exposed. This adds the pinned upstream MIT C99 Renderer,
 not a replacement planner or Python runtime. Profile preparation is off the ticker;
 output is numerically rendered at 1 ms then aggregated through the existing
 roughly 4 ms batching/device path. There is no physical 1 kHz output guarantee.
@@ -386,3 +386,45 @@ passed (2 existing ignored), UI 14 tests and WASM check passed, host 61 tests
 passed with test-only DejaVu fontconfig, upstream C tests 2 passed. No Windows workflow or physical devices
 were exercised. Tests and synthetic feedback checks do not establish in-game
 quality for the optional mode.
+
+### Crash reports and held-trigger soak (2026-10-17)
+
+Native host/backend release profiles use panic unwinding so diagnostics hooks can
+write the panic cause/backtrace, all current-session logs, and a best-effort
+Windows minidump. The host marker is created only after singleton ownership and
+removed on orderly return. A marker left on the next launch produces an
+unclean-exit report that explicitly says the exact cause is unknown and bundles
+the previous session logs. The host also records unexpected backend process
+exit status. Forced termination/power loss cannot reveal a precise cause when
+the OS provided no exception or exit context.
+
+Run the headless optimized soak with:
+`$env:SYSX_SOAK_SECONDS='600'; $env:SYSX_SOAK_INPUT_FPS='60'; cargo test --manifest-path rust-backend/Cargo.toml --release --features ort/load-dynamic --lib sustained_held_trigger_tracks_a_continuously_moving_pixel_target -- --ignored --nocapture`.
+It holds the synthetic Right trigger, feeds 640×640 Pixel Seek frames with a
+continuously moving red target into the bounded pipeline and consumes movement
+ticker events; it does not launch SysX/OBS or connect Medius/physical hardware.
+Windows x64 optimized run: 600 s, 60 FPS input, 33,352 submitted / 33,257
+processed / 95 replaced by latest-frame semantics, 0 stale/rejected, 33,203
+nonzero movement commands, no crash/exit. Working set stayed around 6.8–7.1 MB
+and private memory around 4.5–4.9 MB in periodic process snapshots. The worst
+processing sample (504.48 ms) was frame 0; a 120 s instrumented run again placed
+its 277.54 ms maximum on frame 0 (277.53 ms Pixel Seek detection, 288.29 ms
+frame age). Pixel Seek builds its 2 MiB/profile 24-bit RGB lookup lazily; service
+startup requests asynchronous warm-up, so an early first frame can race that
+initialization. This was a first-frame latency spike, not a steady-state crash.
+Warm-cache soak is being measured separately. These synthetic results do not
+reproduce a physical Medius device, OBS capture, game process, or the reported
+real crash; inspect the new crash/unclean-exit report if that still occurs.
+
+### Modular movement shaping (2026-10-17; superseded)
+
+The existing Normal controller remains the default and computes the original
+delta unchanged. An opt-in experimental output mode post-processes that delta
+through separate `movement/ncaf.rs`, `movement/bezier.rs`, and
+`movement/windmouse.rs` modules, in that order. NCAF attenuates by target
+distance, Bézier bends a per-stroke heading and shapes step magnitude, and the
+simplified WindMouse module adds bounded correlated perturbation that fades near
+the target (it is not the full classical WindMouse model).
+The setting is profile-persisted and exposed as “Normal + NCAF + Bézier +
+WindMouse”; turning it off resets its stroke/wind state. This historical mode
+was removed; Motion Output now exposes only Normal and Normal + ABCurves.

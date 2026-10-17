@@ -522,7 +522,7 @@ pub fn merge_automatic_profile(
 mod automatic_profile_tests {
     use super::*;
     #[test]
-    fn automatic_profile_preserves_drafts_and_never_overwrites_an_import() {
+    fn automatic_profile_preserves_drafts_and_adopts_only_valid_capture() {
         let mut applied = AppSettings::default();
         applied.motion_renderer.enabled = true;
         let mut draft = applied.clone();

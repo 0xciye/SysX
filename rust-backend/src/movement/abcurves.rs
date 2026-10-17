@@ -442,4 +442,43 @@ mod tests {
             reference.step((65536, 0)).unwrap()
         );
     }
+
+    #[test]
+    fn normal_then_abcurves_composes_without_panicking_or_replaying() {
+        use crate::movement::{
+            MotionParams, MovementController, MovementTargetSample, DEFAULT_SPEED,
+        };
+        let profile = synthetic_profile();
+        let start = Instant::now();
+        let mut controller = MovementController::new(0.25);
+        let mut output = MotionOutput::default();
+        for frame_id in 0..64 {
+            let sample = MovementTargetSample {
+                config_revision: 0,
+                frame_id,
+                target: Some((232.0, 32.0)),
+                smoothing_alpha: (1.0, 1.0),
+                crop_origin: (0, 0),
+                processed_size: (64, 64),
+                received_s: frame_id as f64 * 0.004,
+                age_s: 0.0,
+            };
+            let intent = controller.delta(
+                &sample,
+                MotionParams {
+                    offsets: (0.0, 0.0),
+                    speed: (DEFAULT_SPEED, DEFAULT_SPEED),
+                    smooth_fov_degrees: 20,
+                },
+            );
+            let report = output
+                .filter(
+                    Some(&profile),
+                    intent,
+                    start + Duration::from_millis(frame_id * 4),
+                )
+                .unwrap();
+            assert!(report.0.abs() <= i64::from(i16::MAX) && report.1.abs() <= i64::from(i16::MAX));
+        }
+    }
 }

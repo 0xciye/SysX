@@ -650,6 +650,184 @@ fn monotonic_ns() -> u64 {
 mod tests {
     use super::*;
     use crate::config::ModelArtifacts;
+    use crate::movement::{MovementRuntimeSettings, MovementTargetSample, MovementTicker};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    #[ignore = "long-running, headless movement/detection performance soak"]
+    fn sustained_held_trigger_tracks_a_continuously_moving_pixel_target() {
+        let seconds = std::env::var("SYSX_SOAK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120);
+        let input_fps = std::env::var("SYSX_SOAK_INPUT_FPS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+        let frame_period = Duration::from_secs_f64(1.0 / input_fps as f64);
+        let warm_started = Instant::now();
+        crate::pixel_seek::warm_profile_luts();
+        let warm_ms = warm_started.elapsed().as_secs_f64() * 1000.0;
+        let settings = MovementRuntimeSettings {
+            renderer_profile: None,
+            config_revision: 0,
+            motion_enabled: true,
+            motion_always_on: false,
+            sens: 0.25,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            speed_x: 0.06,
+            speed_y: 0.06,
+            smooth_fov_degrees: 20,
+            trigger_button: "right".into(),
+            trigger_held: true,
+            auto_flick: false,
+            recoil: crate::config::RecoilSettings::default(),
+        };
+        let commands = Arc::new(AtomicU64::new(0));
+        let moved = Arc::clone(&commands);
+        let ticker = Arc::new(MovementTicker::new(
+            settings.sens,
+            Arc::new(move || Some(settings.clone())),
+            Arc::new(move |event| {
+                if event.target_valid && (event.dx != 0 || event.dy != 0) {
+                    moved.fetch_add(1, Ordering::Relaxed);
+                }
+            }),
+        ));
+        let frames_processed = Arc::new(AtomicU64::new(0));
+        let timings = Arc::new(Mutex::new(Vec::new()));
+        let callback_ticker = Arc::clone(&ticker);
+        let callback_count = Arc::clone(&frames_processed);
+        let callback_timings = Arc::clone(&timings);
+        let config = PipelineConfig {
+            strategy: DetectionMode::PixelSeek,
+            pixel_color: PixelTargetColor::Red,
+            crop_resolution: Some(640),
+            fov_degrees: 360,
+            ..PipelineConfig::default()
+        };
+        let pipeline = LatestFramePipeline::new(
+            config,
+            Some(Arc::new(move |processed| {
+                if let Some(target) = processed.result.target_xy {
+                    callback_ticker.update(MovementTargetSample {
+                        config_revision: processed.auto_config_revision,
+                        frame_id: processed.frame.frame_id,
+                        target: Some((f64::from(target[0]), f64::from(target[1]))),
+                        smoothing_alpha: (
+                            f64::from(processed.smoothing_alpha.0),
+                            f64::from(processed.smoothing_alpha.1),
+                        ),
+                        crop_origin: (processed.crop_x, processed.crop_y),
+                        processed_size: (
+                            processed.result.processed_width,
+                            processed.result.processed_height,
+                        ),
+                        received_s: 0.0,
+                        age_s: processed.frame.received.elapsed().as_secs_f64(),
+                    });
+                }
+                callback_count.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut samples) = callback_timings.lock() {
+                    samples.push((
+                        processed.result.total_processing_ms,
+                        processed.result.detection_ms,
+                        processed.frame.received.elapsed().as_secs_f64() * 1000.0,
+                        processed.frame.frame_id,
+                    ));
+                }
+            })),
+        );
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let mut frame_id = 0_u64;
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            let phase = frame_id as f64 * 0.035;
+            let target_x = (320.0 + phase.sin() * 210.0) as u32;
+            let target_y = (320.0 + (phase * 0.63).cos() * 145.0) as u32;
+            let mut image = image::RgbImage::from_pixel(640, 640, image::Rgb([0, 0, 0]));
+            for y in target_y.saturating_sub(4)..(target_y + 4).min(640) {
+                for x in target_x.saturating_sub(4)..(target_x + 4).min(640) {
+                    image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+                }
+            }
+            pipeline
+                .submit(SourceFrame {
+                    frame_id,
+                    timestamp_ns: 0,
+                    image,
+                    source: "soak-test".into(),
+                    jpeg: Default::default(),
+                    received: now,
+                })
+                .expect("pipeline remains available during soak");
+            frame_id += 1;
+            thread::sleep(frame_period.saturating_sub(now.elapsed()));
+        }
+        assert!(
+            pipeline.close(Duration::from_secs(5)),
+            "pipeline worker stopped"
+        );
+        assert!(
+            ticker.close(Duration::from_secs(5)),
+            "movement ticker stopped"
+        );
+        let stats = pipeline.stats();
+        let mut timings = timings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        timings.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let percentile = |fraction: f64| {
+            let index = ((timings.len().saturating_sub(1)) as f64 * fraction).round() as usize;
+            timings.get(index).copied().unwrap_or_default()
+        };
+        let mut detection_ms = timings.iter().map(|sample| sample.1).collect::<Vec<_>>();
+        detection_ms.sort_by(f64::total_cmp);
+        let detection_percentile = |fraction: f64| {
+            detection_ms
+                .get(((detection_ms.len().saturating_sub(1)) as f64 * fraction).round() as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let max = timings.last().copied().unwrap_or_default();
+        println!(
+            "held-trigger moving-target soak: duration={}s input_fps={} lut_warm_ms={:.2} submitted={} processed={} dropped={} stale={} rejected={} movement_commands={} processing_ms[p50={:.2},p95={:.2},p99={:.2},max={:.2},max_detection={:.2},max_frame_age={:.2},max_frame_id={}]",
+            seconds,
+            input_fps,
+            warm_ms,
+            frame_id,
+            stats.processed_frames,
+            stats.dropped_input_frames,
+            stats.stale_results,
+            stats.rejected_frames,
+            commands.load(Ordering::Relaxed),
+            percentile(0.50).0,
+            percentile(0.95).0,
+            percentile(0.99).0,
+            max.0,
+            max.1,
+            max.2,
+            max.3,
+        );
+        println!(
+            "pixel-seek detection_ms[p95={:.2},p99={:.2},max={:.2}]",
+            detection_percentile(0.95),
+            detection_percentile(0.99),
+            detection_ms.last().copied().unwrap_or(0.0),
+        );
+        assert!(stats.processed_frames > 0, "at least one frame processed");
+        assert!(
+            commands.load(Ordering::Relaxed) > 0,
+            "held trigger emitted movement"
+        );
+        assert_eq!(
+            stats.rejected_frames, 0,
+            "pipeline reported no rejected frames"
+        );
+    }
 
     #[test]
     fn auto_frames_never_publish_motion_targets_and_use_their_own_fov() {

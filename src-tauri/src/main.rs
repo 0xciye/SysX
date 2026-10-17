@@ -25,7 +25,7 @@ fn main() {
     security::start_release_guard();
     timer_resolution::request_fine_timer();
     native_app::run();
-    diagnostics::record("host stopped");
+    diagnostics::finish_session("native application returned normally");
 }
 
 #[path = "../../native-shared/motion_capture.rs"]

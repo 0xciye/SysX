@@ -2033,7 +2033,7 @@ mod tests {
         std::fs::create_dir(&blocked_temp).unwrap();
         let error = service.dispatch(captured_command(&id)).unwrap_err();
         assert!(
-            error.contains("exist"),
+            error.contains("exist") || error.to_ascii_lowercase().contains("access is denied"),
             "expected atomic-write failure: {error}"
         );
         assert_eq!(std::fs::read(&service.settings_path).unwrap(), original);

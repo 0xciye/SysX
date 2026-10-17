@@ -211,20 +211,16 @@ fn lut_hit(lut: &[u64], r: u8, g: u8, b: u8) -> u8 {
     ((lut[rgb >> 6] >> (rgb & 63)) & 1) as u8
 }
 
-/// Builds all shared profile tables off the processing thread so the first
-/// frame after start or a color change does not pay for it.
+/// Build all shared tables before the receiver accepts frames so a cold
+/// profile can never stall target tracking on the processing worker.
 pub fn warm_profile_luts() {
-    let _ = std::thread::Builder::new()
-        .name("pixel-seek-lut".into())
-        .spawn(|| {
-            for color in [
-                PixelTargetColor::Yellow,
-                PixelTargetColor::Red,
-                PixelTargetColor::Purple,
-            ] {
-                profile_lut(color);
-            }
-        });
+    for color in [
+        PixelTargetColor::Yellow,
+        PixelTargetColor::Red,
+        PixelTargetColor::Purple,
+    ] {
+        profile_lut(color);
+    }
 }
 
 fn in_profile(color: PixelTargetColor, h: f32, s: f32, v: f32) -> bool {
