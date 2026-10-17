@@ -1,4 +1,4 @@
-use crate::auto_target::has_target_at_center;
+use crate::auto_target::{has_target_at_center, CrosshairTracker};
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
@@ -72,6 +72,8 @@ pub struct ProcessedFrame {
     /// Color filter on: the mask it applied (nonzero = selected color,
     /// processed size, at `crop_x/crop_y`), so Preview shows the same image.
     pub mask: Option<Vec<u8>>,
+    /// Measured crosshair radius in pixels (0 until measured).
+    pub crosshair_px: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -234,6 +236,8 @@ fn processing_loop(
     let mut prior_target: Option<PriorTarget> = None;
     let mut prior_target_at: Option<Instant> = None;
     let mut runtime_cache = None;
+    // Not reset on reconfiguration: the game's crosshair stays the same.
+    let mut crosshair = CrosshairTracker::default();
     loop {
         let (pending, config) = {
             let Ok(mut state) = shared.state.lock() else {
@@ -270,6 +274,7 @@ fn processing_loop(
             &mut runtime_cache,
             prior_target.as_ref(),
             prior_is_fresh,
+            &mut crosshair,
         );
         let finished_ns = monotonic_ns();
         let Ok(mut state) = shared.state.lock() else {
@@ -335,6 +340,7 @@ fn process_frame(
     runtime_cache: &mut Option<RuntimeCache>,
     previous_target: Option<&PriorTarget>,
     previous_is_fresh: bool,
+    crosshair: &mut CrosshairTracker,
 ) -> Result<ProcessedFrame, ProcessError> {
     let frame_started = Instant::now();
     // The OBS plugin is the sole owner of capture cropping.  The receiver
@@ -438,6 +444,7 @@ fn process_frame(
             selected_target,
             smoothing_alpha: smoother.alphas(),
             mask: color_filtered.map(|(_, mask)| mask),
+            crosshair_px: 0.0,
         });
     }
     let started = Instant::now();
@@ -461,6 +468,9 @@ fn process_frame(
             locked,
         )
     };
+    // Measured on the original image: the filter blacks the crosshair out.
+    crosshair.update(&frame.image);
+    let crosshair_px = crosshair.radius_px();
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
     let auto_target_valid = config.auto_target_active
@@ -469,6 +479,7 @@ fn process_frame(
             processed.width(),
             processed.height(),
             config.auto_fov_degrees,
+            crosshair_px,
         );
     let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
         x: point[0],
@@ -510,6 +521,7 @@ fn process_frame(
         selected_target: None,
         smoothing_alpha: smoother.alphas(),
         mask: config.color_filter.then_some(output.mask),
+        crosshair_px,
     })
 }
 
@@ -647,9 +659,17 @@ mod tests {
                 source: "test".into(),
                 jpeg: Default::default(),
             };
-            let result = process_frame(frame, &config, &mut smoother, &mut cache, None, false)
-                .unwrap()
-                .result;
+            let result = process_frame(
+                frame,
+                &config,
+                &mut smoother,
+                &mut cache,
+                None,
+                false,
+                &mut Default::default(),
+            )
+            .unwrap()
+            .result;
             assert_eq!(result.auto_active, auto);
             assert_eq!(result.auto_target_valid, auto && center);
             assert_eq!(result.fov_degrees, if auto { 1 } else { 360 });
@@ -681,6 +701,7 @@ mod tests {
             &mut runtime_cache,
             None,
             false,
+            &mut Default::default(),
         )
         .expect("the already-cropped frame should be processed as-is");
 
@@ -736,6 +757,7 @@ mod tests {
                 &mut runtime_cache,
                 None,
                 false,
+                &mut Default::default(),
             )
             .unwrap();
             let target = processed.result.smoothed_target_xy.expect("target");
@@ -773,6 +795,7 @@ mod tests {
                 &mut None,
                 None,
                 false,
+                &mut Default::default(),
             )
             .unwrap()
         };
@@ -831,6 +854,7 @@ mod tests {
             &mut runtime_cache,
             None,
             false,
+            &mut Default::default(),
         )
         .unwrap_err();
 

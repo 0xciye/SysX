@@ -122,7 +122,7 @@ fn simulate(scene: &Scene, seed: u64) -> Outcome {
             let mask = color_mask(&image, PixelTargetColor::Yellow);
             (
                 captured + RECEIVE_S,
-                has_target_at_center(&mask, SIZE, SIZE, 36),
+                has_target_at_center(&mask, SIZE, SIZE, 36, 0.0),
             )
         })
         .collect();

@@ -97,13 +97,19 @@ struct AutoSummary {
 }
 
 impl AutoSummary {
-    fn add(&mut self, active: bool, on_center: bool, fov_degrees: u16) -> Option<String> {
+    fn add(
+        &mut self,
+        active: bool,
+        on_center: bool,
+        fov_degrees: u16,
+        crosshair_px: f32,
+    ) -> Option<String> {
         if !active {
             // Trigger released: report what was gathered, if worth a line.
             let line = self
                 .started
                 .filter(|started| started.elapsed() >= Duration::from_millis(250))
-                .and_then(|_| self.take(fov_degrees));
+                .and_then(|_| self.take(fov_degrees, crosshair_px));
             *self = Self::default();
             return line;
         }
@@ -111,14 +117,14 @@ impl AutoSummary {
         self.frames += 1;
         self.on_center += u32::from(on_center);
         (started.elapsed() >= Duration::from_secs(2))
-            .then(|| self.take(fov_degrees))
+            .then(|| self.take(fov_degrees, crosshair_px))
             .flatten()
     }
 
-    fn take(&mut self, fov_degrees: u16) -> Option<String> {
+    fn take(&mut self, fov_degrees: u16, crosshair_px: f32) -> Option<String> {
         let seconds = self.started?.elapsed().as_secs_f64().max(1e-3);
         let line = format!(
-            "auto held {seconds:.1} s: {} frames ({:.0}/s), target on center in {} (Auto FOV {fov_degrees}°)",
+            "auto held {seconds:.1} s: {} frames ({:.0}/s), target on center in {} (Auto FOV {fov_degrees}°, crosshair {crosshair_px:.0} px)",
             self.frames,
             f64::from(self.frames) / seconds,
             self.on_center,
@@ -340,9 +346,12 @@ impl ReceiverService {
                     let on_center = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, on_center);
                     if let Ok(mut summary) = auto_summary.lock() {
-                        if let Some(line) =
-                            summary.add(auto_active, on_center, settings.auto.fov_degrees)
-                        {
+                        if let Some(line) = summary.add(
+                            auto_active,
+                            on_center,
+                            settings.auto.fov_degrees,
+                            processed.crosshair_px,
+                        ) {
                             crate::diagnostics::record(&line);
                         }
                     }
@@ -1851,12 +1860,17 @@ mod tests {
     #[test]
     fn auto_summary_reports_frames_and_center_hits() {
         let mut summary = super::AutoSummary::default();
-        assert!(summary.add(false, false, 36).is_none(), "nothing gathered");
+        assert!(
+            summary.add(false, false, 36, 0.0).is_none(),
+            "nothing gathered"
+        );
         for frame in 0..10 {
-            assert!(summary.add(true, frame % 5 == 0, 36).is_none());
+            assert!(summary.add(true, frame % 5 == 0, 36, 0.0).is_none());
         }
         summary.started = Some(Instant::now() - Duration::from_secs(1));
-        let line = summary.add(false, false, 36).expect("released: summary");
+        let line = summary
+            .add(false, false, 36, 0.0)
+            .expect("released: summary");
         assert!(line.contains("10 frames"), "{line}");
         assert!(line.contains("on center in 2"), "{line}");
         assert!(line.contains("Auto FOV 36°"), "{line}");
