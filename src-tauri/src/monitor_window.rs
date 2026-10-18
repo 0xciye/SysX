@@ -195,7 +195,7 @@ slint::slint! {
         }
     }
 
-    export struct ConfigSection { label: string, y: float, end: float }
+    export struct ConfigSection { label: string }
     global Palette {
         out property <color> window: #0a0d0f;
         out property <color> surface: #101315;
@@ -451,10 +451,11 @@ slint::slint! {
         callback field-selected(string, string);
         callback apply-requested();
         callback close-requested();
+        // The page shown: one per section in the rail.
+        in-out property <int> current-page;
+        callback page-selected(int);
         callback reset-scroll();
         reset-scroll => { settings-list.viewport-y = 0px; }
-        property <length> scrolled: -settings-list.viewport-y;
-        property <length> max-scroll: max(0px, root.content-height * 1px - settings-list.visible-height);
         property <color> status-color: root.message-kind == "success" ? Palette.good
             : root.message-kind == "error" ? Palette.error
             : root.message-kind == "info" ? Palette.text-secondary
@@ -492,22 +493,20 @@ slint::slint! {
             }
             HorizontalLayout {
                 vertical-stretch: 1;
-                // Section rail: jumps within the one scrolling page.
+                // Page rail: each section is its own page.
                 Rectangle {
                     width: 168px; background: Palette.rail;
                     VerticalLayout {
                         padding: 12px; spacing: 2px; alignment: start;
                         for section[index] in root.sections: SettingsNavItem {
                             caption: section.label; font: root.body-font;
-                            active: root.scrolled + 32px >= section.y * 1px
-                                && (root.scrolled + 32px < section.end * 1px
-                                    || index == root.sections.length - 1)
-                                && !(root.scrolled >= root.max-scroll - 1px
-                                    && root.max-scroll > 0px
-                                    && index != root.sections.length - 1
-                                    && root.scrolled + settings-list.visible-height >= root.sections[root.sections.length - 1].y * 1px + 80px);
+                            active: index == root.current-page;
                             activated => {
-                                settings-list.viewport-y = -min(section.y * 1px, root.max-scroll);
+                                if index != root.current-page {
+                                    root.current-page = index;
+                                    settings-list.viewport-y = 0px;
+                                    root.page-selected(index);
+                                }
                             }
                         }
                     }
@@ -656,12 +655,18 @@ fn ink(rgb: u32) -> slint::Color {
     slint::Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// Settings page geometry (logical px): rows sit in one panel per section,
-/// laid out here so the section rail can jump to each heading.
+/// Settings page geometry (logical px): each section is its own page with
+/// a heading over one panel of rows.
 const SETTINGS_TOP: f32 = 20.0;
 const SETTINGS_HEADING: f32 = 30.0;
 const SETTINGS_ROW: f32 = 44.0;
-const SETTINGS_SECTION_GAP: f32 = 28.0;
+
+/// One page of native Settings: a rail entry and its laid-out rows.
+struct SettingsPageLayout {
+    section: ConfigSection,
+    fields: Vec<ConfigField>,
+    height: f32,
+}
 
 fn setting_text(settings: &serde_json::Value, key: &str) -> String {
     key.split('.')
@@ -778,54 +783,39 @@ impl SettingsPage {
         self.row(row);
     }
 
-    /// Positions every heading, panel and row; returns the rail entries and
-    /// the content height.
-    fn layout(mut self) -> (Vec<ConfigField>, Vec<ConfigSection>, f32) {
-        let mut sections = Vec::<ConfigSection>::new();
-        let mut y = SETTINGS_TOP;
-        let mut panel: Option<usize> = None;
-        let mut first = false;
-        let close = |fields: &mut Vec<ConfigField>, panel: Option<usize>, y: f32| {
-            if let Some(index) = panel {
-                let top = fields[index].y + SETTINGS_HEADING;
-                fields[index].h = (y - top).max(0.0);
-            }
-        };
-        for index in 0..self.fields.len() {
-            if self.fields[index].kind == "section" {
-                close(&mut self.fields, panel, y);
-                if panel.is_some() {
-                    y += SETTINGS_SECTION_GAP;
-                    if let Some(last) = sections.last_mut() {
-                        last.end = y - SETTINGS_TOP;
-                    }
-                }
-                let label = &self.fields[index].label;
-                sections.push(ConfigSection {
-                    label: label.clone(),
-                    y: y - SETTINGS_TOP,
-                    end: f32::MAX,
+    /// Splits the rows into one page per section and positions each page's
+    /// heading, panel and rows from the top.
+    fn layout(self) -> Vec<SettingsPageLayout> {
+        let mut pages = Vec::<SettingsPageLayout>::new();
+        for mut row in self.fields {
+            if row.kind == "section" {
+                row.y = SETTINGS_TOP;
+                pages.push(SettingsPageLayout {
+                    section: ConfigSection {
+                        label: row.label.clone(),
+                    },
+                    fields: vec![row],
+                    height: SETTINGS_TOP + SETTINGS_HEADING,
                 });
-                self.fields[index].y = y;
-                y += SETTINGS_HEADING;
-                panel = Some(index);
-                first = true;
-            } else {
-                self.fields[index].y = y;
-                self.fields[index].first = first;
-                first = false;
-                y += SETTINGS_ROW;
+                continue;
             }
+            let Some(page) = pages.last_mut() else {
+                continue;
+            };
+            row.y = page.height;
+            row.first = page.fields.len() == 1;
+            page.height += SETTINGS_ROW;
+            page.fields[0].h += SETTINGS_ROW;
+            page.fields.push(row);
         }
-        close(&mut self.fields, panel, y);
-        if let Some(last) = sections.last_mut() {
-            last.end = y;
+        for page in &mut pages {
+            page.height += SETTINGS_TOP;
         }
-        (self.fields, sections, y + SETTINGS_TOP)
+        pages
     }
 }
 
-fn settings_page(settings: &serde_json::Value) -> (Vec<ConfigField>, Vec<ConfigSection>, f32) {
+fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
     let mut page = SettingsPage::default();
     page.section("Profiles");
     let profiles = settings
@@ -987,15 +977,31 @@ fn profile_name_of(settings: &serde_json::Value) -> String {
 
 #[cfg(test)]
 fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
-    settings_page(settings).0
+    settings_page(settings)
+        .into_iter()
+        .flat_map(|page| page.fields)
+        .collect()
 }
 
-/// Shows `settings` in the window: rows, rail and the profile being edited.
+/// Shows `settings` in the window: the rail, the current page's rows and
+/// the profile being edited.
 fn show_settings(app: &SettingsWindow, settings: &serde_json::Value) {
-    let (fields, sections, height) = settings_page(settings);
-    app.set_fields(ModelRc::new(VecModel::from(fields)));
-    app.set_sections(ModelRc::new(VecModel::from(sections)));
-    app.set_content_height(height);
+    let mut pages = settings_page(settings);
+    let current = usize::try_from(app.get_current_page())
+        .unwrap_or(0)
+        .min(pages.len().saturating_sub(1));
+    app.set_current_page(current as i32);
+    app.set_sections(ModelRc::new(VecModel::from(
+        pages
+            .iter()
+            .map(|page| page.section.clone())
+            .collect::<Vec<_>>(),
+    )));
+    if current < pages.len() {
+        let page = pages.swap_remove(current);
+        app.set_fields(ModelRc::new(VecModel::from(page.fields)));
+        app.set_content_height(page.height);
+    }
     app.set_profile_name(profile_name_of(settings).into());
 }
 
@@ -1637,6 +1643,15 @@ pub fn run(
             }
         }
     });
+    settings_app.on_page_selected({
+        let draft = Rc::clone(&settings_draft);
+        let weak = settings_app.as_weak();
+        move |_| {
+            if let (Some(app), Some(settings)) = (weak.upgrade(), draft.borrow().as_ref()) {
+                show_settings(&app, settings);
+            }
+        }
+    });
     settings_app.on_field_edited({
         let draft = Rc::clone(&settings_draft);
         let dirty = Rc::clone(&settings_dirty);
@@ -2161,35 +2176,31 @@ mod overlay_routing_tests {
     }
 
     #[test]
-    fn settings_rows_stack_in_panels_and_the_rail_points_at_each_heading() {
-        let (fields, sections, height) = super::settings_page(&serde_json::json!({
+    fn each_settings_section_is_its_own_page_laid_out_from_the_top() {
+        let pages = super::settings_page(&serde_json::json!({
             "profiles":[{"name":"Default"}],"activeProfile":0,
             "auto":{"mode":"aim"}
         }));
-        assert_eq!(sections.len(), 6);
-        assert_eq!(sections[0].y, 0.0, "the first heading is at the top");
-        for (section, next) in sections.iter().zip(sections.iter().skip(1)) {
-            assert_eq!(section.end, next.y, "{}", section.label);
-        }
-        let mut previous = None::<&super::ConfigField>;
-        for field in &fields {
-            if let Some(previous) = previous {
-                assert!(field.y > previous.y, "{} after {}", field.key, previous.key);
+        assert_eq!(pages.len(), 6);
+        for page in &pages {
+            let (heading, rows) = page.fields.split_first().unwrap();
+            assert_eq!(heading.kind, "section");
+            assert_eq!(heading.label, page.section.label);
+            assert_eq!(heading.y, super::SETTINGS_TOP, "{}", heading.label);
+            assert!(!rows.is_empty(), "{}", heading.label);
+            assert!(rows.iter().all(|row| row.kind != "section"));
+            assert_eq!(heading.h, rows.len() as f32 * super::SETTINGS_ROW);
+            assert!(rows[0].first && rows.iter().skip(1).all(|row| !row.first));
+            assert_eq!(rows[0].y, super::SETTINGS_TOP + super::SETTINGS_HEADING);
+            for pair in rows.windows(2) {
+                assert_eq!(pair[1].y, pair[0].y + super::SETTINGS_ROW);
             }
-            if field.kind == "section" {
-                let rows = fields
-                    .iter()
-                    .skip_while(|other| other.y <= field.y)
-                    .take_while(|other| other.kind != "section")
-                    .count() as f32;
-                assert_eq!(field.h, rows * super::SETTINGS_ROW, "{}", field.label);
-            }
-            previous = Some(field);
+            let last = rows.last().unwrap();
+            assert_eq!(
+                page.height,
+                last.y + super::SETTINGS_ROW + super::SETTINGS_TOP
+            );
         }
-        let firsts = fields.iter().filter(|field| field.first).count();
-        assert_eq!(firsts, sections.len(), "one first row per panel");
-        let last = fields.last().unwrap();
-        assert_eq!(height, last.y + super::SETTINGS_ROW + super::SETTINGS_TOP);
     }
 
     #[test]
@@ -2348,27 +2359,25 @@ mod render_tests {
             settings.set_body_font("DejaVu Sans".into());
             settings.set_mono_font("DejaVu Sans Mono".into());
         }
-        show_settings(
-            &settings,
-            &serde_json::json!({
-                "profiles":[{"name":"Default"},{"name":"Low recoil"}],"activeProfile":0,
-                "pixelColor":"yellow","fovDegrees":90,"colorFilter":false,
-                "cropResolution":256,"scale":"Smooth","motionEnabled":true,
-                "motionAlwaysOn":false,"motionNoDeadzone":true,"triggerButton":"right",
-                "offsetX":0,"offsetY":0,"motionSpeedX":0.045,"motionSpeedY":0.045,
+        let settings_json = serde_json::json!({
+            "profiles":[{"name":"Default"},{"name":"Low recoil"}],"activeProfile":0,
+            "pixelColor":"yellow","fovDegrees":90,"colorFilter":false,
+            "cropResolution":256,"scale":"Smooth","motionEnabled":true,
+            "motionAlwaysOn":false,"motionNoDeadzone":true,"triggerButton":"right",
+            "offsetX":0,"offsetY":0,"motionSpeedX":0.045,"motionSpeedY":0.045,
+            "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
+            "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,
+            "motionRenderer":{"enabled":false},
+            "auto":{"enabled":false,"mode":"center","triggerButton":"m4",
+                "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0,
+                "offsetX":0,"offsetY":0,"speedX":0.045,"speedY":0.045,
                 "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
-                "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,
-                "motionRenderer":{"enabled":false},
-                "auto":{"enabled":false,"mode":"center","triggerButton":"m4",
-                    "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0,
-                    "offsetX":0,"offsetY":0,"speedX":0.045,"speedY":0.045,
-                    "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
-                    "smoothingYMin":1,"smoothingYMax":3},
-                "recoil":{"recoilEnabled":false,"recoilLevels":[1,2,3],
-                    "recoilPercentage":50,"recoilStartDelayMs":100,"recoilLevelDurationMs":50},
-                "port":4200
-            }),
-        );
+                "smoothingYMin":1,"smoothingYMax":3},
+            "recoil":{"recoilEnabled":false,"recoilLevels":[1,2,3],
+                "recoilPercentage":50,"recoilStartDelayMs":100,"recoilLevelDurationMs":50},
+            "port":4200
+        });
+        show_settings(&settings, &settings_json);
         settings.set_dirty(true);
         settings.show().unwrap();
         settings.invoke_reset_scroll();
@@ -2387,22 +2396,28 @@ mod render_tests {
                 .unwrap()
                 .save(std::path::Path::new(&dir).join("settings-native.png"))
                 .unwrap();
-            // The whole page at once, for reviewing every section.
-            let tall = settings.get_content_height().ceil() as u32 + 140;
-            window.set_size(slint::PhysicalSize::new(760, tall));
-            let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * tall as usize];
+        }
+        // Every page, for reviewing each section.
+        let json = settings_json.clone();
+        for page in 0..slint::Model::row_count(&settings.get_sections()) {
+            settings.set_current_page(page as i32);
+            show_settings(&settings, &json);
+            assert_eq!(settings.get_current_page(), page as i32);
+            let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
             window.request_redraw();
             window.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, 760);
             });
-            let raw = pixels
-                .iter()
-                .flat_map(|p| [p.r, p.g, p.b])
-                .collect::<Vec<_>>();
-            image::RgbImage::from_raw(760, tall, raw)
-                .unwrap()
-                .save(std::path::Path::new(&dir).join("settings-native-full.png"))
-                .unwrap();
+            if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
+                let raw = pixels
+                    .iter()
+                    .flat_map(|p| [p.r, p.g, p.b])
+                    .collect::<Vec<_>>();
+                image::RgbImage::from_raw(760, 720, raw)
+                    .unwrap()
+                    .save(std::path::Path::new(&dir).join(format!("settings-page-{page}.png")))
+                    .unwrap();
+            }
         }
         settings.hide().unwrap();
     }
