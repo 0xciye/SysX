@@ -57,9 +57,10 @@ impl CenterCrossing {
                 && (point[0] - previous[0]).hypot(point[1] - previous[1])
                     > MAX_PIXEL_TRACK_SPEED_PX_PER_SECOND * elapsed.as_secs_f32()
         }) {
-            // A discontinuous selected pixel starts a new track; do not let
-            // it become the previous sample for a later center-crossing check.
-            self.target = None;
+            // A discontinuous selected pixel starts a new track: it cannot
+            // cross center from the old point, but the next frame continues
+            // from it instead of losing another frame.
+            self.target = Some((point, now));
             return self.valid_until.is_some_and(|until| now < until);
         }
         let crossed = self.target.is_some_and(|(previous, seen)| {
@@ -184,13 +185,22 @@ mod tests {
             64,
             start + Duration::from_millis(1),
         ));
-        assert!(crossing.target.is_none());
+        assert_eq!(crossing.target.map(|(point, _)| point), Some([54.5, 32.5]));
         assert!(!crossing.update_target_pixel(
             Some([54.5, 32.5]),
             64,
             64,
             start + Duration::from_millis(2),
         ));
+        assert!(
+            crossing.update_target_pixel(
+                Some([30.5, 32.5]),
+                64,
+                64,
+                start + Duration::from_millis(10),
+            ),
+            "the new track continues from the jumped point"
+        );
     }
 
     #[test]

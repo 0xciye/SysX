@@ -416,7 +416,8 @@ mod tests {
                 tx.send(error.to_string()).unwrap();
             })
             .unwrap();
-        fs::write(fixture.0.join("backend"), b"evil").unwrap();
+        // Same length as "backend", so only the hash can catch it.
+        fs::write(fixture.0.join("backend"), b"evilbin").unwrap();
         assert!(rx
             .recv_timeout(Duration::from_secs(4))
             .unwrap()

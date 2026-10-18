@@ -1087,18 +1087,30 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_display_config" => {
+                // Validate everything first: a rejected command must not
+                // leave half of it in the settings for the next reconfigure.
+                let fov = command
+                    .get("fov_degrees")
+                    .and_then(Value::as_u64)
+                    .map(|value| {
+                        u16::try_from(value)
+                            .ok()
+                            .filter(|fov| (1..=360).contains(fov))
+                            .ok_or("FOV must be 1..360")
+                    })
+                    .transpose()?;
+                let scale = command.get("preview_scale").and_then(Value::as_str);
+                if scale.is_some_and(|scale| !["Smooth", "Pixel perfect"].contains(&scale)) {
+                    return Err("preview scale must be Smooth or Pixel perfect".into());
+                }
                 let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
-                if let Some(value) = command.get("fov_degrees").and_then(Value::as_u64) {
-                    settings.fov_degrees =
-                        u16::try_from(value).map_err(|_| "FOV must be 1..360")?;
+                if let Some(fov) = fov {
+                    settings.fov_degrees = fov;
                 }
                 if !(1..=360).contains(&settings.fov_degrees) {
                     return Err("FOV must be 1..360".into());
                 }
-                if let Some(scale) = command.get("preview_scale").and_then(Value::as_str) {
-                    if !["Smooth", "Pixel perfect"].contains(&scale) {
-                        return Err("preview scale must be Smooth or Pixel perfect".into());
-                    }
+                if let Some(scale) = scale {
                     settings.scale = scale.into();
                 }
                 drop(settings);

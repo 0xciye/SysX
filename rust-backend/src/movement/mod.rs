@@ -30,9 +30,11 @@ pub fn crop_target_error(
     processed_size: (u32, u32),
     offsets: (f64, f64),
 ) -> (f64, f64) {
+    // The center pixel is index side / 2 (rounded down): an odd crop side must
+    // not leave its center pixel half a pixel off, or no-deadzone Motion hunts.
     (
-        target_xy.0.trunc() - crop_origin.0 as f64 - processed_size.0 as f64 / 2.0 + offsets.0,
-        target_xy.1.trunc() - crop_origin.1 as f64 - processed_size.1 as f64 / 2.0 + offsets.1,
+        target_xy.0.trunc() - crop_origin.0 as f64 - f64::from(processed_size.0 / 2) + offsets.0,
+        target_xy.1.trunc() - crop_origin.1 as f64 - f64::from(processed_size.1 / 2) + offsets.1,
     )
 }
 
@@ -897,6 +899,11 @@ mod tests {
         assert_eq!(
             crop_target_error((-1.9, -1.9), (0, 0), (0, 0), (0.0, 0.0)),
             (-1.0, -1.0)
+        );
+        assert_eq!(
+            crop_target_error((127.5, 127.5), (0, 0), (255, 255), (0.0, 0.0)),
+            (0.0, 0.0),
+            "the center pixel of an odd crop is on target"
         );
     }
 

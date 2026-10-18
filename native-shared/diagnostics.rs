@@ -35,8 +35,13 @@ pub fn install(component: &str) -> io::Result<()> {
         .join("Library")
         .join("Logs")
         .join("SysX");
+    // Other platforms are development hosts only; LOCALAPPDATA lets a test
+    // isolate the folder there as on Windows.
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let root = std::env::temp_dir().join("SysX");
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("SysX");
     let logs = root.join("logs");
     let crashes = root.join("crashes");
     let sessions = root.join("sessions");

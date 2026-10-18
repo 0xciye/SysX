@@ -4,7 +4,8 @@ use crate::crop::CropRect;
 use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
 use crate::pixel_seek::{
     color_mask, color_mask_into, process_pixel_seek_with_scratch_and_pixel_prediction,
-    try_pack_mask, PixelSeekScratch, PixelTargetColor, MAX_PIXEL_TRACK_SPEED_PX_PER_SECOND,
+    try_pack_mask, PixelSeekOutput, PixelSeekScratch, PixelTargetColor,
+    MAX_PIXEL_TRACK_SPEED_PX_PER_SECOND,
 };
 use crate::receiver::SourceFrame;
 use crate::results::{DetectionMode, DetectionResult};
@@ -347,7 +348,7 @@ fn processing_loop(
             crossing.reset();
         }
         let Some(smoother) = smoother.as_mut() else {
-            return;
+            continue;
         };
         let started = Instant::now();
         let prior_is_fresh =
@@ -748,6 +749,33 @@ fn process_frame_with_velocity(
         mask,
         pixel_seek_scratch,
     );
+    // Motion: a lost lock falls back to the topmost pixel in the FOV at once
+    // instead of stalling until the lock expires. Auto keeps the miss so its
+    // center-crossing track is not handed to an unrelated target.
+    let output = if output.lock_miss && !config.auto_target_active {
+        let fallback = process_pixel_seek_with_scratch_and_pixel_prediction(
+            processed,
+            rect,
+            config.pixel_color,
+            config.fov_degrees,
+            None,
+            [0.0; 2],
+            [0.0; 2],
+            None,
+            output.mask,
+            pixel_seek_scratch,
+        );
+        if fallback.target.is_some() {
+            fallback
+        } else {
+            PixelSeekOutput {
+                lock_miss: true,
+                ..fallback
+            }
+        }
+    } else {
+        output
+    };
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let auto_without_aim = config.auto_target_active && !auto_aim;
     let target_xy = (!auto_without_aim)
@@ -1474,6 +1502,52 @@ mod tests {
         .unwrap();
         assert!(!reacquired.pixel_lock_miss);
         assert!(!reacquired.result.auto_target_valid);
+    }
+
+    #[test]
+    fn motion_falls_back_to_the_topmost_fov_pixel_when_its_lock_is_lost() {
+        let config = PipelineConfig {
+            pixel_color: PixelTargetColor::Red,
+            target_lock_active: true,
+            ..PipelineConfig::default()
+        };
+        let mut smoother =
+            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut runtime_cache = None;
+        let mut scratch = PixelSeekScratch::default();
+        let mut crossing = CenterCrossing::default();
+        let mut image = image::RgbImage::new(64, 64);
+        image.put_pixel(44, 40, image::Rgb([255, 0, 0]));
+        let frame = SourceFrame {
+            frame_id: 1,
+            timestamp_ns: 0,
+            image,
+            source: "test".into(),
+            jpeg: Default::default(),
+            received: std::time::Instant::now(),
+        };
+        // The fresh lock sits on a target that is gone this frame.
+        let prior = PriorTarget {
+            bbox_xyxy: Some([20.0, 20.0, 21.0, 21.0]),
+            class_id: None,
+        };
+        let processed = process_frame_with_velocity(
+            frame,
+            &config,
+            &mut smoother,
+            &mut runtime_cache,
+            Some(&prior),
+            true,
+            [0.0; 2],
+            [0.0; 2],
+            Some([20.5, 20.5]),
+            &mut scratch,
+            &mut crossing,
+        )
+        .unwrap();
+        assert!(!processed.pixel_lock_miss);
+        assert_eq!(processed.pixel_lock_bbox, Some([44.0, 40.0, 45.0, 41.0]));
+        assert_eq!(processed.result.target_xy, Some([44.5, 40.5]));
     }
 
     #[test]
