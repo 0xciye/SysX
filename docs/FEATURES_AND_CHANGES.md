@@ -1,4 +1,6 @@
-# SysX — tính năng và những gì đã làm
+# SysX — tính năng và những gì đã làm (tài liệu lưu trữ)
+
+> Snapshot lịch sử: sơ đồ và mô tả bên dưới ghi lại kiến trúc Web Config/Leptos cũ, không phải trạng thái source hiện tại. Xem `README.md`, `AGENTS.md` và `DEVELOPMENT.md` để biết kiến trúc đang dùng.
 
 > **Trạng thái sử dụng:** Hiện chỉ **Pixel Seek dùng được**. **Object Detection, ONNX Runtime, OpenVINO và TensorRT chưa dùng được**; source/dependency được giữ cho phát triển. Thiết bị được hỗ trợ chỉ còn **Medius qua Rust SDK**; đã bỏ Ferrum và MAKCU.
 
@@ -29,7 +31,7 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
   `kReceiverHost = "127.0.0.1"`, `kReceiverPort = 4200`, `kJpegQuality = 80`, `kMaxFps = 0` (= mọi frame OBS), `kChroma444 = true`, `kDefaultCrop = 640`. Không có file cấu hình.
 - **Không log, không thông báo:** không gọi `blog`, không ghi file, không hộp thoại. Chỉ OBS tự ghi tên module đã nạp vào log của OBS.
 - **Không cần cài thêm gì:** libjpeg-turbo và VC++ runtime link tĩnh; DLL chỉ import `KERNEL32.dll` và `WS2_32.dll`; các hàm libobs lấy qua `GetProcAddress` từ `obs.dll` đang chạy.
-- **Nhận crop size:** luồng `control_loop` chờ trên cùng socket UDP; chỉ chấp nhận gói `SYSCFG 1 CROP <n>` (1–8192) đến từ đúng `kReceiverHost:kReceiverPort`. Giá trị mới được áp dụng ở frame render kế tiếp (tạo lại texture crop).
+- **Nhận crop size:** luồng `control_loop` chờ trên cùng socket UDP; chỉ chấp nhận gói `SYSCFG 1 CROP <n>` (1–5792, nằm trong ngân sách 32 Mi-pixel của receiver) đến từ đúng `kReceiverHost:kReceiverPort`. Giá trị mới được áp dụng ở frame render kế tiếp (tạo lại texture crop).
 - **Canvas HDR** (không phải BGRA 8-bit) bị bỏ qua, không crash.
 - **Kiểm chứng:**
   - `sysx-sender-selftest` (không cần OBS): 3/3 frame (320×320 nhiều chunk, 200×120 có padding, 1×1), 0 lỗi, nhận `SYSCFG` 640.
@@ -80,7 +82,7 @@ profile import and NCAF/Bézier/WindMouse post-processing are not supported.
 
 - **Làm mượt X/Y** (`ExponentialTargetSmoother`): alpha 0.01–1.0 cho từng trục; 1.0 = không làm mượt. Reset khi mất target hoặc đổi cấu hình.
 - **Backend** (`rust-backend/src/movement/normal.rs`): tính delta X/Y theo target, speed, smoothing và Smooth FOV; chỉ xử lý mỗi frame một lần. Ticker chạy mỗi 4 ms với target mới nhất. ABCurves chỉ định hình delta Normal sau khi profile 256 báo cáo chuột vật lý được Medius tự thu; Normal vẫn chạy trong thời gian thu profile.
-- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms); mặc định chỉ di chuyển target khi nút Motion trigger (Right/M4/M5; Middle dành cho đổi profile) đang giữ. Motion **Always on** bỏ yêu cầu giữ nút nhưng vẫn cần Motion bật và target còn hợp lệ/tươi; khi bật thì Auto bị khóa hiệu dụng, còn thiết lập Auto đã lưu được giữ nguyên. Recoil độc lập với Motion trigger nhưng chỉ bắt đầu khi có target Motion hợp lệ/tươi đồng thời đang giữ nút trái vật lý; sau đó đếm `Start delay`, đổi level theo `Time per level`, cộng vào Y của lệnh target hoặc gửi chuyển động dọc riêng nếu Motion trigger chưa giữ (không gửi nếu mất target); kẹp ±32 mỗi lệnh qua Medius Rust SDK `move_rel`. Auto giữ state riêng: chỉ nhận pixel màu chạm tâm crosshair trong Auto FOV, Delay bắt đầu khi xác nhận pixel đó, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)`.
+- **Host** (`src-tauri/src/movement.rs`, `src-tauri/src/auto.rs`): cộng dồn delta còn tươi (≤100 ms); mặc định chỉ di chuyển target khi nút Motion trigger (Right/M4/M5; Middle dành cho đổi profile) đang giữ. Motion **Always on** bỏ yêu cầu giữ nút nhưng vẫn cần Motion bật và target còn hợp lệ/tươi; khi bật thì Auto bị khóa hiệu dụng, còn thiết lập Auto đã lưu được giữ nguyên. Recoil độc lập với Motion trigger nhưng chỉ bắt đầu khi có target Motion hợp lệ/tươi đồng thời đang giữ nút trái vật lý; sau đó đếm `Start delay`, đổi level theo `Time per level`, cộng vào Y của lệnh target hoặc gửi chuyển động dọc riêng nếu Motion trigger chưa giữ (không gửi nếu mất target); kẹp ±32 mỗi lệnh qua Medius Rust SDK `move_rel`. Auto giữ state riêng: Center mode chỉ xác nhận pixel hợp lệ duy nhất mà Pixel Seek đã chọn khi pixel đó đi qua tâm ảnh trong Auto FOV; không suy luận crosshair hay dò pixel khác ở quanh tâm. Delay bắt đầu khi xác nhận crossing, Cooldown bắt đầu ngay khi phát lệnh left-click, còn Sleep chỉ đặt nhịp kiểm tra Auto và không cộng vào Cooldown. Lệnh click đi qua Medius `press/release(Button::LEFT)`.
 - **Chưa kiểm chứng:** chưa có phần cứng Medius để thử.
 
 ## 7. Receiver UI (`rust-ui`)

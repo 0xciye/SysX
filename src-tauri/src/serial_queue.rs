@@ -82,7 +82,9 @@ impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
             let Some(result) = self.writer.poll_completion(&mut in_flight.ticket) else {
                 return;
             };
-            let in_flight = self.in_flight.take().expect("in-flight request exists");
+            let Some(in_flight) = self.in_flight.take() else {
+                return;
+            };
             let _ = in_flight.completion.send(result);
         }
 
@@ -165,7 +167,11 @@ impl ThreadedSerialWriter {
             .name("sysx-serial-writer".into())
             .spawn(move || {
                 for job in receiver {
-                    let _ = job.completion.send(sink(&job.bytes, job.budget));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sink(&job.bytes, job.budget)
+                    }))
+                    .unwrap_or_else(|_| Err("Medius writer panicked".into()));
+                    let _ = job.completion.send(result);
                 }
             })
             .map_err(|error| format!("serial writer thread failed to start: {error}"))?;
@@ -346,6 +352,35 @@ mod tests {
         assert_eq!(first.try_recv().unwrap(), Ok(()));
         assert_eq!(second.try_recv().unwrap(), Ok(()));
         assert_eq!(moves.lock().unwrap().as_slice(), &[(5, -6), (-32, 32)]);
+    }
+
+    #[test]
+    fn threaded_writer_recovers_after_a_sink_panic() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let writer = ThreadedSerialWriter::spawn(move |_, _| {
+            if worker_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                panic!("simulated Medius writer panic");
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut queue = SerialCommandQueue::new(writer);
+        let failed = queue.submit_medius_move(1, 2).unwrap();
+        let recovered = queue.submit_medius_move(3, 4).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !queue.is_idle() && Instant::now() < deadline {
+            queue.pump();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(queue.is_idle());
+        assert_eq!(
+            failed.try_recv().unwrap(),
+            Err("Medius writer panicked".into())
+        );
+        assert_eq!(recovered.try_recv().unwrap(), Ok(()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

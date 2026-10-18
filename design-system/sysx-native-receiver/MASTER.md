@@ -185,13 +185,13 @@
 - **Preview:** centered column, square ≤640 px, 8 px radius, 1 px border. HUD is one dark plate top-left: `Res: <n>  <fps> FPS  <latency> ms` (the crop is square, so one number; mono values, sans labels/units; latency = per-frame detection time). Object Detection summary sits in a plate bottom-center. Overlays: boxes (class hue / Pixel Seek color), FOV circle, "hairline reticle" target (1.25 px lead fading in from the crop center, 8 px ring with four ticks, 1.6 px core, all on a dark underlay), all mapped after removing the crop origin.
 - **Empty state:** `NO FRAME` (mono, muted) above a status headline with dot; a detail line appears only for errors (no "Listening on UDP" line, by request).
 - **Mouse State:** one 30 px segmented strip (Left / Right / Middle / M4 / M5, equal widths) matching the Preview width, 7 px radius, hairline separators. Held = green tint, semibold white label and a 2 px green bar on the bottom edge (shape, not only color); released = muted label; no connected device = whole strip at 50 % opacity. Captures: `receiver-monitor-web-mouse-held.png`, `receiver-monitor-web-waiting.png`.
-- **Surface:** web page `/monitor.html` (Leptos/WASM, `.monitor` block in `rust-ui/style.css`) shown in a chromeless Edge app window; there is no egui window anymore. CSS tokens: `--m-bg #090C10`, `--m-bar #0F151C`, `--m-feed #05080B`, `--m-cell #121A23`, `--m-border #2D3946`, `--m-text #EBF1F5`, `--m-muted #9AA9B4`, `--m-live #43CFA0`, `--m-wait #E8B858`, `--m-error #EF6C6C`.
+- **Surface:** native Slint desktop receiver; there is no browser/WebView fallback. `src-tauri/src/monitor_window.rs` is the implementation. Preserve the palette: background `#090C10`, bar `#0F151C`, feed `#05080B`, cell `#121A23`, border `#2D3946`, text `#EBF1F5`, muted `#9AA9B4`, live `#43CFA0`, wait `#E8B858`, error `#EF6C6C`.
 - **Sizing:** `--m-side = max(240px, min(640px, 100vw − 40px, 100vh − bar − gap − mouse row − 40px))`; feed and Mouse State share that width.
-- **Fonts:** Segoe UI Variable / Segoe UI for text; Cascadia Mono / Consolas only for measurements (HUD values, `NO FRAME`), with tabular numerals.
-- **Motion:** only 120–200 ms color transitions on status dots and Mouse State; no pulsing or entrance animation; `prefers-reduced-motion` disables transitions.
-- **Captures:** `design-review/receiver-monitor-web-{live,waiting,narrow}.png` (headless Edge, isolated backend, synthetic plugin frames).
+- **Fonts:** Segoe UI for text; Consolas only for measurements (HUD values, `NO FRAME`), with tabular numerals.
+- **Motion:** restrained state changes; no pulsing or decorative entrance animation.
+- **Captures:** historical `design-review/receiver-monitor-web-*` images are not current Slint captures.
 - **Removed as decoration/duplication:** corner brackets, "RECEIVER MONITOR" eyebrow, pipeline chip, "LOOPBACK · AUTHENTICATED" caption, and the footer metric strip that repeated the HUD.
-- **Navigation:** none inside the native receiver page; Web Config is a separate browser surface.
+- **Navigation:** no navigation in the receiver; open Settings as a separate native Slint window.
 
 ---
 

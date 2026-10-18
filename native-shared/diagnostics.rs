@@ -23,10 +23,20 @@ static SESSION: OnceLock<Session> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn install(component: &str) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("SysX");
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library")
+        .join("Logs")
+        .join("SysX");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = std::env::temp_dir().join("SysX");
     let logs = root.join("logs");
     let crashes = root.join("crashes");
     let sessions = root.join("sessions");

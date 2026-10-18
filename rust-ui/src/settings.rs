@@ -259,6 +259,8 @@ pub struct AppSettings {
     /// Normal motion speed per axis: fraction of the error moved per frame.
     pub motion_speed_x: f64,
     pub motion_speed_y: f64,
+    #[serde(default)]
+    pub motion_no_deadzone: bool,
     /// Inside this FOV the speed is divided by the smoothing strength.
     pub smooth_fov_degrees: u16,
     pub scale: String,
@@ -299,6 +301,7 @@ impl Default for AppSettings {
             sens: 0.25,
             motion_speed_x: DEFAULT_MOTION_SPEED,
             motion_speed_y: DEFAULT_MOTION_SPEED,
+            motion_no_deadzone: false,
             smooth_fov_degrees: 20,
             scale: "Smooth".into(),
             show_preview: true,
@@ -322,6 +325,108 @@ impl Default for AppSettings {
 /// Default Normal motion speed per axis (matches the backend).
 pub const DEFAULT_MOTION_SPEED: f64 = 0.045;
 pub const SMOOTHING_LIMITS: (f32, f32) = (1.0, 50.0);
+
+/// The single runtime-apply payload used by both the native and web settings
+/// surfaces. Persistence happens separately before this command is sent.
+pub fn apply_settings_fields(
+    settings: &AppSettings,
+    has_model: bool,
+    request_id: &str,
+) -> serde_json::Value {
+    let command = |kind: &str, fields: serde_json::Value| {
+        let mut value = fields.as_object().cloned().unwrap_or_default();
+        value.insert("version".into(), serde_json::json!(1));
+        value.insert("type".into(), serde_json::json!(kind));
+        serde_json::Value::Object(value)
+    };
+    let mut commands = vec![
+        command(
+            "set_udp_port",
+            serde_json::json!({"port":settings.port.parse::<u16>().unwrap_or(4200)}),
+        ),
+        command(
+            "set_pixel_color",
+            serde_json::json!({"color":settings.pixel_color}),
+        ),
+        command(
+            "set_display_config",
+            serde_json::json!({"fov_degrees":settings.fov_degrees,"preview_scale":settings.scale}),
+        ),
+        command(
+            "set_target_offset",
+            serde_json::json!({"x":settings.offset_x,"y":settings.offset_y}),
+        ),
+        command(
+            "set_trigger_button",
+            serde_json::json!({"button":settings.trigger_button}),
+        ),
+        command(
+            "set_smoothing_config",
+            serde_json::json!({
+                "x_min": settings.smoothing_x_min,
+                "x_max": settings.smoothing_x_max,
+                "y_min": settings.smoothing_y_min,
+                "y_max": settings.smoothing_y_max,
+            }),
+        ),
+        command(
+            "set_motion_renderer",
+            serde_json::json!({"settings": settings.motion_renderer}),
+        ),
+        command(
+            "set_motion_speed",
+            serde_json::json!({
+                "x": settings.motion_speed_x,
+                "y": settings.motion_speed_y,
+                "smooth_fov_degrees": settings.smooth_fov_degrees,
+                "no_deadzone": settings.motion_no_deadzone,
+            }),
+        ),
+        command(
+            "set_movement_calibration",
+            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled,"motion_always_on":settings.motion_always_on}),
+        ),
+        command(
+            "set_color_filter",
+            serde_json::json!({"enabled":settings.color_filter}),
+        ),
+        command(
+            "set_recoil",
+            serde_json::json!({"settings":settings.recoil}),
+        ),
+        command("set_auto", serde_json::json!({"settings":settings.auto})),
+        command(
+            "set_crop_resolution",
+            serde_json::json!({"resolution":settings.crop_resolution}),
+        ),
+        command(
+            "set_inference_config",
+            serde_json::json!({"backend":settings.model_backend,"compute_target":settings.compute_target}),
+        ),
+    ];
+    if settings.strategy == "pixel_seek" || has_model {
+        commands.push(command(
+            "set_strategy",
+            serde_json::json!({"mode":settings.strategy}),
+        ));
+    }
+    if has_model {
+        if let Some(id) = settings.active_model_id.as_deref() {
+            commands.push(command(
+                "update_model",
+                serde_json::json!({
+                    "id":id,
+                    "input_width":settings.model_width.parse::<u32>().unwrap_or(640),
+                    "input_height":settings.model_height.parse::<u32>().unwrap_or(640),
+                    "confidence":settings.model_confidence.parse::<f64>().unwrap_or(0.5),
+                    "iou":settings.model_iou.parse::<f64>().unwrap_or(0.45)
+                }),
+            ));
+            commands.push(command("activate_model", serde_json::json!({"id":id})));
+        }
+    }
+    serde_json::json!({"commands":commands,"request_id":request_id})
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothingAxis {
@@ -419,8 +524,8 @@ impl AppSettings {
         if !["yellow", "red", "purple"].contains(&self.pixel_color.as_str()) {
             return Err("Choose Yellow, Red, or Purple for Pixel Seek.");
         }
-        if !(1..=8192).contains(&self.crop_resolution) {
-            return Err("Crop resolution must be from 1 to 8192 pixels.");
+        if !(1..=crate::protocol::MAX_CROP_RESOLUTION).contains(&self.crop_resolution) {
+            return Err("Crop resolution exceeds the receiver's frame limit.");
         }
         self.recoil.validate()?;
         self.auto.validate()?;
@@ -430,7 +535,9 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_recoil_levels, parse_recoil_levels, AppSettings, AutoSettings};
+    use super::{
+        apply_settings_fields, format_recoil_levels, parse_recoil_levels, AppSettings, AutoSettings,
+    };
 
     #[test]
     fn unavailable_object_detection_cannot_be_applied_from_the_ui() {
@@ -446,6 +553,46 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.auto, AutoSettings::default());
         assert!(settings.auto.validate().is_ok());
+    }
+
+    #[test]
+    fn crop_resolution_stays_within_the_receiver_frame_budget() {
+        let mut settings = AppSettings::default();
+        settings.crop_resolution = crate::protocol::MAX_CROP_RESOLUTION;
+        assert!(settings.validate().is_ok());
+        settings.crop_resolution += 1;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("receiver's frame limit"));
+    }
+
+    #[test]
+    fn shared_apply_payload_carries_runtime_settings_and_request_id() {
+        let mut settings = AppSettings::default();
+        settings.pixel_color = "purple".into();
+        settings.color_filter = true;
+        settings.fov_degrees = 240;
+        let payload = apply_settings_fields(&settings, false, "native-apply-1");
+        assert_eq!(payload["request_id"], "native-apply-1");
+        let commands = payload["commands"].as_array().unwrap();
+        let command = |kind: &str| commands.iter().find(|value| value["type"] == kind).unwrap();
+        assert_eq!(command("set_pixel_color")["color"], "purple");
+        assert_eq!(command("set_color_filter")["enabled"], true);
+        assert_eq!(command("set_motion_speed")["no_deadzone"], false);
+        assert_eq!(command("set_display_config")["fov_degrees"], 240);
+        assert!(commands.iter().all(|value| value["version"] == 1));
+    }
+
+    #[test]
+    fn no_deadzone_is_backward_compatible_and_reaches_apply_payload() {
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.motion_no_deadzone);
+
+        let mut enabled = AppSettings::default();
+        enabled.motion_no_deadzone = true;
+        let payload = apply_settings_fields(&enabled, false, "test");
+        assert_eq!(payload["commands"][7]["no_deadzone"], true);
     }
 
     #[test]

@@ -1,32 +1,6 @@
-//! One SysX per Windows session. A second launch does not start another
+//! One SysX per desktop session. A second launch does not start another
 //! backend (it could not bind UDP 4200 anyway); it brings the running
 //! instance's monitor window to the front, or reopens it, and exits.
-use std::path::Path;
-
-const INSTANCE_FILE: &str = "instance.json";
-
-/// Remembers the running instance's loopback web port so a second launch can
-/// locate its separate config page.
-pub fn record_config_port(data_dir: &Path, config_port: u16) {
-    let _ = std::fs::write(
-        data_dir.join(INSTANCE_FILE),
-        serde_json::json!({ "config_port": config_port }).to_string(),
-    );
-}
-
-pub fn clear_config_port(data_dir: &Path) {
-    let _ = std::fs::remove_file(data_dir.join(INSTANCE_FILE));
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn running_config_port(data_dir: &Path) -> Option<u16> {
-    let text = std::fs::read_to_string(data_dir.join(INSTANCE_FILE)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    u16::try_from(value.get("config_port")?.as_u64()?)
-        .ok()
-        .filter(|port| *port > 0)
-}
-
 #[cfg(target_os = "windows")]
 mod win {
     use std::ffi::c_void;
@@ -155,22 +129,164 @@ mod win {
 #[cfg(target_os = "windows")]
 pub use win::{acquire, focus_monitor_window, request_monitor, MonitorSignal};
 
-#[cfg(not(target_os = "windows"))]
-pub struct InstanceGuard;
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
 
-#[cfg(not(target_os = "windows"))]
-pub fn acquire() -> Option<InstanceGuard> {
-    Some(InstanceGuard)
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    fn ipc_path() -> PathBuf {
+        std::env::temp_dir().join("sysx-native-monitor.sock")
+    }
+
+    pub struct InstanceGuard {
+        _file: Option<File>,
+    }
+
+    pub struct MonitorSignal {
+        listener: Option<UnixListener>,
+        path: PathBuf,
+    }
+
+    impl MonitorSignal {
+        pub fn new() -> Self {
+            Self::at(ipc_path())
+        }
+
+        fn at(path: PathBuf) -> Self {
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).ok();
+            if let Some(listener) = &listener {
+                let _ = listener.set_nonblocking(true);
+            }
+            Self { listener, path }
+        }
+
+        pub fn requested(&self) -> bool {
+            self.listener
+                .as_ref()
+                .is_some_and(|listener| match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        true
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(_) => false,
+                })
+        }
+    }
+
+    impl Drop for MonitorSignal {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    pub fn request_monitor() -> bool {
+        request_monitor_at(&ipc_path())
+    }
+
+    fn request_monitor_at(path: &Path) -> bool {
+        for _ in 0..30 {
+            if UnixStream::connect(path).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    pub fn acquire() -> Option<InstanceGuard> {
+        acquire_at(&std::env::temp_dir().join("sysx-receiver.lock"))
+    }
+
+    fn acquire_at(path: &Path) -> Option<InstanceGuard> {
+        let Ok(file) = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+        else {
+            return Some(InstanceGuard { _file: None });
+        };
+        // flock is released by the OS even after a crash; the file itself is intentionally kept.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            Some(InstanceGuard { _file: Some(file) })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{acquire_at, request_monitor_at, MonitorSignal};
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn unique_path(suffix: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "sysx-macos-{}-{}-{suffix}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        }
+
+        #[test]
+        fn lock_allows_one_owner_and_recovers_after_drop() {
+            let path = unique_path("lock");
+            let owner = acquire_at(&path).expect("first instance acquires lock");
+            assert!(acquire_at(&path).is_none());
+            drop(owner);
+            assert!(acquire_at(&path).is_some());
+            let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn second_launch_signal_is_received_by_the_running_monitor() {
+            let path = unique_path("sock");
+            let signal = MonitorSignal::at(path.clone());
+            assert!(request_monitor_at(&path));
+            assert!(signal.requested());
+            drop(signal);
+            assert!(!path.exists());
+        }
+    }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub use mac::{acquire, request_monitor, MonitorSignal};
+#[cfg(target_os = "macos")]
 pub fn focus_monitor_window() -> bool {
     false
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub struct InstanceGuard;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn acquire() -> Option<InstanceGuard> {
+    Some(InstanceGuard)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn focus_monitor_window() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub struct MonitorSignal;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl MonitorSignal {
     pub fn new() -> Self {
         Self
@@ -179,7 +295,7 @@ impl MonitorSignal {
         false
     }
 }
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn request_monitor() -> bool {
     false
 }
@@ -187,22 +303,6 @@ pub fn request_monitor() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn config_port_round_trips_and_rejects_garbage() {
-        let dir = std::env::temp_dir().join(format!("sysx-instance-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(running_config_port(&dir), None);
-        record_config_port(&dir, 4202);
-        assert_eq!(running_config_port(&dir), Some(4202));
-        std::fs::write(dir.join(INSTANCE_FILE), "{\"config_port\":0}").unwrap();
-        assert_eq!(running_config_port(&dir), None);
-        std::fs::write(dir.join(INSTANCE_FILE), "not json").unwrap();
-        assert_eq!(running_config_port(&dir), None);
-        clear_config_port(&dir);
-        assert!(!dir.join(INSTANCE_FILE).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[cfg(target_os = "windows")]
     #[test]

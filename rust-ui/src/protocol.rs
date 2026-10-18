@@ -1,11 +1,19 @@
 use crate::settings::{AutoSettings, RecoilSettings};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ConnectionInfo {
-    pub host: String,
-    pub port: u16,
-    pub token: String,
+/// Largest square crop that fits the receiver's 32 Mi-pixel frame budget.
+pub const MAX_CROP_RESOLUTION: u32 = 5792;
+
+#[cfg(test)]
+mod limits_tests {
+    use super::MAX_CROP_RESOLUTION;
+
+    #[test]
+    fn max_square_crop_fits_the_receiver_pixel_budget() {
+        const MAX_FRAME_PIXELS: u64 = 33_554_432;
+        assert!(u64::from(MAX_CROP_RESOLUTION).pow(2) <= MAX_FRAME_PIXELS);
+        assert!(u64::from(MAX_CROP_RESOLUTION + 1).pow(2) > MAX_FRAME_PIXELS);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -20,6 +28,8 @@ pub struct BackendState {
     pub motion_enabled: bool,
     #[serde(default)]
     pub motion_always_on: bool,
+    #[serde(default)]
+    pub motion_no_deadzone: bool,
     #[serde(default)]
     pub motion_renderer: crate::settings::MotionRendererSettings,
     #[serde(default)]
@@ -106,30 +116,6 @@ pub struct ProfileSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct BackendModel {
-    pub id: String,
-    pub name: String,
-    pub artifacts: ModelArtifacts,
-    pub input_width: u32,
-    pub input_height: u32,
-    pub confidence: f32,
-    pub iou: f32,
-    pub device: String,
-    pub enabled: bool,
-    #[serde(default)]
-    pub class_names: Option<std::collections::HashMap<u32, String>>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelArtifacts {
-    pub onnx: String,
-    pub tensorrt: String,
-    pub openvino_xml: String,
-    pub openvino_bin: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DetectionObject {
     pub class_id: u32,
     pub class_name: String,
@@ -204,19 +190,4 @@ pub struct DeviceStatus {
     pub name: Option<String>,
     #[serde(default)]
     pub buttons: Vec<Option<bool>>,
-}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Debug)]
-pub enum BackendEvent {
-    Ready,
-    Disconnected,
-    State(BackendState),
-    CommandResponse {
-        request_id: String,
-        command_type: String,
-        error: Option<String>,
-    },
-    Models(Vec<BackendModel>, Option<String>),
-    Error(String),
 }

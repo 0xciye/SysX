@@ -215,6 +215,7 @@ pub struct AppSettings {
     /// per frame (0.01–1).
     pub motion_speed_x: f64,
     pub motion_speed_y: f64,
+    pub motion_no_deadzone: bool,
     /// Inside this FOV (degrees, same scale as the Motion FOV) the speed is
     /// divided by the smoothing strength.
     pub smooth_fov_degrees: u16,
@@ -257,6 +258,7 @@ impl Default for AppSettings {
             sens: 0.25,
             motion_speed_x: crate::movement::DEFAULT_SPEED,
             motion_speed_y: crate::movement::DEFAULT_SPEED,
+            motion_no_deadzone: false,
             smooth_fov_degrees: 20,
             scale: "Smooth".into(),
             show_preview: true,
@@ -431,8 +433,8 @@ impl AppSettings {
         if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
             return Err(SettingsError::Invalid("invalid trigger button"));
         }
-        if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
-            return Err(SettingsError::Invalid("invalid strategy"));
+        if self.strategy != "pixel_seek" {
+            return Err(SettingsError::Invalid("Object Detection is not available"));
         }
         if !(1..=360).contains(&self.fov_degrees) {
             return Err(SettingsError::Invalid("FOV must be 1..360"));
@@ -482,8 +484,10 @@ impl AppSettings {
         if !["cpu", "gpu", "npu"].contains(&self.compute_target.as_str()) {
             return Err(SettingsError::Invalid("invalid inference compute target"));
         }
-        if !(1..=8192).contains(&self.crop_resolution) {
-            return Err(SettingsError::Invalid("crop resolution must be 1..8192"));
+        if !(1..=sysx_ui::protocol::MAX_CROP_RESOLUTION).contains(&self.crop_resolution) {
+            return Err(SettingsError::Invalid(
+                "crop resolution exceeds the receiver's frame limit",
+            ));
         }
         if self
             .active_model_id
@@ -528,6 +532,8 @@ pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
     };
     migrate_smoothing(&mut json);
     migrate_trigger_buttons(&mut json);
+    migrate_unavailable_detection(&mut json);
+    migrate_crop_resolution(&mut json);
     let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
         return default_settings_with_profiles();
     };
@@ -559,6 +565,53 @@ fn migrate_trigger_buttons(json: &mut serde_json::Value) {
         }
         if settings.get("auto").is_some_and(middle) {
             settings["auto"]["triggerButton"] = serde_json::json!("right");
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
+}
+
+fn migrate_unavailable_detection(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        if settings.get("strategy").and_then(serde_json::Value::as_str) == Some("object_detection")
+        {
+            settings["strategy"] = serde_json::json!("pixel_seek");
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
+}
+
+/// Earlier builds accepted crops larger than the receiver's pixel budget.
+/// Clamp only that field so loading them preserves the rest of user settings.
+fn migrate_crop_resolution(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        if settings
+            .get("cropResolution")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|resolution| {
+                resolution > u64::from(sysx_ui::protocol::MAX_CROP_RESOLUTION)
+            })
+        {
+            settings["cropResolution"] = serde_json::json!(sysx_ui::protocol::MAX_CROP_RESOLUTION);
         }
     }
     migrate(json);
@@ -1031,6 +1084,89 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_object_detection_migrates_without_resetting_profiles() {
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-settings-unavailable-engine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-settings.json");
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        old["strategy"] = serde_json::json!("object_detection");
+        let mut second = old.clone();
+        second.as_object_mut().unwrap().remove("profiles");
+        second["motionSpeedX"] = serde_json::json!(0.12);
+        old["profiles"] = serde_json::json!([
+            {"name":"Default","settings":old.clone()},
+            {"name":"Second","settings":second}
+        ]);
+        old["profiles"][0]["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profiles");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let mut loaded = load_settings(&path);
+        assert_eq!(loaded.strategy, "pixel_seek");
+        assert_eq!(loaded.profiles.len(), 2);
+        assert_eq!(loaded.profiles[0].settings["strategy"], "pixel_seek");
+        assert_eq!(loaded.profiles[1].settings["strategy"], "pixel_seek");
+        loaded.activate_profile(1).unwrap();
+        assert_eq!(loaded.motion_speed_x, 0.12);
+        assert_eq!(loaded.strategy, "pixel_seek");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn oversized_legacy_crops_are_clamped_without_resetting_profiles() {
+        let directory = std::env::temp_dir().join(format!(
+            "sysx-settings-crop-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-settings.json");
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        old["cropResolution"] = serde_json::json!(8192);
+        old["motionSpeedX"] = serde_json::json!(0.12);
+        let mut second = old.clone();
+        second.as_object_mut().unwrap().remove("profiles");
+        second["cropResolution"] = serde_json::json!(256);
+        old["profiles"] = serde_json::json!([
+            {"name":"Default","settings":old.clone()},
+            {"name":"Second","settings":second}
+        ]);
+        old["profiles"][0]["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profiles");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let mut loaded = load_settings(&path);
+        assert_eq!(
+            loaded.crop_resolution,
+            sysx_ui::protocol::MAX_CROP_RESOLUTION
+        );
+        assert_eq!(loaded.motion_speed_x, 0.12);
+        assert_eq!(loaded.profiles.len(), 2);
+        assert_eq!(
+            loaded.profiles[0].settings["cropResolution"],
+            sysx_ui::protocol::MAX_CROP_RESOLUTION
+        );
+        loaded.activate_profile(1).unwrap();
+        assert_eq!(loaded.crop_resolution, 256);
+        assert_eq!(loaded.motion_speed_x, 0.12);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn older_alpha_smoothing_settings_become_the_one_to_ten_scale() {
         let directory = std::env::temp_dir().join(format!(
             "sysx-settings-smoothing-{}-{}",
@@ -1144,10 +1280,31 @@ mod tests {
     }
 
     #[test]
+    fn crop_resolution_cannot_exceed_the_receiver_frame_budget() {
+        let mut settings = AppSettings::default();
+        settings.crop_resolution = sysx_ui::protocol::MAX_CROP_RESOLUTION;
+        assert!(settings.validate().is_ok());
+        settings.crop_resolution += 1;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn recoil_defaults_are_disabled_and_valid() {
         let settings = AppSettings::default();
         assert!(!settings.recoil.recoil_enabled);
         assert!(settings.recoil.validate().is_ok());
+    }
+
+    #[test]
+    fn no_deadzone_defaults_off_for_new_and_legacy_settings() {
+        assert!(!AppSettings::default().motion_no_deadzone);
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.motion_no_deadzone);
+        let mut enabled = AppSettings::default();
+        enabled.motion_no_deadzone = true;
+        let restored: AppSettings =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.motion_no_deadzone);
     }
 
     #[test]

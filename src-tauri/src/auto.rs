@@ -136,6 +136,7 @@ impl AutoState {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.reset();
+        self.cooldown_until = None;
     }
 
     pub const fn timing(self) -> AutoTiming {
@@ -145,12 +146,14 @@ impl AutoState {
     pub fn set_timing(&mut self, timing: AutoTiming) {
         self.timing = timing;
         self.reset();
+        self.cooldown_until = None;
     }
 
     pub fn set_config_revision(&mut self, revision: u64) {
         if self.config_revision != revision {
             self.config_revision = revision;
             self.reset();
+            self.cooldown_until = None;
         }
     }
 
@@ -180,8 +183,8 @@ impl AutoState {
             return None;
         }
 
-        // A valid target in the Auto FOV arms one delayed click. The target
-        // need not stay until it fires; target loss only rearms other phases.
+        // Once a valid target begins the delay, it need not stay valid until
+        // the click; target loss only rearms the later phases.
         let latched_for_press = self.once_per_press && self.phase == AutoPhase::Latched;
         if !target_valid && self.phase != AutoPhase::WaitingDelay && !latched_for_press {
             self.reset();
@@ -386,6 +389,57 @@ mod tests {
         state.update(false, false, start + Duration::from_millis(1));
         assert_eq!(
             state.update(true, true, start + Duration::from_millis(2)),
+            Some(AutoAction::LeftClick)
+        );
+    }
+
+    #[test]
+    fn timing_and_configuration_changes_clear_the_previous_cooldown() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 1000,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+
+        state.set_timing(AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 500,
+            sleep_ms: 0,
+        });
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(1)),
+            Some(AutoAction::LeftClick),
+            "a timing edit cancels the previous cooldown"
+        );
+
+        state.set_config_revision(1);
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(2)),
+            Some(AutoAction::LeftClick),
+            "a configuration revision cancels the previous cooldown"
+        );
+    }
+
+    #[test]
+    fn disabling_and_reenabling_without_an_intermediate_poll_clears_cooldown() {
+        let start = Instant::now();
+        let mut state = AutoState::new();
+        state.set_enabled(true);
+        state.set_timing(AutoTiming {
+            delay_ms: 0,
+            cooldown_ms: 1000,
+            sleep_ms: 0,
+        });
+        assert_eq!(state.update(true, true, start), Some(AutoAction::LeftClick));
+
+        state.set_enabled(false);
+        state.set_enabled(true);
+        assert_eq!(
+            state.update(true, true, start + Duration::from_millis(1)),
             Some(AutoAction::LeftClick)
         );
     }

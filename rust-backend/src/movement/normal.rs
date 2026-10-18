@@ -40,6 +40,8 @@ pub struct NormalStep {
     /// Smooth FOV radius in crop px (0: no smoothing).
     pub smooth_fov_px: f64,
     pub counts_per_px: f64,
+    /// Per-axis deadzone radius; zero enables no-deadzone tracking.
+    pub dead_zone_px: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -57,7 +59,7 @@ impl NormalMotion {
     /// Device counts for one new frame.
     pub fn step(&mut self, step: NormalStep) -> (i64, i64) {
         let (ex, ey) = step.error;
-        if !(ex.is_finite() && ey.is_finite()) || ex.hypot(ey) <= DEAD_ZONE_PX {
+        if !(ex.is_finite() && ey.is_finite()) || ex.hypot(ey) <= step.dead_zone_px.max(0.0) {
             self.reset();
             return (0, 0);
         }
@@ -73,6 +75,9 @@ impl NormalMotion {
         };
         let inside = distance < step.smooth_fov_px;
         let axis = |error: f64, speed: f64, smooth: f64, residual: &mut f64, last: &mut f64| {
+            if error == 0.0 {
+                return 0;
+            }
             let divisor = if inside {
                 1.0 + (smooth.max(1.0) - 1.0) * closeness
             } else {
@@ -121,6 +126,7 @@ mod tests {
             smooth: (1.0, 1.0),
             smooth_fov_px: 0.0,
             counts_per_px: 4.0,
+            dead_zone_px: DEAD_ZONE_PX,
         }
     }
 
@@ -190,6 +196,31 @@ mod tests {
         };
         assert_eq!(reverse.step(step((-1.5, 0.0))).0, -1, "-0.6 rounds to -1");
         assert!((reverse.residual.0 - 0.4).abs() < 1e-9, "-0.6 - (-1) = 0.4");
+    }
+
+    #[test]
+    fn no_deadzone_moves_errors_that_default_motion_ignores() {
+        let mut motion = NormalMotion::default();
+        let mut small = step((0.5, 0.0));
+        small.speed = (0.1, 0.1);
+        small.counts_per_px = 10.0;
+        assert_eq!(motion.step(small), (0, 0));
+
+        small.dead_zone_px = 0.0;
+        assert_eq!(motion.step(small), (1, 0));
+    }
+
+    #[test]
+    fn rounding_residual_does_not_move_an_axis_with_no_error() {
+        let mut motion = NormalMotion {
+            residual: (-0.5, 0.0),
+            last: (0.5, 0.0),
+        };
+        let mut input = step((0.0, 2.0));
+        input.dead_zone_px = 0.0;
+
+        assert_eq!(motion.step(input), (0, 1));
+        assert_eq!(motion.residual.0, -0.5, "keep it for a later X error");
     }
 
     #[test]

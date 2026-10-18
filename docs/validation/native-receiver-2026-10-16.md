@@ -1,12 +1,11 @@
 # Native Slint receiver validation — 2026-10-16
 
-The receiver is a native Slint window. The existing monitor's dimensions, dark palette, header/profile/device status, square feed, measured HUD, FOV, detection corners, target reticle/lead and five-button row are retained. No Wry, WebView2, Tao, Win32/GDI UI renderer or Edge/browser receiver fallback remains. The browser serves settings only; `/monitor.html` is explicitly 404 and the config boot placeholder has no preview.
+The receiver and Settings are native Slint windows. The existing monitor's dimensions, dark palette, header/profile/device status, square feed, measured HUD, FOV, detection corners, target reticle/lead and five-button row are retained. No Wry, WebView2, Tao, Win32/GDI UI renderer or Edge/browser receiver fallback remains. The backend has no config HTTP endpoint or WASM bootstrap.
 
 Checks run on Linux:
 
 - Native host Rust tests: **47 passed**, including real local WebSocket envelope/JPEG/button-state reception, bounded pending-frame replacement, size/malformed-message rejection, JPEG dimension mismatch, stale-frame expiry, lifecycle regressions and headless Slint rendering.
 - Shared/config Rust tests: **11 passed**.
-- Browser-route integration: **1 passed**, proving `/config.html` serves settings-only boot markup and `/monitor.html` returns 404.
 - Windows MSVC target `cargo check --tests`: **passed**. This checks Windows-specific code but does not link/run a Windows executable.
 - Browser config WASM `cargo check`: **passed**.
 - Actionlint, edited PowerShell parsers and `git diff --check`: **passed**.

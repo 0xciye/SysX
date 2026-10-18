@@ -56,25 +56,13 @@ fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let port = option(args, "--port")
         .unwrap_or_else(|| "0".into())
         .parse::<u16>()?;
-    let config_port = option(args, "--config-port")
-        .unwrap_or_else(|| "4201".into())
-        .parse::<u16>()?;
     let udp_port = option(args, "--udp-port")
         .unwrap_or_else(|| "4200".into())
         .parse::<u16>()?;
-    let config_root = option(args, "--config-root").map(std::path::PathBuf::from);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(crate::service::serve(
-        token,
-        data_dir,
-        host,
-        port,
-        config_root,
-        config_port,
-        udp_port,
-    ))?;
+    runtime.block_on(crate::service::serve(token, data_dir, host, port, udp_port))?;
     Ok(())
 }
 
@@ -122,5 +110,5 @@ fn option(args: &[String], name: &str) -> Option<String> {
 }
 
 fn print_help() {
-    println!("SysX Rust receiver backend\n\nCommands:\n  udp-listen [--host 0.0.0.0] [--port 4200] [--count N]\n  udp-send-image FILE.jpg [--host 127.0.0.1] [--port 4200]\n  serve [--host 127.0.0.1] [--port 0] [--data-dir PATH] [--udp-port 4200] [--config-root PATH] [--config-port 4201]");
+    println!("SysX Rust receiver backend\n\nCommands:\n  udp-listen [--host 0.0.0.0] [--port 4200] [--count N]\n  udp-send-image FILE.jpg [--host 127.0.0.1] [--port 4200]\n  serve [--host 127.0.0.1] [--port 0] [--data-dir PATH] [--udp-port 4200]");
 }

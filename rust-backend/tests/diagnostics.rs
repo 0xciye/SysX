@@ -12,13 +12,19 @@ fn panic_report_survives_backend_process_exit() {
             .unwrap()
             .as_nanos()
     ));
-    let output = Command::new(env!("CARGO_BIN_EXE_receiver-backend"))
-        .arg("--diagnostics-self-test")
-        .env("LOCALAPPDATA", &root)
-        .output()
-        .expect("run isolated panic fixture");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_receiver-backend"));
+    command.arg("--diagnostics-self-test");
+    #[cfg(target_os = "macos")]
+    command.env("HOME", &root);
+    #[cfg(not(target_os = "macos"))]
+    command.env("LOCALAPPDATA", &root);
+    let output = command.output().expect("run isolated panic fixture");
     assert!(!output.status.success());
-    let logs = fs::read_dir(root.join("SysX/logs"))
+    #[cfg(target_os = "macos")]
+    let diagnostics_root = root.join("Library/Logs/SysX");
+    #[cfg(not(target_os = "macos"))]
+    let diagnostics_root = root.join("SysX");
+    let logs = fs::read_dir(diagnostics_root.join("logs"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
@@ -27,7 +33,7 @@ fn panic_report_survives_backend_process_exit() {
     assert!(report.contains("Rust panic:"));
     assert!(report.contains("SysX diagnostics self-test"));
     assert!(report.contains("main.rs"));
-    let crash_reports = fs::read_dir(root.join("SysX/crashes"))
+    let crash_reports = fs::read_dir(diagnostics_root.join("crashes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "txt"))
@@ -39,7 +45,7 @@ fn panic_report_survives_backend_process_exit() {
     assert!(crash_report.contains("backend-"));
     #[cfg(windows)]
     {
-        let dumps = fs::read_dir(root.join("SysX/crashes"))
+        let dumps = fs::read_dir(diagnostics_root.join("crashes"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "dmp"))

@@ -8,7 +8,7 @@ param(
     [string] $ExecutablePath
 )
 # Builds SysX and packs what another Windows PC needs to run it into one
-# archive: SysX.exe (backend + web UI embedded), a LAN firewall helper, and
+# archive: SysX.exe (backend + native Settings embedded), a LAN firewall helper, and
 # HUONG-DAN.txt. The OBS plugin DLL is built separately
 # (scripts/build-obs-plugin.ps1). The Visual C++ x64 runtime is installed by
 # the user.
@@ -75,12 +75,12 @@ SysX - huong dan cai dat tren may khac
 Yeu cau (nguoi dung tu cai):
   1. Microsoft Visual C++ Redistributable 2015-2022 (x64):
      https://aka.ms/vs/17/release/vc_redist.x64.exe
-  Receiver native Slint khong can WebView2; trinh duyet chi dung cho trang Config.
+  Receiver and Settings use native Slint; no browser or WebView runtime is required.
 
 Chay SysX:
-  - Chay SysX.exe. Cua so receiver/preview mo ra, trang config tu mo
-    (bang Chrome neu co, neu khong thi trinh duyet mac dinh).
-  - Dong ca receiver va cac trang Config de thoat SysX. Chi chay duoc 1 SysX cung luc.
+  - Chay SysX.exe. Cua so Preview va Settings native mo trong ung dung.
+  - Dung Settings trong cua so app de chinh va Apply Changes.
+  - Dong cua so app de thoat SysX. Chi chay duoc 1 SysX cung luc.
   - Cai dat duoc luu o %LOCALAPPDATA%\SysX.
   - SysX nhan frame tu OBS plugin (sysx-canvas-sender.dll, build rieng) qua UDP 4200.
 

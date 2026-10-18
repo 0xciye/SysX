@@ -299,18 +299,14 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(path.join("web-config")).unwrap();
+            fs::create_dir_all(&path).unwrap();
             fs::write(path.join("backend"), b"backend").unwrap();
-            fs::write(path.join("web-config/app.wasm"), b"wasm").unwrap();
             Self(path)
         }
         fn entries(&self) -> Vec<ManifestEntry> {
-            [
-                ("backend", b"backend".as_slice()),
-                ("web-config/app.wasm", b"wasm".as_slice()),
-            ]
-            .map(|(name, bytes)| (name, bytes.len() as u64, Sha256::digest(bytes).into()))
-            .to_vec()
+            [("backend", b"backend".as_slice())]
+                .map(|(name, bytes)| (name, bytes.len() as u64, Sha256::digest(bytes).into()))
+                .to_vec()
         }
     }
     impl Drop for Fixture {
@@ -326,9 +322,9 @@ mod tests {
             let entries = fixture.entries();
             match mode {
                 0 => fs::write(fixture.0.join("backend"), b"patched").unwrap(),
-                1 => fs::write(fixture.0.join("web-config/app.wasm"), b"resized").unwrap(),
+                1 => fs::write(fixture.0.join("backend"), b"resized backend").unwrap(),
                 2 => fs::remove_file(fixture.0.join("backend")).unwrap(),
-                _ => fs::write(fixture.0.join("web-config/injected.js"), b"extra").unwrap(),
+                _ => fs::write(fixture.0.join("extra"), b"extra").unwrap(),
             }
             assert!(VerifiedRuntime::open(&fixture.0, &entries).is_err());
         }
@@ -340,7 +336,7 @@ mod tests {
         let mut runtime = VerifiedRuntime::open(&fixture.0, &fixture.entries()).unwrap();
         for _ in 0..3 {
             let report = runtime.scan(Duration::ZERO).unwrap();
-            assert_eq!(report.bytes, 11);
+            assert_eq!(report.bytes, 7);
             assert!(!report.cancelled);
         }
         let guard = runtime
@@ -358,7 +354,7 @@ mod tests {
         for path in [
             "../outside",
             "/absolute",
-            "web-config/../backend",
+            "subdir/../backend",
             "file:stream",
             "",
         ] {
@@ -377,14 +373,14 @@ mod tests {
         let report = runtime.scan_inner(&stop, CHUNK_PAUSE).unwrap();
         assert!(report.cancelled);
         assert_eq!(report.bytes, 0);
-        assert_eq!(runtime.scan(Duration::ZERO).unwrap().bytes, 11);
+        assert_eq!(runtime.scan(Duration::ZERO).unwrap().bytes, 7);
     }
 
     #[test]
     fn a_file_injected_after_startup_is_detected() {
         let fixture = Fixture::new();
         let mut runtime = VerifiedRuntime::open(&fixture.0, &fixture.entries()).unwrap();
-        fs::write(fixture.0.join("web-config/injected.js"), b"extra").unwrap();
+        fs::write(fixture.0.join("extra"), b"extra").unwrap();
         assert!(runtime.scan(Duration::ZERO).is_err());
     }
 
@@ -420,7 +416,7 @@ mod tests {
                 tx.send(error.to_string()).unwrap();
             })
             .unwrap();
-        fs::write(fixture.0.join("web-config/app.wasm"), b"evil").unwrap();
+        fs::write(fixture.0.join("backend"), b"evil").unwrap();
         assert!(rx
             .recv_timeout(Duration::from_secs(4))
             .unwrap()
@@ -435,7 +431,7 @@ mod tests {
         let fixture = Fixture::new();
         let runtime = VerifiedRuntime::open(&fixture.0, &fixture.entries()).unwrap();
         assert!(fs::write(fixture.0.join("backend"), b"patched").is_err());
-        assert!(fs::remove_file(fixture.0.join("web-config/app.wasm")).is_err());
+        assert!(fs::remove_file(fixture.0.join("backend")).is_err());
         assert!(fs::rename(fixture.0.join("backend"), fixture.0.join("replacement")).is_err());
         drop(runtime);
         fs::write(fixture.0.join("backend"), b"changed").unwrap();

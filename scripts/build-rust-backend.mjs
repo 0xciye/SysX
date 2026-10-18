@@ -48,6 +48,11 @@ if (!existsSync(binary)) throw new Error(`Rust backend build did not produce ${b
 mkdirSync(sidecarDir, { recursive: true });
 copyFileSync(binary, sidecar);
 if (binaryExtension === "") chmodSync(sidecar, 0o755);
+if (binaryExtension === "") {
+  const debugSidecar = path.join(sidecarDir, "receiver-backend");
+  copyFileSync(binary, debugSidecar);
+  chmodSync(debugSidecar, 0o755);
+}
 
 const help = spawnSync(sidecar, ["--help"], { cwd: root, stdio: "inherit" });
 if (help.error) throw help.error;

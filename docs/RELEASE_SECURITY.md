@@ -8,7 +8,7 @@ decision.
 
 ## What the source now does
 
-- Native release profiles use fat LTO, one codegen unit, full PDB debug information (`debug = 2`, `strip = "none"`), disabled debug assertions and `panic = "abort"`. PDBs are stored separately. The WASM UI still strips its debug metadata. Retaining symbols does not disable the release-only anti-debug guard.
+- Native release profiles use fat LTO, one codegen unit, full PDB debug information (`debug = 2`, `strip = "none"`), disabled debug assertions and `panic = "abort"`. PDBs are stored separately. Retaining symbols does not disable the release-only anti-debug guard.
 - The Windows MSVC target enables Rust/LLVM Control Flow Guard through
   `.cargo/config.toml`, and explicitly requests ASLR, high-entropy ASLR, and
   NX/DEP linker flags. These are platform mitigations against invalid indirect
@@ -23,9 +23,9 @@ decision.
   port/object/flags checks; a small release-only watchdog checks again every
   two seconds and terminates the process tree if it trips. Debug and test
   builds, including release-profile tests, do not enable this guard.
-- The build embeds a SHA-256/length manifest for the final backend and every UI
-  asset (HTML/JS/Wasm/CSS/icons). The release host verifies the extracted files
-  **before** launching the sidecar or opening the UI. The expected hashes come
+- The build embeds a SHA-256/length manifest for the final backend sidecar. The
+  release host verifies the extracted file **before** launching the sidecar.
+  The expected hash comes
   from trusted build inputs, not an editable runtime manifest or a new baseline
   learned from the extracted files. Missing, patched, resized, linked/reparse
   or unexpected runtime files fail verification. Settings, calibrations, model
@@ -40,16 +40,14 @@ decision.
   maximum detection delay. A failed sweep kills the owned backend through its
   process handle; backend disconnect then closes the host and releases runtime
   files. Debug/test launches do not automatically enable integrity enforcement.
-- The release UI post-process removes the Wasm `name`, `.debug_*`, and source
-  map custom sections before embedding the bundle, reducing symbol/source-map
-  metadata in the UI artifact. WASM remains a client artifact rather than a
-  security boundary; sensitive runtime logic stays in the native backend.
-- `src-tauri/build.rs` embeds the release backend and the complete Trunk UI
-  bundle. The final distribution contains one `SysX.exe`; the backend is only
-  extracted to `%LOCALAPPDATA%\SysX\runtime` while the app is running.
-- A Windows release host fails the build if either the backend sidecar or the
-  Trunk UI bundle is missing. This prevents an apparently successful but
-  unusable executable from being packaged.
+- The desktop distribution uses native Slint for Preview and Settings. There
+  is no browser config page, WASM UI bundle, or config HTTP endpoint.
+- `src-tauri/build.rs` embeds the release backend sidecar. The final
+  distribution contains one `SysX.exe`; the backend is extracted to
+  `%LOCALAPPDATA%\SysX\runtime` while the app is running.
+- A Windows release host fails the build if the backend sidecar is missing,
+  preventing an apparently successful but unusable executable from being
+  packaged.
 - The random loopback IPC token remains per launch. No license secret or
   reusable authentication credential is stored in the executable or repository.
 
@@ -67,8 +65,8 @@ VMProtect is neither invoked nor required by build/packaging; the preparation
 script and mandatory protection flags were removed at the user's request.
 Packaging still validates x86-64 PE format and excludes debug/source/map files
 and the separate backend. Pixel Seek requires no ONNX Runtime installation;
-Object Detection remains unavailable. The target computer needs WebView2/Edge
-and the Microsoft Visual C++ x64 runtime.
+Object Detection remains unavailable. The target computer needs the Microsoft
+Visual C++ x64 runtime.
 
 ## Optional manual third-party protection
 

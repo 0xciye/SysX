@@ -1,5 +1,5 @@
-//! Auto under ADS/scope zoom, with the real Pixel Seek mask, center-cell gate
-//! and host Auto state machine (simulation only, no device or game).
+//! Auto under ADS/scope zoom, with the real Pixel Seek target pixel, center
+//! crossing gate and host Auto state machine (simulation only, no device/game).
 //!
 //! `cargo test --release --test auto_ads -- --ignored --nocapture`
 
@@ -11,11 +11,12 @@ use host_auto::{AutoAction, AutoState, AutoTiming};
 use image::{Rgb, RgbImage};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::time::{Duration, Instant};
-use sysx_backend::auto_target::has_target_at_center;
-use sysx_backend::pixel_seek::{color_mask, PixelTargetColor};
+use sysx_backend::auto_target::CenterCrossing;
+use sysx_backend::crop::CropRect;
+use sysx_backend::pixel_seek::{process_pixel_seek, PixelTargetColor};
 
-/// Only the pixels around the crosshair matter to the center gate; an even
-/// 32 px image has the same 2 × 2 center cells as the 256 px crop.
+/// The selected pixel must pass through the image center; this small frame
+/// keeps the center-crossing simulation inexpensive.
 const SIZE: u32 = 32;
 const FPS: f64 = 240.0;
 /// Capture to backend (OBS encode, UDP, decode).
@@ -76,19 +77,22 @@ fn coverage(x: f64, from: f64, to: f64) -> f64 {
     (to.min(x + 1.0) - from.max(x)).clamp(0.0, 1.0)
 }
 
-/// Renders the frame around the crosshair: target offset `center` (image px,
-/// + right) and zoom, with the color blended by pixel coverage plus noise.
+/// Renders a one-pixel-high valid-color target through the image center.
 fn render(scene: &Scene, center: f64, zoom: f64, rng: &mut StdRng) -> RgbImage {
     let half = scene.body * zoom / 2.0;
     let (left, right) = (center - half, center + half);
     let mid = SIZE as f64 / 2.0;
-    RgbImage::from_fn(SIZE, SIZE, |x, _| {
+    RgbImage::from_fn(SIZE, SIZE, |x, y| {
         let column = x as f64 - mid;
-        let c = match scene.look {
-            Look::Solid => coverage(column, left, right),
-            Look::Outline(band) => (coverage(column, left, left + band)
-                + coverage(column, right - band, right))
-            .min(1.0),
+        let c = if y != SIZE / 2 {
+            0.0
+        } else {
+            match scene.look {
+                Look::Solid => coverage(column, left, right),
+                Look::Outline(band) => (coverage(column, left, left + band)
+                    + coverage(column, right - band, right))
+                .min(1.0),
+            }
         };
         let mut pixel = [0u8; 3];
         for (channel, value) in pixel.iter_mut().enumerate() {
@@ -106,24 +110,41 @@ fn simulate(scene: &Scene, seed: u64) -> Outcome {
     let phase = rng.random_range(0.0..std::f64::consts::TAU);
     let target = |t: f64| scene.amplitude * (std::f64::consts::TAU * scene.hz * t + phase).sin();
     let on_body = |t: f64| target(t).abs() <= scene.body / 2.0;
-    let start = Instant::now();
     let mut auto = AutoState::new();
     auto.set_enabled(true);
     auto.set_timing(scene.timing);
 
-    // Center-gate result per frame, visible to the host from `received`.
+    // Center-crossing result per frame, visible to the host from `received`.
     let frame_s = 1.0 / FPS;
     let frames = (scene.seconds * FPS) as usize;
+    let start = Instant::now();
+    let mut crossing = CenterCrossing::default();
+    let mut locked = None;
     let gate: Vec<(f64, bool)> = (0..frames)
         .map(|n| {
             let captured = n as f64 * frame_s;
             let zoom = zoom_at(&scene.keys, captured);
             let image = render(scene, target(captured) * zoom, zoom, &mut rng);
-            let mask = color_mask(&image, PixelTargetColor::Yellow);
-            (
-                captured + RECEIVE_S,
-                has_target_at_center(&mask, SIZE, SIZE, 36, 0.0),
-            )
+            let output = process_pixel_seek(
+                &image,
+                CropRect {
+                    x: 0,
+                    y: 0,
+                    width: SIZE,
+                    height: SIZE,
+                },
+                PixelTargetColor::Yellow,
+                36,
+                locked,
+            );
+            locked = output.objects.first().map(|object| object.bbox_xyxy);
+            let valid = crossing.update_target_pixel(
+                output.target.map(|point| [point.x, point.y]),
+                SIZE,
+                SIZE,
+                start + Duration::from_secs_f64(captured + RECEIVE_S),
+            );
+            (captured + RECEIVE_S, valid)
         })
         .collect();
 

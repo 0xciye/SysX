@@ -66,7 +66,10 @@ pub fn decode_udp_frame(frame: EncodedFrame) -> Result<SourceFrame, ReceiverErro
                 message,
             },
         })?;
-    let image = RgbImage::from_raw(width, height, pixels).expect("decoded RGB size");
+    let image = RgbImage::from_raw(width, height, pixels).ok_or_else(|| ReceiverError::Decode {
+        frame_id: frame.frame_id,
+        message: format!("decoder returned an invalid RGB buffer for {width}x{height}"),
+    })?;
     Ok(SourceFrame {
         frame_id: frame.frame_id,
         timestamp_ns: frame.timestamp_ns,
@@ -116,7 +119,7 @@ impl UdpDecodedFrameSource {
     }
 
     pub fn set_crop_resolution(&mut self, resolution: u32) {
-        if (1..=8192).contains(&resolution) {
+        if (1..=sysx_ui::protocol::MAX_CROP_RESOLUTION).contains(&resolution) {
             self.crop_resolution = resolution;
             self.send_crop_config();
         }
@@ -171,6 +174,16 @@ impl UdpDecodedFrameSource {
     pub fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.socket.as_ref().map(UdpSocket::local_addr).transpose()
     }
+
+    fn socket(&self) -> io::Result<&UdpSocket> {
+        self.socket.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP receiver socket is not open",
+            )
+        })
+    }
+
     pub fn stats(&self) -> ReassemblyStats {
         self.reassembler.stats()
     }
@@ -207,15 +220,21 @@ impl UdpDecodedFrameSource {
             // socket buffer (8 MiB) would otherwise hold seconds of old frames
             // and every frame handed on would be one of them.
             self.drain()?;
+            self.reassembler.expire(monotonic_ns());
             if let Some(frame) = self.reassembler.take_latest() {
                 return Ok(Some(frame));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            let socket = self.socket.as_ref().expect("socket opened");
+            let socket = self.socket.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "UDP receiver socket is not open",
+                )
+            })?;
             match socket.recv_from(&mut self.datagram) {
-                Ok((length, sender)) => self.accept(length, sender),
+                Ok((length, sender)) => self.accept(length, sender, true),
                 Err(error) if quiet(&error) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -224,14 +243,24 @@ impl UdpDecodedFrameSource {
 
     /// Accepts every datagram already queued without waiting.
     fn drain(&mut self) -> Result<(), ReceiverError> {
-        let socket = self.socket.as_ref().expect("socket opened");
+        let socket = self.socket.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP receiver socket is not open",
+            )
+        })?;
         socket.set_nonblocking(true)?;
         let mut result = Ok(());
         // Bounded so a flood cannot keep this loop from decoding.
         for _ in 0..MAX_DRAINED_DATAGRAMS {
-            let socket = self.socket.as_ref().expect("socket opened");
+            let socket = self.socket.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "UDP receiver socket is not open",
+                )
+            })?;
             match socket.recv_from(&mut self.datagram) {
-                Ok((length, sender)) => self.accept(length, sender),
+                Ok((length, sender)) => self.accept(length, sender, false),
                 Err(error) if quiet(&error) => break,
                 Err(error) => {
                     result = Err(error.into());
@@ -239,14 +268,11 @@ impl UdpDecodedFrameSource {
                 }
             }
         }
-        self.socket
-            .as_ref()
-            .expect("socket opened")
-            .set_nonblocking(false)?;
+        self.socket()?.set_nonblocking(false)?;
         result
     }
 
-    fn accept(&mut self, length: usize, sender: std::net::SocketAddr) {
+    fn accept(&mut self, length: usize, sender: std::net::SocketAddr, expire: bool) {
         // Only a real RCVR sender may become the crop recipient;
         // stray LAN datagrams must not redirect SYSCFG.
         if self.datagram[..length].starts_with(b"RCVR") {
@@ -261,8 +287,13 @@ impl UdpDecodedFrameSource {
                 self.send_crop_config();
             }
         }
-        self.reassembler
-            .accept(&self.datagram[..length], monotonic_ns());
+        if expire {
+            self.reassembler
+                .accept(&self.datagram[..length], monotonic_ns());
+        } else {
+            self.reassembler
+                .accept_unexpired(&self.datagram[..length], monotonic_ns());
+        }
     }
     pub fn close(&mut self) {
         self.socket = None;
@@ -436,6 +467,21 @@ mod tests {
         let _ = source.read(Duration::from_millis(300)).unwrap();
         let length = sender.recv(&mut reply).expect("repeated SYSCFG");
         assert_eq!(&reply[..length], b"SYSCFG 1 CROP 256");
+    }
+
+    #[test]
+    fn crop_resolution_rejects_values_the_receiver_cannot_process() {
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.set_crop_resolution(sysx_ui::protocol::MAX_CROP_RESOLUTION);
+        assert_eq!(
+            source.crop_resolution,
+            sysx_ui::protocol::MAX_CROP_RESOLUTION
+        );
+        source.set_crop_resolution(sysx_ui::protocol::MAX_CROP_RESOLUTION + 1);
+        assert_eq!(
+            source.crop_resolution,
+            sysx_ui::protocol::MAX_CROP_RESOLUTION
+        );
     }
 
     #[test]

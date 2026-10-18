@@ -1,5 +1,5 @@
 param(
-    # Launches SysX.exe (opens the monitor and config windows). Off by default.
+    # Launches SysX.exe (opens the native monitor). Off by default.
     [switch] $AppSmoke,
     # Optionally embed an existing backend. No third-party protection tool
     # is run or required by this build.
@@ -17,9 +17,6 @@ $target = "x86_64-pc-windows-msvc"
 $sidecar = Join-Path $root "src-tauri\binaries\receiver-backend-$target.exe"
 $symbols = Join-Path $root 'dist-symbols'
 $env:Path = (Join-Path $env:USERPROFILE ".cargo\bin") + ";" + $env:Path
-# Trunk rejects NO_COLOR=1.
-Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
-
 function Invoke-CheckedNative {
     param(
         [Parameter(Mandatory)] [string] $Command,
@@ -57,23 +54,7 @@ try {
         if (Test-Path -LiteralPath $componentSymbols) { Remove-Item -LiteralPath $componentSymbols -Recurse -Force }
     }
     New-Item -ItemType Directory -Force $symbols | Out-Null
-    # 1. Web UI (monitor + config) -> dist/, then remove Wasm debug/name
-    # metadata before src-tauri/build.rs embeds it. The helper is Rust-only;
-    # this Windows build path does not require Node.
-    Invoke-CheckedNative -Command "trunk" -CommandArguments @("build", "--release") -WorkingDirectory (Join-Path $root "rust-ui")
-    $stripperDirectory = Join-Path $root "target"
-    New-Item -ItemType Directory -Force $stripperDirectory | Out-Null
-    $stripper = Join-Path $stripperDirectory "strip-wasm-debug.exe"
-    Invoke-CheckedNative -Command "rustc" -CommandArguments @(
-        (Join-Path $root "scripts\strip-wasm-debug.rs"), "--edition", "2021", "-O", "-o", $stripper
-    )
-    Invoke-CheckedNative -Command $stripper -CommandArguments @((Join-Path $root "dist"))
-
-    & (Join-Path $root "scripts\tests\ui-bundle.Tests.ps1")
-    # Check the generated loader and refresh SRI after stripping final Wasm bytes.
-    & (Join-Path $root "scripts\finalize-ui-bundle.ps1") -Directory (Join-Path $root "dist")
-
-    # 2. Backend sidecar, embedded into SysX.exe.
+    # 1. Backend sidecar, embedded into SysX.exe.
     if ($UseExistingBackend) {
         if ($BackendPath) {
             $existing = (Resolve-Path -LiteralPath $BackendPath -ErrorAction Stop).Path
@@ -95,12 +76,12 @@ try {
         Copy-NativePdb -Directory (Split-Path -Parent $backend) -Names @('receiver_backend.pdb', 'receiver-backend.pdb') -Component 'backend'
     }
 
-    # 3. Tests.
+    # 2. Tests.
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic")
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "rust-ui\Cargo.toml")
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("test", "--manifest-path", "src-tauri\Cargo.toml")
 
-    # 4. Portable SysX.exe.
+    # 3. Portable SysX.exe.
     Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "src-tauri\Cargo.toml", "--release")
     $builtExe = Join-Path $root "src-tauri\target\release\receiver.exe"
     $sysxExe = Join-Path $root "src-tauri\target\release\SysX.exe"
@@ -109,7 +90,7 @@ try {
     Copy-NativePdb -Directory (Split-Path -Parent $builtExe) -Names @('receiver.pdb') -Component 'host'
     Write-Host "Built $sysxExe"
 
-    # 5. Headless protocol smoke; the app smoke opens windows, so it is opt-in.
+    # 4. Headless protocol smoke; the app smoke opens windows, so it is opt-in.
     & (Join-Path $PSScriptRoot "smoke-windows-udp.ps1")
     if ($AppSmoke) {
         & (Join-Path $PSScriptRoot "smoke-windows-app.ps1") -ApplicationPath $sysxExe

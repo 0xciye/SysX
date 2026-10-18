@@ -2,21 +2,21 @@
 
 > **Current availability:** Pixel Seek is the only usable detection engine. Object Detection and its ONNX Runtime, OpenVINO and TensorRT integrations are **not ready for use**. Their source/dependencies remain for development; build and unit-test results are not functional validation. SysX supports **Medius only** through its Rust SDK.
 
-## Current milestone status (2026-10-16)
+## Current milestone status (2026-10-18)
 
 Windows portable packaging: `scripts/build-windows.ps1` builds and tests the backend with `ort/load-dynamic`, so Pixel Seek builds do not link/download the unused ONNX Runtime SDK. The branch-only `portable-test-build.yml` runs Windows checks and stores a raw test ZIP in a draft release instead of Actions artifacts. VMProtect is excluded from automated build/packaging at the user's request; no physical-device validation is implied.
 
 The Windows build exposed different wildcard/specific-interface UDP binding behavior. The receiver now sets `SO_EXCLUSIVEADDRUSE` before binding on Windows so an occupied port is rejected, the existing listener survives a failed port change, and recovery can retry after the port is released. Regression checks exercise both bind directions.
 
-Windows application smoke also exposed a native-window shutdown delay: lifecycle tracking restarted after the monitor was already closed and could wait another 60 seconds. Native close now starts the three-second close grace, config-only reloads retain that grace, and WebView creation failure uses the Edge fallback without waiting indefinitely for backend exit.
+Windows application smoke also exposed a native-window shutdown delay: lifecycle tracking restarted after the monitor was already closed and could wait another 60 seconds. Native close starts the three-second close grace; the in-app Settings window now counts as a live native client while open.
 
-The active receiver is a native Slint desktop window. Its existing visual design is retained. Wry/WebView2, Edge app mode and the WASM monitor are removed; the separate browser settings page remains Leptos/WASM with no preview or monitor-shaped boot fallback.
+The active receiver and Settings are native Slint windows. The desktop no longer opens a browser, starts a local config server, embeds or extracts a Leptos/WASM bundle, or requires Trunk. The backend has no config HTTP endpoint; configuration is handled by the authenticated native host connection.
 
 ## Architecture
 
 The Rust native host owns Slint rendering, Medius I/O, movement and backend supervision. `native_monitor.rs` consumes authenticated monitor-role WebSocket messages, validates preview envelopes, keeps at most one pending JPEG and decodes away from the UI thread. `monitor_window.rs` uploads only fresh decoded frames and draws the same HUD, FOV, boxes, target indicator, profile and Mouse State using shared pure Rust layout/protocol helpers.
 
-The config page is served only at loopback `/config.html`; `/monitor.html` returns 404. Config clients keep the app alive after the native window closes. The Slint loop remains available to reopen the hidden receiver when a second launch signals the existing instance, without starting another backend or browser monitor. Without clients the app exits after the existing three-second grace period. A failed config server does not prevent the native monitor from opening.
+The native Settings window uses the authenticated host WebSocket for settings reads, profile actions, persistence, and runtime apply. Closing the receiver hides it; Settings can remain open independently, and the app exits after all native clients close plus the three-second grace period. A second launch focuses or reopens the existing native monitor without starting another backend.
 
 Develop, build, and test on Windows; the Windows executable and its embedded sidecar are built there.
 
@@ -29,28 +29,28 @@ References:
 
 ### Brand assets
 
-- `public/receiver-mark.svg` is the canonical SysX mark. Keep browser config branding and desktop assets visually aligned with it.
-- `src-tauri/build.rs` embeds the backend sidecar and web-config assets into the native executable.
+- `public/receiver-mark.svg` is the canonical SysX mark used by the desktop assets.
+- `src-tauri/build.rs` embeds the backend sidecar into the native executable; no web-config asset bundle is embedded.
+- `pnpm dev` and `pnpm build` use the native SysX app.
 
 ### Rust UI
 
 - UI components live in `rust-ui/src`; `layout.rs` contains pure preview geometry helpers.
-- `scripts/build-rust-ui.mjs` runs Trunk for both development and release builds. The output directory is embedded and served by the Rust sidecar's local configuration server.
-- `app.rs` mounts only `ConfigApp`. It receives state and configuration acknowledgements, never preview frames. The native Slint component follows the existing monitor design tokens in `design-system/sysx-native-receiver/MASTER.md`.
+- Native settings fields, profile operations, and the Preview monitor live in `src-tauri/src/monitor_window.rs`; they use the design tokens in `design-system/sysx-native-receiver/MASTER.md`.
 
 ### Desktop frontend
 
 - Keep the native monitor window focused on Preview, Mouse State, device state, and receiver connection state. Preview is always visible; its HUD shows only processing FPS, latency, and processing resolution.
-- Put all settings in one vertically scrolling page in the separate browser window, grouped into Main, Motion, Auto, Recoil, and Settings cards with one global Apply Changes action. The profile toolbar supports selecting, cloning, renaming, creating, and deleting up to three profiles. Persist settings in app data and restore them when the backend starts.
+- Put settings in one vertically scrolling native Settings window, with Main, Motion, Auto, Recoil, Settings, and profile controls plus one global Apply Changes action. Profile selection, clone/create, rename and delete use the backend's existing persisted profile model (maximum three).
 - Cap Preview at 640 × 640 px; preserve aspect ratio and enlarge smaller frames with smooth or nearest-neighbor scaling.
-- Keep a circle-only FOV overlay always enabled; expose its size as a 1–360° setting in the local config page, with no enable/disable control. Scale its diameter against the shorter side of the displayed image so it stays proportional across source resolutions; 360° is the largest inscribed circle.
-- Persist `offsetX` and `offsetY` as signed crop-pixel settings and display them relative to the selected target in the web config. Movement adds these offsets to the selected point before calculating crop-center error.
-- Persist a Trigger button preference in the web config with Right, M4, and M5 choices; exclude Left, and exclude Middle because it cycles profiles (also for the Auto trigger key; older files that select Middle load as Right). Device output is sent only while that physical button is held. Start with one `Default` profile and persist up to three independent settings profiles in `app-settings.json`; users can create, clone, rename, delete, and select them, while a middle-button rising edge cycles only through profiles that exist and immediately reconfigures the pipeline.
+- Keep a circle-only FOV overlay always enabled; expose its size as a 1–360° setting in native Settings, with no enable/disable control. Scale its diameter against the shorter side of the displayed image so it stays proportional across source resolutions; 360° is the largest inscribed circle.
+- Persist `offsetX` and `offsetY` as signed crop-pixel settings and display them relative to the selected target in native Settings. Movement adds these offsets to the selected point before calculating crop-center error.
+- Persist a Trigger button preference in native Settings with Right, M4, and M5 choices; exclude Left, and exclude Middle because it cycles profiles (also for the Auto trigger key; older files that select Middle load as Right). Device output is sent only while that physical button is held. Start with one `Default` profile and persist up to three independent settings profiles in `app-settings.json`; a middle-button rising edge cycles only through profiles that exist and immediately reconfigures the pipeline.
 - Provide independent X/Y exponential-smoothing alpha sliders in the local config. The backend applies `previous + alpha * (current - previous)` to selected target coordinates; the filtered point feeds Preview and device movement while raw detections remain intact. Alpha `1.0` disables filtering. Clear smoothing history when a target is lost or pipeline configuration changes.
 - Provide persisted user-entered sensitivity (`0.01..10`) in the local config. DPI is not a SysX setting because injected device counts are calibrated against measured image pixels per count.
 - Reflect backend IPC readiness in the connection status; show “Waiting for sender” after the authenticated socket connects and reserve “Starting receiver” for startup.
 - Retry frame-source runtime failures every 3 seconds. Retain the active listener while a requested port is occupied, then switch to the requested port and clear its error after a successful bind. Startup bind failures and later socket failures retry until the listener returns. Bad JPEGs and decoded-size mismatches are counted and dropped while the listener stays bound. Current errors clear on recovery; diagnostic history is not treated as a current failure.
-- Let the local configuration page scroll vertically as additional settings are added.
+- Let the native Settings window scroll vertically as additional settings are added.
 - Apply backend and compute selections to inference. Precision remains a saved preference because the imported model artifact supplies its precision.
 - Send receiver and detection configuration to the backend. The OBS sender provides the configured centered square MJPEG crop through `SYSCFG`; the receiver processes each decoded frame as received and publishes it to Preview without a second crop or resize.
 - Default the UDP listener to port `4200`. Show model controls (including import) only in Object Detection mode. Do not add a Data or export section to the desktop UI.
@@ -64,14 +64,14 @@ References:
 - Packet reassembly and JPEG boundary validation live in `rust-backend/src/udp.rs`; UDP receive and JPEG decode live in `receiver.rs`; centered crop geometry is isolated in `crop.rs`.
 - Bounded latest-frame processing lives in `pipeline.rs`. Pixel Seek profiles and target selection live in `pixel_seek.rs` and `targeting.rs`.
 - Model loading, NCHW RGB preprocessing, runtime adapters, YOLOv8 output decoding, confidence/IoU filtering, and class-aware NMS live in `inference.rs`. The pipeline caches the selected runtime and uses model artifact paths plus backend/compute selection to choose it.
-- Movement conversion/batching and loopback web configuration live in `movement.rs` and `web_config.rs`. Per-frame detection results are not persisted.
-- User settings live in `app-settings.json` under the operating system's app-data directory. The backend creates a defaults file on first launch, loads it at startup, and the local page reads and atomically updates the same file through `GET/PUT /api/settings` when Apply Changes is used.
+- Movement conversion/batching live in `movement.rs`; desktop settings commands use the authenticated host WebSocket. Per-frame detection results are not persisted.
+- User settings live in `app-settings.json` under the operating system's app-data directory. The backend creates a defaults file on first launch, loads it at startup, and saves/applies the same file when native Settings invokes Apply Changes.
 - Development-only, unavailable Object Detection path: import one bundle with ONNX `.onnx`, TensorRT `.engine`/`.plan`, and OpenVINO IR `.xml`/`.bin`. ONNX Runtime is CPU-only; OpenVINO requests CPU/GPU/NPU from the installed runtime; TensorRT is compiled only when TensorRT headers and `CUDA_PATH` are set during backend build and needs GPU hardware. Inference rejects crop dimensions that differ from the configured model input; it does not resize.
 - The supported decoder expects raw YOLOv8 output shaped `[1, 4+classes, anchors]` or `[1, anchors, 4+classes]`. Confidence and IoU come from the model registry; class-aware NMS precedes the common FOV/prior-box/anchor selector. The Precision selector is saved UI preference only.
 - Runtime adapters compile, the pure output decoder and crop mismatch path have unit coverage, but no user model is present. Actual model inference and accelerator/runtime availability remain unverified.
-- `scripts/build-rust-backend.mjs` builds the target-specific sidecar after the UI bundle; `src-tauri/build.rs` embeds it and the config assets in the native executable. The host extracts them into a per-process app-data runtime directory, manages the backend process, and removes that directory on normal shutdown.
+- `scripts/build-rust-backend.mjs` builds the target-specific sidecar; `src-tauri/build.rs` embeds it in the native executable. The host extracts the backend into app data, manages its process, and removes the runtime directory on normal shutdown.
 
-The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pixel Seek (Object Detection is unavailable development work), and serves local configuration plus authenticated state/preview WebSocket messages. The Rust UI consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
+The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pixel Seek (Object Detection is unavailable development work), and serves authenticated state/preview WebSocket messages. The native Slint host consumes binary preview frames and typed state. No Python or React/TypeScript application source remains in the repository.
 
 ### Frame flow
 
@@ -79,7 +79,7 @@ The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pix
 2. Reassemble UDP frames with bounded memory and timeout.
 3. Keep queues bounded and discard stale frames under load.
 4. Process every frame still admitted to the processing queue.
-5. Forward every processed frame to Preview (event-driven, original sender JPEG, no re-encode) so preview FPS matches input FPS; report processing FPS and preview FPS separately. With a 240 FPS libobs source (headless, 2026-10-15) the monitor page received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
+5. Forward every processed frame to Preview (event-driven, original sender JPEG, no re-encode) so preview FPS matches input FPS; report processing FPS and preview FPS separately. With a 240 FPS libobs source (headless, 2026-10-15) the monitor received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
 
 ### Target selection and mouse output
 
@@ -89,17 +89,17 @@ The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pix
 
 The CapkfaPlus mapping in [`docs/CAPKFA_RECONSTRUCTION_MAPPING.md`](docs/CAPKFA_RECONSTRUCTION_MAPPING.md) is reference material only. SysX does not expose or run the reconstructed active-state, mode-predicate, direct-offset, or timed-click branches because their live state producers are unavailable. The supported output path uses fresh summed deltas, the configured physical trigger, sampled recoil on Y, and the documented Medius relative-move APIs.
 
-The development and release launchers build the Rust UI before the Rust backend. The native host embeds the sidecar and static config bundle; Windows emits the `SysX.exe` portable executable. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
+Desktop development/release launchers build the Rust backend sidecar and native host; Windows emits the `SysX.exe` portable executable. UDP is reserved for sender frames. Large frame payloads use binary WebSocket messages with small metadata rather than repeated JSON serialization.
 
 The native host runs the vision sidecar and a Medius device monitor on separate processes/threads. Fresh-delta merging, trigger mapping and the ±32 per-axis clamp stay in `src-tauri/src/movement.rs`. The official `medius 3.4.6` Rust SDK owns mouse-box discovery, connection, health validation, physical input telemetry and transport. `medius_device.rs` dispatches internal queue records to `move_rel` or `press/release(Button::LEFT)` on a cloned SDK handle. Ferrum and MAKCU are removed; no raw serial fallback is supported. Windows/device behavior remains unvalidated.
 
-Release protection: native host/backend release profiles retain full PDB information with LTO and disabled debug assertions; WASM metadata stripping remains enabled. The Windows MSVC target also enables Control Flow Guard, ASLR, high-entropy ASLR, and NX/DEP; the host and backend set compatible image-load and extension-point mitigations at startup. Windows release builds include a release-only debugger guard in both the host and extracted backend, and the packaging build fails when either the backend sidecar or the UI bundle is missing. The build emits the release EXE directly and the package script has no VMProtect gate. Optional VMProtect processing is manual; the repository preparation script was removed. See `docs/RELEASE_SECURITY.md`; the backend must be protected separately because the host extracts it at runtime. Authentication and licensing are intentionally not implemented yet.
+Release protection: native host/backend release profiles retain full PDB information with LTO and disabled debug assertions. The Windows MSVC target also enables Control Flow Guard, ASLR, high-entropy ASLR, and NX/DEP; the host and backend set compatible image-load and extension-point mitigations at startup. Windows release builds include a release-only debugger guard in both the host and extracted backend, and the packaging build fails when the backend sidecar is missing. The build emits the release EXE directly and the package script has no VMProtect gate. Optional VMProtect processing is manual; the repository preparation script was removed. See `docs/RELEASE_SECURITY.md`; the backend must be protected separately because the host extracts it at runtime. Authentication and licensing are intentionally not implemented yet.
 
-No GitHub Actions build workflow is configured. `scripts/build-windows.ps1` (no Node required) builds the Trunk UI, the Rust sidecar, runs all three test suites, emits one `SysX.exe` without an installer, and verifies UDP `4200` and 192×192 frame receipt. `-AppSmoke` additionally launches `SysX.exe --smoke-test` (suppresses automatic Config opening so that the test owns the complete client lifecycle), waits for its backend to bind UDP `4200` and for its native WebView2 or dedicated Edge monitor window, closes that HWND with WM_CLOSE, and checks that SysX and its backend exit — it opens windows, so run it only when the machine is free. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
+The manual Windows GitHub Actions workflow builds the Rust sidecar, runs backend/UI/host test suites, emits one `SysX.exe` without an installer, and verifies UDP `4200` and 192×192 frame receipt. Its optional app lifecycle smoke runs only on the hosted runner. `scripts/build-windows.ps1` no longer requires Node or Trunk for the desktop build. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
 
 ## Build prerequisites
 
-- Node.js 20+, pnpm, Rust stable, and Trunk.
+- Rust stable and the Windows MSVC toolchain. Node/pnpm are used only by the desktop helper scripts.
 - CMake and NASM on `PATH`: backend and host decode JPEG with libjpeg-turbo (`turbojpeg` crate, vendored source built statically with `require-simd`, so a build without NASM fails instead of silently losing SIMD). On Windows: `choco install nasm` (adds `C:\Program Files\NASM`) plus the CMake that ships with Visual Studio Build Tools; the manual EXE workflow installs NASM itself.
 - For Windows release builds: Windows x64 runner and the selected inference runtimes.
 
@@ -124,7 +124,6 @@ cargo test --manifest-path rust-ui/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The Rust UI release bundle is built with `pnpm build` (or `node scripts/build-rust-ui.mjs build`).
 
 Local UDP protocol verification:
 
@@ -320,6 +319,8 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 149. [x] Audit fixes (on `4e0743e`): removed the per-frame JSONL detection log (~290 MB/h at 240 FPS, never read; old `sessions` folders are deleted at startup); `apply_settings` applies every command and reports all failures; 1 ms Windows timer resolution for host and backend; the host keeps the part of a target delta beyond ±32 for the next command; the host socket reads with a 2 ms timeout; preview metadata no longer builds the full state per frame; Middle is no longer a Motion/Auto trigger (it cycles profiles; files that select it load as Right); a fast least-squares check raises px/count within a few frames after zooming in (ADS/scope), cutting the simulated 4× still-target oscillation peak from 119 to 34 px. Backend, UI and host tests pass on Linux; `x86_64-pc-windows-msvc` checks pass. Not run on Windows or hardware.
 
 150. [x] Added Color Filter: a persisted toggle below Motion/Auto/Recoil in the Modules group. When on, the frame is filtered to the selected Pixel Seek color (everything else black) before Motion/Auto processing, and the native Preview shows the same filtered image from the original JPEG plus a packed one-bit mask (no re-encode). Backend, UI and host tests pass on Linux; Windows checks compile. Not run on Windows, OBS or hardware.
+
+151. [ ] Current overhaul in progress (2026-10-18): removed browser/config-server startup and web bundle embedding from desktop builds; added native Slint profile actions and keeps the backend alive while Settings is open. Pixel Seek no longer switches targets on a single lock-region miss; it waits through the existing 100 ms lock freshness window. Added OBS callback frame-size checks and exception containment. `cargo check` and `cargo check --tests` pass for backend/native host. No test binaries were executed, no app/game was opened, and Windows/DLL/device behavior remains unverified. Remaining scope includes full performance/stability audit, target tracking validation, and desktop Settings/runtime validation.
 
 
 ### Pixel Seek Motion / Auto contract correction (2026-10-16)

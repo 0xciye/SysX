@@ -18,6 +18,7 @@ use crate::config::RecoilSettings;
 use crate::targeting::fov_radius_px;
 use normal::{counts_per_px, NormalMotion, NormalStep};
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -41,6 +42,7 @@ pub struct MotionParams {
     pub offsets: (f64, f64),
     pub speed: (f64, f64),
     pub smooth_fov_degrees: u16,
+    pub no_deadzone: bool,
 }
 
 /// Turns each new frame's target into one move; ticks without a new frame
@@ -112,6 +114,11 @@ impl MovementController {
             ),
             smooth_fov_px: f64::from(smooth_radius),
             counts_per_px: counts_per_px(self.sens),
+            dead_zone_px: if params.no_deadzone {
+                0.0
+            } else {
+                normal::DEAD_ZONE_PX
+            },
         })
     }
 }
@@ -152,6 +159,7 @@ pub struct MovementRuntimeSettings {
     pub speed_y: f64,
     /// Inside this FOV the speed is divided by the smoothing strength.
     pub smooth_fov_degrees: u16,
+    pub no_deadzone: bool,
     pub trigger_button: String,
     /// The selected physical trigger is held (from the host's device status).
     pub trigger_held: bool,
@@ -263,7 +271,7 @@ impl MovementTicker {
         initial_sens: f64,
         settings: Arc<dyn Fn() -> Option<MovementRuntimeSettings> + Send + Sync>,
         on_event: Arc<dyn Fn(MovementEvent) + Send + Sync>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(TickerState {
                 latest: None,
@@ -298,7 +306,9 @@ impl MovementTicker {
                         if state.stopping {
                             return;
                         }
-                        let latest = state.latest.clone().expect("latest movement target");
+                        let Some(latest) = state.latest.clone() else {
+                            continue;
+                        };
                         (latest.0, latest.1)
                     };
 
@@ -404,18 +414,29 @@ impl MovementTicker {
                             sens = runtime.sens;
                             rendered.reset();
                         }
-                        let (dx, dy) = controller.delta(
-                            &sample,
-                            MotionParams {
-                                offsets: (runtime.offset_x, runtime.offset_y),
-                                speed: (runtime.speed_x, runtime.speed_y),
-                                smooth_fov_degrees: runtime.smooth_fov_degrees,
-                            },
-                        );
+                        let output_active = runtime.output_active();
+                        let (dx, dy) = if output_active {
+                            controller.delta(
+                                &sample,
+                                MotionParams {
+                                    offsets: (runtime.offset_x, runtime.offset_y),
+                                    speed: (runtime.speed_x, runtime.speed_y),
+                                    smooth_fov_degrees: runtime.smooth_fov_degrees,
+                                    no_deadzone: runtime.no_deadzone,
+                                },
+                            )
+                        } else {
+                            // A released trigger must not build fractional
+                            // movement that can leak into the next press.
+                            controller.reset();
+                            rendered.reset();
+                            (0, 0)
+                        };
                         let (dx, dy) = if let Some(profile) = runtime.renderer_profile.as_ref() {
-                            if !runtime.output_active()
-                                || controller.frame_error.0.hypot(controller.frame_error.1)
-                                    <= normal::DEAD_ZONE_PX
+                            if !output_active
+                                || (!runtime.no_deadzone
+                                    && controller.frame_error.0.hypot(controller.frame_error.1)
+                                        <= normal::DEAD_ZONE_PX)
                             {
                                 rendered.reset();
                                 (0, 0)
@@ -433,7 +454,7 @@ impl MovementTicker {
                             // Default Normal bypasses ABCurves completely.
                             (dx, dy)
                         };
-                        if runtime.output_active() {
+                        if output_active {
                             if let Some(line) = summary.add(&controller, sample.frame_id, (dx, dy))
                             {
                                 crate::diagnostics::record(&line);
@@ -490,13 +511,12 @@ impl MovementTicker {
                     }
                     let _ = wake.wait_timeout(state, Duration::from_millis(4));
                 }
-            })
-            .expect("movement ticker thread");
-        Self {
+            })?;
+        Ok(Self {
             shared,
             worker: Mutex::new(Some(worker)),
             flick_done,
-        }
+        })
     }
 
     /// Auto's aim move reached its locked target (see [`flick`]).
@@ -537,6 +557,12 @@ impl MovementTicker {
             return false;
         }
         worker.join().is_ok()
+    }
+}
+
+impl Drop for MovementTicker {
+    fn drop(&mut self) {
+        let _ = self.close(Duration::from_secs(1));
     }
 }
 
@@ -597,13 +623,13 @@ pub struct MovementBatcher {
 }
 
 impl MovementBatcher {
-    pub fn new(on_batch: Arc<dyn Fn(MovementEvent) + Send + Sync>) -> Self {
+    pub fn new(on_batch: Arc<dyn Fn(MovementEvent) + Send + Sync>) -> io::Result<Self> {
         Self::with_interval(Duration::from_millis(4), on_batch)
     }
     pub fn with_interval(
         interval: Duration,
         on_batch: Arc<dyn Fn(MovementEvent) + Send + Sync>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(BatchState {
                 pending: None,
@@ -651,12 +677,11 @@ impl MovementBatcher {
                 if let Some(event) = batch.filter(|event| !is_stale(event)) {
                     on_batch(event);
                 }
-            })
-            .expect("movement batcher thread");
-        Self {
+            })?;
+        Ok(Self {
             shared,
             worker: Mutex::new(Some(worker)),
-        }
+        })
     }
     pub fn submit(&self, event: MovementEvent) {
         let (lock, wake) = &*self.shared;
@@ -687,6 +712,12 @@ impl MovementBatcher {
             return false;
         }
         worker.join().is_ok()
+    }
+}
+
+impl Drop for MovementBatcher {
+    fn drop(&mut self) {
+        let _ = self.close(Duration::from_secs(1));
     }
 }
 
@@ -737,6 +768,7 @@ mod tests {
             speed_x: 0.06,
             speed_y: 0.06,
             smooth_fov_degrees: 20,
+            no_deadzone: false,
             trigger_button: "right".into(),
             trigger_held: held,
             auto_flick: false,
@@ -779,7 +811,8 @@ mod tests {
                 Arc::new(move |event| {
                     let _ = tx.send(event);
                 }),
-            );
+            )
+            .unwrap();
             ticker.update(sample(1));
             let invalid = rx.recv_timeout(Duration::from_secs(2));
             ticker.update(sample(2));
@@ -872,6 +905,7 @@ mod tests {
             offsets: (0.0, 0.0),
             speed: (0.1, 0.1),
             smooth_fov_degrees: 20,
+            no_deadzone: false,
         }
     }
 
@@ -891,6 +925,71 @@ mod tests {
         assert_eq!(controller.delta(&frame, params()), (40, 0));
         frame.target = None;
         assert_eq!(controller.delta(&frame, params()), (0, 0));
+    }
+
+    #[test]
+    fn no_deadzone_setting_controls_small_target_motion() {
+        let mut controller = MovementController::new(0.1);
+        let mut frame = sample(2);
+        frame.target = Some((32.0, 32.0));
+        let mut normal = params();
+        normal.offsets = (0.5, 0.0);
+        normal.speed = (0.1, 0.1);
+        assert_eq!(controller.delta(&frame, normal), (0, 0));
+
+        controller.reset();
+        frame.frame_id += 1;
+        normal.no_deadzone = true;
+        assert_eq!(controller.delta(&frame, normal), (1, 0));
+    }
+
+    #[test]
+    fn inactive_motion_emits_no_delta_and_resets_fractional_carry() {
+        let held = Arc::new(AtomicBool::new(true));
+        let settings_held = Arc::clone(&held);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ticker = MovementTicker::new(
+            10.0,
+            Arc::new(move || {
+                let mut settings = runtime(false, settings_held.load(Ordering::Acquire));
+                settings.sens = 10.0;
+                settings.speed_x = 0.005;
+                settings.speed_y = 0.01;
+                Some(settings)
+            }),
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .unwrap();
+        let receive_frame = |expected_frame| loop {
+            let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if event.frame_id == expected_frame {
+                break event;
+            }
+        };
+
+        let mut frame = sample(2);
+        ticker.update(frame.clone());
+        let first = receive_frame(frame.frame_id);
+        assert!(first.target_valid);
+
+        held.store(false, Ordering::Release);
+        frame.frame_id += 1;
+        ticker.update(frame.clone());
+        let released = receive_frame(frame.frame_id);
+        assert!(
+            released.target_valid,
+            "target validity remains available to Recoil"
+        );
+        assert_eq!((released.dx, released.dy), (0, 0));
+
+        held.store(true, Ordering::Release);
+        frame.frame_id += 1;
+        ticker.update(frame.clone());
+        let pressed = receive_frame(frame.frame_id);
+        assert_eq!((pressed.dx, pressed.dy), (0, 0));
+        assert!(ticker.close(Duration::from_secs(1)));
     }
 
     #[test]

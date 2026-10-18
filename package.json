@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/build-rust-backend.mjs --debug && node scripts/build-rust-ui.mjs serve",
-    "build": "node scripts/build-rust-ui.mjs build",
-    "build:desktop": "pnpm build && node scripts/build-rust-backend.mjs --release && cargo build --manifest-path src-tauri/Cargo.toml --release",
+    "dev": "pnpm native:dev",
+    "build": "pnpm build:desktop",
+    "build:desktop": "node scripts/build-rust-backend.mjs --release && cargo build --manifest-path src-tauri/Cargo.toml --release",
+    "build:macos": "bash scripts/build-macos.sh",
     "native:dev": "node scripts/build-rust-backend.mjs --debug && cargo run --manifest-path src-tauri/Cargo.toml",
     "native:build": "pnpm build:desktop"
   },

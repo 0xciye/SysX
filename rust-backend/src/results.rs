@@ -35,8 +35,8 @@ pub struct DetectionResult {
     pub target_xy: Option<[f32; 2]>,
     #[serde(default)]
     pub smoothed_target_xy: Option<[f32; 2]>,
-    /// Auto's presence gate: an active-color pixel must occupy the
-    /// screen-center cell inside Auto FOV (the crosshair must touch it).
+    /// Auto's center-crossing gate: the selected active-color pixel must pass
+    /// through the screen center while remaining on the same target track.
     #[serde(default)]
     pub auto_target_valid: bool,
     /// Frame-level routing intent, independent of center-pixel validity.

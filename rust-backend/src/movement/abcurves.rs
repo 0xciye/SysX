@@ -329,6 +329,7 @@ mod tests {
                         offsets: (0.0, 0.0),
                         speed: (DEFAULT_SPEED, DEFAULT_SPEED),
                         smooth_fov_degrees: 20,
+                        no_deadzone: false,
                     },
                 );
                 let report = if error.abs() <= 1.0 {
@@ -469,6 +470,7 @@ mod tests {
                     offsets: (0.0, 0.0),
                     speed: (DEFAULT_SPEED, DEFAULT_SPEED),
                     smooth_fov_degrees: 20,
+                    no_deadzone: false,
                 },
             );
             let report = output

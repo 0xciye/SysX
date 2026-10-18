@@ -64,9 +64,7 @@ $testBackendIds = @()
 $monitor = @()
 
 try {
-    # Suppress only the automatic config tab. A connected config page keeps
-    # the current host alive by design after its monitor closes.
-    $app = Start-Process -FilePath $appExe -ArgumentList "--smoke-test" -WorkingDirectory $appDir -PassThru
+    $app = Start-Process -FilePath $appExe -WorkingDirectory $appDir -PassThru
     # Windows PowerShell 5.1 only reports ExitCode if the process handle was opened.
     $null = $app.Handle
     $startupDeadline = (Get-Date).AddSeconds(120)
@@ -120,41 +118,13 @@ try {
     if ($monitor.Count -eq 0) {
         throw "SysX did not open its monitor app window within 30 seconds."
     }
-    # Verify the native preview client connected before closing the window.
-    # This probe uses role=config and cannot satisfy the monitor count itself.
-    $instance = Get-Content (Join-Path $env:LOCALAPPDATA 'SysX\instance.json') -Raw | ConvertFrom-Json
-    $session = Invoke-RestMethod -Uri "http://127.0.0.1:$($instance.config_port)/api/session" -TimeoutSec 5
-    $probe = [System.Net.WebSockets.ClientWebSocket]::new()
-    $cancel = [System.Threading.CancellationTokenSource]::new(30000)
-    $connectedMonitor = $false
-    try {
-        $uri = [Uri]"ws://127.0.0.1:$($session.port)/receiver?role=config&token=$([Uri]::EscapeDataString($session.token))"
-        $probe.ConnectAsync($uri, $cancel.Token).GetAwaiter().GetResult()
-        $buffer = [byte[]]::new(65536)
-        while (-not $cancel.IsCancellationRequested -and -not $connectedMonitor) {
-            $message = [IO.MemoryStream]::new()
-            try {
-                do {
-                    $part = $probe.ReceiveAsync([ArraySegment[byte]]::new($buffer), $cancel.Token).GetAwaiter().GetResult()
-                    if ($part.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
-                        throw 'Backend disconnected before the native monitor became ready.'
-                    }
-                    $message.Write($buffer, 0, $part.Count)
-                    if ($message.Length -gt 262144) { throw 'Oversized smoke state message.' }
-                } while (-not $part.EndOfMessage)
-                if ($part.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Text) {
-                    $state = [Text.Encoding]::UTF8.GetString($message.ToArray()) | ConvertFrom-Json
-                    $connectedMonitor = $state.event -eq 'state' -and $state.monitor_clients -gt 0
-                }
-            } finally { $message.Dispose() }
-        }
-    } finally {
-        $probe.Abort()
-        $probe.Dispose()
-        $cancel.Dispose()
-    }
-    if (-not $connectedMonitor) { throw 'The native monitor never connected; a visible window alone is not a running UI.' }
-    Write-Host 'The native monitor connected to the backend.'
+    # The native app owns its authenticated IPC client; there is no browser
+    # session/config endpoint to probe. Confirm the app remains alive with its
+    # monitor open, then exercise the owned-window shutdown below.
+    Start-Sleep -Seconds 1
+    $app.Refresh()
+    if ($app.HasExited) { throw 'SysX exited while its native monitor window was open.' }
+    Write-Host 'The native monitor window remained open.'
     foreach ($window in $monitor) {
         if (-not [SysXSmokeWindows]::Close($window.Handle)) {
             throw "Could not send WM_CLOSE to the SysX monitor."

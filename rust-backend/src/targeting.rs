@@ -32,24 +32,34 @@ pub fn fov_radius_px(width: u32, height: u32, degrees: u16) -> f32 {
     ((FOV_REFERENCE_PX - 1.0) * f32::from(degrees) / 720.0).min(limit)
 }
 
+pub(crate) fn fov_row_bounds(height: u32, radius: f32) -> (u32, u32) {
+    let center = height as f32 / 2.0;
+    let limit = i64::from(height);
+    let first = ((center - radius - 0.5).ceil() as i64).clamp(0, limit) as u32;
+    let end = ((center + radius - 0.5).floor() as i64 + 1).clamp(0, limit) as u32;
+    (first, end)
+}
+
 pub fn highest_pixel_in_fov(
     mask: &[u8],
     width: u32,
     height: u32,
     degrees: u16,
 ) -> Option<FrameCoordinate> {
-    highest_pixel_in_fov_within(mask, width, height, degrees, [0, 0, width, height])
+    highest_pixel_in_fov_within(mask, width, height, degrees, [0, 0, width, height], None)
 }
 
 /// Topmost mask pixel inside both the FOV circle and `region`
 /// (`[left, top, right, bottom)` in mask pixels, right/bottom exclusive).
-/// Ties on a row go to the pixel closest to the horizontal center.
+/// Ties on a row go to the pixel closest to `preferred_x`, or the horizontal
+/// center when no tracked position is available.
 pub fn highest_pixel_in_fov_within(
     mask: &[u8],
     width: u32,
     height: u32,
     degrees: u16,
     region: [u32; 4],
+    preferred_x: Option<f32>,
 ) -> Option<FrameCoordinate> {
     if width == 0
         || height == 0
@@ -66,22 +76,48 @@ pub fn highest_pixel_in_fov_within(
     ];
     let cx = width as f32 / 2.0;
     let cy = height as f32 / 2.0;
+    let preferred_x = preferred_x.filter(|x| x.is_finite()).unwrap_or(cx);
     let radius = fov_radius_px(width, height, degrees);
-    for y in top..bottom {
+    let radius_squared = radius * radius;
+    let (fov_top, fov_bottom) = fov_row_bounds(height, radius);
+    for y in top.max(fov_top)..bottom.min(fov_bottom) {
         let py = y as f32 + 0.5;
+        let dy = py - cy;
+        let dy_squared = dy * dy;
+        if dy_squared > radius_squared {
+            continue;
+        }
+        let half_width = (radius_squared - dy_squared).max(0.0).sqrt();
+        let row_left = ((cx - half_width - 0.5).floor() as i64)
+            .max(left as i64)
+            .max(0) as u32;
+        let row_right = ((cx + half_width - 0.5).ceil() as i64 + 1)
+            .min(right as i64)
+            .min(width as i64)
+            .max(0) as u32;
         let mut best_x: Option<u32> = None;
-        for x in left..right {
-            if mask[(y * width + x) as usize] == 0 {
-                continue;
+        let mut best_distance_squared = f32::INFINITY;
+        for x in row_left..row_right {
+            if mask[(y * width + x) as usize] != 0 {
+                let px = x as f32 + 0.5;
+                let dx = px - cx;
+                if dx * dx + dy_squared <= radius_squared {
+                    let anchor_delta = px - preferred_x;
+                    let distance_squared = anchor_delta * anchor_delta;
+                    if distance_squared < best_distance_squared {
+                        best_x = Some(x);
+                        best_distance_squared = distance_squared;
+                    }
+                }
             }
-            let px = x as f32 + 0.5;
-            let dx = px - cx;
-            let dy = py - cy;
-            if dx * dx + dy * dy <= radius * radius
-                && best_x
-                    .is_none_or(|best| (x as f32 + 0.5 - cx).abs() < (best as f32 + 0.5 - cx).abs())
-            {
-                best_x = Some(x);
+            // Stop only after the scan has passed the best hit's distance;
+            // the first pixel past the anchor can still be closer than a far-left hit.
+            if best_x.is_some() {
+                let pixel_x = x as f32 + 0.5;
+                let anchor_delta = pixel_x - preferred_x;
+                if pixel_x >= preferred_x && anchor_delta * anchor_delta >= best_distance_squared {
+                    break;
+                }
             }
         }
         if let Some(x) = best_x {
@@ -296,6 +332,54 @@ impl ExponentialTargetSmoother {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fov_scan_keeps_in_circle_edge_pixels_and_rejects_outer_pixels() {
+        let mut mask = vec![0; 100 * 100];
+        mask[50 * 100 + 81] = 1;
+        mask[81 * 100 + 50] = 1;
+        mask[18 * 100 + 50] = 1;
+        assert_eq!(
+            highest_pixel_in_fov(&mask, 100, 100, 36),
+            Some(FrameCoordinate { x: 50.5, y: 18.5 })
+        );
+
+        let mut outside = vec![0; 100 * 100];
+        outside[50 * 100 + 82] = 1;
+        outside[82 * 100 + 50] = 1;
+        outside[17 * 100 + 50] = 1;
+        assert_eq!(highest_pixel_in_fov(&outside, 100, 100, 36), None);
+    }
+
+    #[test]
+    fn preferred_x_scan_stops_at_the_nearest_hit_and_keeps_left_ties() {
+        let mut mask = vec![0; 100 * 100];
+        mask[50 * 100 + 40] = 1;
+        mask[50 * 100 + 49] = 1;
+        mask[50 * 100 + 50] = 1;
+        mask[50 * 100 + 60] = 1;
+
+        assert_eq!(
+            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(60.5)),
+            Some(FrameCoordinate { x: 60.5, y: 50.5 })
+        );
+        assert_eq!(
+            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(50.0)),
+            Some(FrameCoordinate { x: 49.5, y: 50.5 })
+        );
+    }
+
+    #[test]
+    fn preferred_x_scan_keeps_searching_for_a_closer_hit_to_the_right() {
+        let mut mask = vec![0; 100 * 100];
+        mask[50 * 100 + 40] = 1;
+        mask[50 * 100 + 56] = 1;
+
+        assert_eq!(
+            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(55.5)),
+            Some(FrameCoordinate { x: 56.5, y: 50.5 })
+        );
+    }
 
     fn candidate(class_id: u32, bbox_xyxy: [f32; 4]) -> TargetCandidate {
         TargetCandidate {

@@ -12,7 +12,6 @@ use crate::receiver::UdpDecodedFrameSource;
 use crate::results::DetectionMode;
 use crate::targeting::SmoothingRange;
 use crate::udp::ReassemblyStats;
-use crate::web_config;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -22,18 +21,24 @@ use axum::Router;
 use image::codecs::jpeg::JpegEncoder;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
 const UDP_RETRY: Duration = Duration::from_secs(3);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+fn emit_stdout_line(line: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
 
 /// Serialize control changes and target samples on the same stdout channel.
 /// Controls have no fresh target; a revision also cancels pending actions when
@@ -89,46 +94,40 @@ impl AutoEvents {
 }
 
 /// Held-Auto-trigger summary for the diagnostics log, at most one line every
-/// two seconds: whether frames arrive and how often the target is on center.
+/// two seconds: whether frames arrive and how often center validity is observed.
 #[derive(Default)]
 struct AutoSummary {
     started: Option<Instant>,
     frames: u32,
-    on_center: u32,
+    center_valid_frames: u32,
 }
 
 impl AutoSummary {
-    fn add(
-        &mut self,
-        active: bool,
-        on_center: bool,
-        fov_degrees: u16,
-        crosshair_px: f32,
-    ) -> Option<String> {
+    fn add(&mut self, active: bool, center_valid: bool, fov_degrees: u16) -> Option<String> {
         if !active {
             // Trigger released: report what was gathered, if worth a line.
             let line = self
                 .started
                 .filter(|started| started.elapsed() >= Duration::from_millis(250))
-                .and_then(|_| self.take(fov_degrees, crosshair_px));
+                .and_then(|_| self.take(fov_degrees));
             *self = Self::default();
             return line;
         }
         let started = *self.started.get_or_insert_with(Instant::now);
         self.frames += 1;
-        self.on_center += u32::from(on_center);
+        self.center_valid_frames += u32::from(center_valid);
         (started.elapsed() >= Duration::from_secs(2))
-            .then(|| self.take(fov_degrees, crosshair_px))
+            .then(|| self.take(fov_degrees))
             .flatten()
     }
 
-    fn take(&mut self, fov_degrees: u16, crosshair_px: f32) -> Option<String> {
+    fn take(&mut self, fov_degrees: u16) -> Option<String> {
         let seconds = self.started?.elapsed().as_secs_f64().max(1e-3);
         let line = format!(
-            "auto held {seconds:.1} s: {} frames ({:.0}/s), target on center in {} (Auto FOV {fov_degrees}°, crosshair {crosshair_px:.0} px)",
+            "auto held {seconds:.1} s: {} frames ({:.0}/s), center-valid frames {} (Auto FOV {fov_degrees}°)",
             self.frames,
             f64::from(self.frames) / seconds,
-            self.on_center,
+            self.center_valid_frames,
         );
         *self = Self::default();
         Some(line)
@@ -237,14 +236,11 @@ pub struct ReceiverService {
     reader: Mutex<Option<JoinHandle<()>>>,
     session_id: String,
     /// Latest Medius status reported by the native host
-    /// (`device_status` command); forwarded to the monitor page in `state`.
+    /// (`device_status` command); forwarded to the native monitor in `state`.
     device: Arc<Mutex<Value>>,
     auto_events: Arc<Mutex<AutoEvents>>,
     /// Open `role=monitor` WebSocket clients.
     monitor_clients: AtomicUsize,
-    /// Open configuration WebSocket clients keep the backend/config server
-    /// alive after the monitor window is closed.
-    config_clients: AtomicUsize,
     /// Published-at timestamp of the newest processed frame; changes once per
     /// frame so each preview socket forwards every input frame.
     preview_rx: tokio::sync::watch::Receiver<u64>,
@@ -257,7 +253,19 @@ impl ReceiverService {
             return Err("IPC token must contain at least 32 characters".into());
         }
         std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
-        crate::pixel_seek::warm_profile_luts();
+        let lut_warmer = match thread::Builder::new()
+            .name("sysx-pixel-lut-warmup".into())
+            .spawn(crate::pixel_seek::warm_profile_luts)
+        {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                crate::diagnostics::record(&format!(
+                    "Pixel Seek warmup thread unavailable; warming inline: {error}"
+                ));
+                crate::pixel_seek::warm_profile_luts();
+                None
+            }
+        };
         let settings_path = data_dir.join("app-settings.json");
         let had_settings = settings_path.is_file();
         let mut settings_value = load_settings(&settings_path);
@@ -318,6 +326,7 @@ impl ReceiverService {
             fov_degrees: app.fov_degrees,
             auto_fov_degrees: app.auto.fov_degrees,
             auto_target_active: false,
+            target_lock_active: app.motion_enabled && app.motion_always_on,
             auto_aim: false,
             auto_config_revision: 0,
             color_filter: app.color_filter,
@@ -327,16 +336,23 @@ impl ReceiverService {
             model_backend: app.model_backend.clone(),
             compute_target: app.compute_target.clone(),
         };
-        let movement_batcher = Arc::new(MovementBatcher::new(Arc::new(|event| {
-            if let Ok(line) = serde_json::to_string(&event) {
-                println!("{line}");
-            }
-        })));
+        let movement_batcher = Arc::new(
+            MovementBatcher::new(Arc::new(|event| {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    emit_stdout_line(&line);
+                }
+            }))
+            .map_err(|error| format!("could not start movement batcher: {error}"))?,
+        );
         let device = Arc::new(Mutex::new(missing_device()));
         let auto_events = Arc::new(Mutex::new(AutoEvents {
             settings: routed_auto_settings(&app),
             revision: 0,
-            emit: Arc::new(|event| println!("{event}")),
+            emit: Arc::new(|event| {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    emit_stdout_line(&line);
+                }
+            }),
         }));
         let motion_renderer = Arc::new(Mutex::new(crate::movement::abcurves::ProfileCache::new(
             &app.motion_renderer,
@@ -346,31 +362,34 @@ impl ReceiverService {
         let ticker_device = Arc::clone(&device);
         let ticker_auto = Arc::clone(&auto_events);
         let ticker_batcher = Arc::clone(&movement_batcher);
-        let movement_ticker = Arc::new(MovementTicker::new(
-            app.sens,
-            Arc::new(move || {
-                let settings = ticker_settings.lock().ok()?;
-                let device = ticker_device.lock().ok()?;
-                let renderer_profile = ticker_renderer.lock().ok()?.profile.clone();
-                let config_revision = ticker_auto.lock().ok()?.revision;
-                Some(movement_runtime(
-                    &settings,
-                    &device,
-                    renderer_profile,
-                    config_revision,
-                ))
-            }),
-            Arc::new(move |event| {
-                // Auto's aim move goes out at once, not after the 4 ms batch.
-                if event.flick && (event.dx != 0 || event.dy != 0) {
-                    if let Ok(line) = serde_json::to_string(&event) {
-                        println!("{line}");
+        let movement_ticker = Arc::new(
+            MovementTicker::new(
+                app.sens,
+                Arc::new(move || {
+                    let settings = ticker_settings.lock().ok()?;
+                    let device = ticker_device.lock().ok()?;
+                    let renderer_profile = ticker_renderer.lock().ok()?.profile.clone();
+                    let config_revision = ticker_auto.lock().ok()?.revision;
+                    Some(movement_runtime(
+                        &settings,
+                        &device,
+                        renderer_profile,
+                        config_revision,
+                    ))
+                }),
+                Arc::new(move |event| {
+                    // Auto's aim move goes out at once, not after the 4 ms batch.
+                    if event.flick && (event.dx != 0 || event.dy != 0) {
+                        if let Ok(line) = serde_json::to_string(&event) {
+                            emit_stdout_line(&line);
+                        }
+                    } else {
+                        ticker_batcher.submit(event);
                     }
-                } else {
-                    ticker_batcher.submit(event);
-                }
-            }),
-        ));
+                }),
+            )
+            .map_err(|error| format!("could not start movement ticker: {error}"))?,
+        );
         let callback_ticker = Arc::clone(&movement_ticker);
         let callback_settings = Arc::clone(&settings);
         let callback_device = Arc::clone(&device);
@@ -412,27 +431,27 @@ impl ReceiverService {
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     // Aim mode fires once its move reached the locked target.
-                    let on_center = auto_active
+                    let target_valid = auto_active
                         && if settings.auto.aims() {
                             callback_ticker.flick_done()
                         } else {
                             processed.result.auto_target_valid
                         };
-                    events.target(processed.auto_config_revision, on_center);
+                    events.target(processed.auto_config_revision, target_valid);
                     if let Ok(mut summary) = auto_summary.lock() {
-                        if let Some(line) = summary.add(
-                            auto_active,
-                            on_center,
-                            settings.auto.fov_degrees,
-                            processed.crosshair_px,
-                        ) {
+                        if let Some(line) =
+                            summary.add(auto_active, target_valid, settings.auto.fov_degrees)
+                        {
                             crate::diagnostics::record(&line);
                         }
                     }
                 }
             }
         });
-        let pipeline = Arc::new(LatestFramePipeline::new(config, Some(callback)));
+        let pipeline = Arc::new(
+            LatestFramePipeline::new(config, Some(callback))
+                .map_err(|error| format!("could not start frame processing worker: {error}"))?,
+        );
         let source_times = Arc::new(Mutex::new(VecDeque::with_capacity(720)));
         let decoder = {
             let (times, pipeline) = (Arc::clone(&source_times), Arc::clone(&pipeline));
@@ -448,6 +467,7 @@ impl ReceiverService {
                     let _ = pipeline.submit(frame);
                 }),
             )
+            .map_err(|error| format!("could not start JPEG decoder pool: {error}"))?
         };
         let mut initial_source = UdpDecodedFrameSource::new(
             "0.0.0.0",
@@ -490,22 +510,33 @@ impl ReceiverService {
             device,
             auto_events,
             monitor_clients: AtomicUsize::new(0),
-            config_clients: AtomicUsize::new(0),
             preview_rx,
         });
-        Self::start_reader(&service);
+        if let Some(worker) = lut_warmer {
+            worker
+                .join()
+                .map_err(|_| "Pixel Seek lookup warmup thread panicked".to_owned())?;
+        }
+        Self::start_reader(&service).map_err(|error| error.to_string())?;
         Ok(service)
     }
 
-    fn start_reader(service: &Arc<Self>) {
+    fn start_reader(service: &Arc<Self>) -> std::io::Result<()> {
         let weak = Arc::downgrade(service);
         let thread = thread::Builder::new()
             .name("sysx-udp-receiver".into())
-            .spawn(move || receiver_loop(weak))
-            .expect("UDP receiver thread");
-        if let Ok(mut slot) = service.reader.lock() {
-            *slot = Some(thread);
+            .spawn(move || receiver_supervisor(weak))?;
+        match service.reader.lock() {
+            Ok(mut slot) => *slot = Some(thread),
+            Err(_) => {
+                service.stop.store(true, Ordering::Release);
+                let _ = thread.join();
+                return Err(std::io::Error::other(
+                    "receiver thread handle lock poisoned",
+                ));
+            }
         }
+        Ok(())
     }
 
     pub fn state(&self) -> Value {
@@ -578,7 +609,7 @@ impl ReceiverService {
             "motion_capture":capture_request,"motion_capture_count":capture_count,"motion_capture_message":capture_message,
             "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
-            "smooth_fov_degrees":settings.smooth_fov_degrees, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
+            "smooth_fov_degrees":settings.smooth_fov_degrees, "motion_no_deadzone":settings.motion_no_deadzone, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "auto":settings.auto,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
@@ -597,7 +628,6 @@ impl ReceiverService {
             "processing_fps":stats.processing_fps, "source_fps":source_fps, "port":source_port, "last_error":last_error,
             "device":device,
             "monitor_clients":self.monitor_clients.load(Ordering::Relaxed),
-            "config_clients":self.config_clients.load(Ordering::Relaxed)
         })
     }
 
@@ -615,15 +645,23 @@ impl ReceiverService {
     fn source_fps(&self) -> Option<f64> {
         let now = monotonic_ns();
         let times = self.source_times.lock().ok()?;
-        let recent: Vec<_> = times
+        let (mut first, mut last, mut count) = (None, None, 0usize);
+        for stamp in times
             .iter()
             .copied()
             .filter(|stamp| now.saturating_sub(*stamp) <= 1_000_000_000)
-            .collect();
-        if recent.len() < 2 || recent.last()? <= recent.first()? {
+        {
+            first.get_or_insert(stamp);
+            last = Some(stamp);
+            count += 1;
+        }
+        let (Some(first), Some(last)) = (first, last) else {
+            return None;
+        };
+        if count < 2 || last <= first {
             return None;
         }
-        Some((recent.len() - 1) as f64 * 1e9 / (recent.last()? - recent.first()?) as f64)
+        Some((count - 1) as f64 * 1e9 / (last - first) as f64)
     }
 
     fn record_error(&self, message: String) {
@@ -689,6 +727,23 @@ impl ReceiverService {
         Ok(())
     }
 
+    fn prepare_udp_source(
+        &self,
+        port: u16,
+        crop_resolution: u32,
+    ) -> Result<Option<UdpDecodedFrameSource>, String> {
+        let source = lock_source(&self.source);
+        if source.active_port == port && source.active.is_some() {
+            return Ok(None);
+        }
+        drop(source);
+        let mut candidate =
+            UdpDecodedFrameSource::new("0.0.0.0", port).map_err(|error| error.to_string())?;
+        candidate.set_crop_resolution(crop_resolution);
+        candidate.open().map_err(|error| error.to_string())?;
+        Ok(Some(candidate))
+    }
+
     fn pipeline_config(&self, settings: &AppSettings) -> Result<PipelineConfig, String> {
         let strategy = match settings.strategy.as_str() {
             "pixel_seek" => DetectionMode::PixelSeek,
@@ -702,6 +757,7 @@ impl ReceiverService {
             .clone();
         let (_, pixel_color_name, auto_target_active) =
             effective_detection_settings(settings, &device);
+        let target_lock_active = auto_target_active || motion_target_active(settings, &device);
         let pixel_color =
             PixelTargetColor::parse(&pixel_color_name).ok_or("invalid Pixel Seek color")?;
         let model = {
@@ -721,6 +777,7 @@ impl ReceiverService {
             fov_degrees: settings.fov_degrees,
             auto_fov_degrees: settings.auto.fov_degrees,
             auto_target_active,
+            target_lock_active,
             auto_aim: auto_target_active && settings.auto.aims(),
             auto_config_revision: 0, // filled atomically by reconfigure()
             color_filter: settings.color_filter,
@@ -760,6 +817,20 @@ impl ReceiverService {
             .lock()
             .map_err(|_| "Motion renderer lock poisoned")?
             .configure(&settings.motion_renderer)?;
+        let mut config = self.pipeline_config(&settings)?;
+        config.auto_config_revision = revision;
+        self.pipeline.configure(config).map_err(str::to_owned)
+    }
+
+    fn reconfigure_pipeline(&self) -> Result<(), String> {
+        let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        let mut events = self
+            .auto_events
+            .lock()
+            .map_err(|_| "Auto event lock poisoned")?;
+        events.reconfigure(&routed_auto_settings(&settings));
+        let revision = events.revision;
+        drop(events);
         let mut config = self.pipeline_config(&settings)?;
         config.auto_config_revision = revision;
         self.pipeline.configure(config).map_err(str::to_owned)
@@ -833,6 +904,69 @@ impl ReceiverService {
             .ok_or("command type is required")?;
         match kind {
             "state" => Ok(self.state()),
+            "get_app_settings" => Ok(json!({
+                "event":"app_settings",
+                "settings":*self.settings.lock().map_err(|_| "settings lock poisoned")?
+            })),
+            "apply_app_settings" => {
+                let mut settings: AppSettings = serde_json::from_value(
+                    command
+                        .get("settings")
+                        .cloned()
+                        .ok_or("app settings are required")?,
+                )
+                .map_err(|_| "Invalid app settings")?;
+                if settings.profiles.is_empty() {
+                    settings.profiles = self
+                        .settings
+                        .lock()
+                        .map_err(|_| "settings lock poisoned")?
+                        .profiles
+                        .clone();
+                }
+                settings.sync_active_profile();
+                settings.validate().map_err(|error| error.to_string())?;
+                let port = settings
+                    .port
+                    .parse::<u16>()
+                    .map_err(|_| "UDP port must be 1..65535")?;
+                let candidate = self.prepare_udp_source(port, settings.crop_resolution)?;
+                let renderer =
+                    crate::movement::abcurves::ProfileCache::new(&settings.motion_renderer)?;
+                {
+                    // Keep the source stable from validation through persistence and install.
+                    // This uses the same source -> settings lock order as set_udp_port.
+                    let mut source = lock_source(&self.source);
+                    let mut current = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                    if candidate.is_none()
+                        && (source.active_port != port || source.active.is_none())
+                    {
+                        return Err(
+                            "UDP source changed while applying settings; retry Apply Changes."
+                                .into(),
+                        );
+                    }
+                    let mut current_renderer = self
+                        .motion_renderer
+                        .lock()
+                        .map_err(|_| "Motion renderer lock poisoned")?;
+                    save_settings(&self.settings_path, &settings)
+                        .map_err(|error| error.to_string())?;
+                    *current_renderer = renderer;
+                    *current = settings;
+                    if let Some(candidate) = candidate {
+                        source.active = Some(candidate);
+                        source.active_port = port;
+                    }
+                    source.pending_port = None;
+                    source.last_error = None;
+                    if let Ok(mut view) = self.source_view.lock() {
+                        *view = SourceView::of(&source);
+                    }
+                }
+                self.reconfigure()?;
+                Ok(json!({"event":"ack","type":kind,"state":self.state()}))
+            }
             "device_status" => {
                 let device = parse_device_status(&command)?;
                 let settings = self
@@ -853,6 +987,8 @@ impl ReceiverService {
                 }
                 let previous_auto = auto_trigger_active(&settings.auto, &previous);
                 let next_auto = auto_trigger_active(&settings.auto, &device);
+                let previous_motion = motion_target_active(&settings, &previous);
+                let next_motion = motion_target_active(&settings, &device);
                 let middle_pressed =
                     !trigger_held(&previous, "middle") && trigger_held(&device, "middle");
                 *self.device.lock().map_err(|_| "device lock poisoned")? = device;
@@ -861,6 +997,10 @@ impl ReceiverService {
                 }
                 if previous_auto != next_auto {
                     self.reconfigure()?;
+                } else if previous_motion != next_motion && !next_auto {
+                    // Advance the shared routing revision so queued Motion
+                    // deltas from before the physical trigger edge are dropped.
+                    self.reconfigure_pipeline()?;
                 }
                 Ok(json!({"event":"ack","type":kind}))
             }
@@ -1122,6 +1262,9 @@ impl ReceiverService {
                 settings.motion_speed_x = x;
                 settings.motion_speed_y = y;
                 settings.smooth_fov_degrees = fov;
+                if let Some(enabled) = command.get("no_deadzone").and_then(Value::as_bool) {
+                    settings.motion_no_deadzone = enabled;
+                }
                 drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
@@ -1149,8 +1292,8 @@ impl ReceiverService {
                     .get("resolution")
                     .and_then(Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok())
-                    .filter(|v| (1..=8192).contains(v))
-                    .ok_or("crop resolution must be 1..8192")?;
+                    .filter(|v| (1..=sysx_ui::protocol::MAX_CROP_RESOLUTION).contains(v))
+                    .ok_or("crop resolution exceeds the receiver's frame limit")?;
                 self.settings
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
@@ -1168,7 +1311,10 @@ impl ReceiverService {
                     .get("mode")
                     .and_then(Value::as_str)
                     .ok_or("detection strategy is required")?;
-                if !["pixel_seek", "object_detection"].contains(&mode) {
+                if mode == "object_detection" {
+                    return Err("Object Detection is not available".into());
+                }
+                if mode != "pixel_seek" {
                     return Err("invalid detection strategy".into());
                 }
                 self.settings
@@ -1376,17 +1522,67 @@ impl ReceiverService {
                 let _ = thread.join();
             }
         }
-        if let Ok(mut source) = self.source.lock() {
-            if let Some(active) = source.active.as_mut() {
-                active.close();
-            }
+        let mut source = lock_source(&self.source);
+        if let Some(active) = source.active.as_mut() {
+            active.close();
         }
+        drop(source);
         if !self.pipeline.close(Duration::from_secs(3)) {
             self.record_error("frame pipeline did not stop within three seconds".into());
         }
         let _ = self.movement_ticker.close(Duration::from_secs(1));
         let _ = self.movement_batcher.close(Duration::from_secs(1));
     }
+}
+
+fn receiver_supervisor(service: Weak<ReceiverService>) {
+    loop {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver_loop(service.clone())
+        }));
+        let Err(panic) = result else { return };
+        let Some(receiver) = service.upgrade() else {
+            return;
+        };
+        if receiver.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let detail = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        let message = format!("UDP receive worker recovered from panic: {detail}");
+        {
+            let mut source = lock_source(&receiver.source);
+            reset_source_after_failure(&mut source, Instant::now(), message.clone());
+            if let Ok(mut view) = receiver.source_view.lock() {
+                *view = SourceView::of(&source);
+            }
+        }
+        crate::diagnostics::record(&message);
+        receiver.record_error(message);
+        drop(receiver);
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn lock_source(source: &Mutex<SourceState>) -> MutexGuard<'_, SourceState> {
+    match source.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let guard = error.into_inner();
+            source.clear_poison();
+            guard
+        }
+    }
+}
+
+fn reset_source_after_failure(source: &mut SourceState, now: Instant, message: String) {
+    source.active = None;
+    source.pending_port = Some(source.active_port);
+    source.retry_at = now + UDP_RETRY;
+    source.last_error = Some(message);
 }
 
 fn receiver_loop(service: Weak<ReceiverService>) {
@@ -1397,11 +1593,12 @@ fn receiver_loop(service: Weak<ReceiverService>) {
         if service.stop.load(Ordering::Acquire) {
             return;
         }
-        let retry = service.source.lock().ok().and_then(|state| {
+        let retry = {
+            let state = lock_source(&service.source);
             state
                 .pending_port
                 .filter(|_| Instant::now() >= state.retry_at)
-        });
+        };
         if let Some(port) = retry {
             let crop_resolution = service
                 .settings
@@ -1416,33 +1613,31 @@ fn receiver_loop(service: Weak<ReceiverService>) {
             });
             match candidate {
                 Ok(candidate) => {
-                    if let Ok(mut state) = service.source.lock() {
-                        if state.pending_port == Some(port) && !service.stop.load(Ordering::Acquire)
-                        {
-                            state.active = Some(candidate);
-                            state.active_port = port;
-                            state.pending_port = None;
-                            state.last_error = None;
-                            if let Ok(mut view) = service.source_view.lock() {
-                                *view = SourceView::of(&state);
-                            }
-                            if let Ok(mut settings) = service.settings.lock() {
-                                settings.port = port.to_string();
-                            }
+                    let mut state = lock_source(&service.source);
+                    if state.pending_port == Some(port) && !service.stop.load(Ordering::Acquire) {
+                        state.active = Some(candidate);
+                        state.active_port = port;
+                        state.pending_port = None;
+                        state.last_error = None;
+                        if let Ok(mut view) = service.source_view.lock() {
+                            *view = SourceView::of(&state);
+                        }
+                        if let Ok(mut settings) = service.settings.lock() {
+                            settings.port = port.to_string();
                         }
                     }
                 }
                 Err(error) => {
-                    if let Ok(mut state) = service.source.lock() {
-                        state.last_error = Some(error.to_string());
-                        state.retry_at = Instant::now() + UDP_RETRY;
-                    }
+                    let mut state = lock_source(&service.source);
+                    state.last_error = Some(error.to_string());
+                    state.retry_at = Instant::now() + UDP_RETRY;
                 }
             }
         }
-        let read = service.source.lock().ok().map(|mut state| {
+        let read = {
+            let mut state = lock_source(&service.source);
             let result = if let Some(source) = state.active.as_mut() {
-                source.read_encoded(Duration::from_millis(100))
+                catch_receiver_panic(|| source.read_encoded(Duration::from_millis(100)))
             } else {
                 Ok(None)
             };
@@ -1452,57 +1647,64 @@ fn receiver_loop(service: Weak<ReceiverService>) {
                 *view = SourceView::of(&state);
             }
             result
-        });
+        };
         match read {
-            Some(Ok(Some(frame))) => service.decoder.submit(frame, Instant::now()),
-            Some(Ok(None)) => thread::sleep(Duration::from_millis(5)),
-            Some(Err(error)) => {
+            Ok(Some(frame)) => service.decoder.submit(frame, Instant::now()),
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
                 let message = error.to_string();
-                if let Ok(mut source) = service.source.lock() {
-                    source.active = None;
-                    source.pending_port = Some(source.active_port);
-                    source.retry_at = Instant::now() + UDP_RETRY;
-                    source.last_error = Some(message.clone());
-                    if let Ok(mut view) = service.source_view.lock() {
-                        *view = SourceView::of(&source);
-                    }
+                let mut source = lock_source(&service.source);
+                reset_source_after_failure(&mut source, Instant::now(), message.clone());
+                if let Ok(mut view) = service.source_view.lock() {
+                    *view = SourceView::of(&source);
                 }
                 service.record_error(message);
             }
-            None => thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+fn catch_receiver_panic<T>(
+    run: impl FnOnce() -> Result<T, crate::receiver::ReceiverError>,
+) -> Result<T, crate::receiver::ReceiverError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        Err(crate::receiver::ReceiverError::Io(std::io::Error::other(
+            format!("UDP receive worker recovered from panic: {message}"),
+        )))
+    })
 }
 
 #[derive(Clone)]
 struct WebSocketState {
     service: Arc<ReceiverService>,
     token: String,
-    config_port: Option<u16>,
 }
 
 #[derive(serde::Deserialize)]
 struct WsQuery {
     token: String,
-    /// `monitor` (counted, receives preview frames), `host` (native host: state
-    /// only, no preview frames), or absent (config page: frames + state).
+    /// `monitor` receives preview frames; `host` is the native app client.
     #[serde(default)]
     role: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClientRole {
     Monitor,
     Host,
-    Config,
 }
 
 impl ClientRole {
-    fn parse(role: Option<&str>) -> Self {
+    fn parse(role: Option<&str>) -> Option<Self> {
         match role {
-            Some("monitor") => Self::Monitor,
-            Some("host") => Self::Host,
-            _ => Self::Config,
+            Some("monitor") => Some(Self::Monitor),
+            Some("host") => Some(Self::Host),
+            _ => None,
         }
     }
 }
@@ -1516,14 +1718,6 @@ impl Drop for MonitorGuard {
     }
 }
 
-struct ConfigGuard(Arc<ReceiverService>);
-
-impl Drop for ConfigGuard {
-    fn drop(&mut self) {
-        self.0.config_clients.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 async fn websocket_route(
     State(state): State<WebSocketState>,
     Query(query): Query<WsQuery>,
@@ -1532,11 +1726,13 @@ async fn websocket_route(
 ) -> Response {
     let token_ok = token_matches(&state.token, &query.token);
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let allowed_origin = origin_allowed(origin, state.config_port);
+    let allowed_origin = origin_allowed(origin);
     if !token_ok || !allowed_origin {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let role = ClientRole::parse(query.role.as_deref());
+    let Some(role) = ClientRole::parse(query.role.as_deref()) else {
+        return (StatusCode::BAD_REQUEST, "unsupported client role").into_response();
+    };
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
@@ -1555,7 +1751,7 @@ fn token_matches(expected: &str, supplied: &str) -> bool {
     expected.as_bytes().ct_eq(supplied.as_bytes()).unwrap_u8() == 1
 }
 
-fn origin_allowed(origin: Option<&str>, config_port: Option<u16>) -> bool {
+fn origin_allowed(origin: Option<&str>) -> bool {
     origin.is_none_or(|origin| {
         [
             "tauri://localhost",
@@ -1563,10 +1759,6 @@ fn origin_allowed(origin: Option<&str>, config_port: Option<u16>) -> bool {
             "http://127.0.0.1:1420",
         ]
         .contains(&origin)
-            || config_port.is_some_and(|port| {
-                origin == format!("http://127.0.0.1:{port}")
-                    || origin == format!("http://localhost:{port}")
-            })
     })
 }
 
@@ -1574,10 +1766,6 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
     let _monitor = (role == ClientRole::Monitor).then(|| {
         service.monitor_clients.fetch_add(1, Ordering::Relaxed);
         MonitorGuard(Arc::clone(&service))
-    });
-    let _config = (role == ClientRole::Config).then(|| {
-        service.config_clients.fetch_add(1, Ordering::Relaxed);
-        ConfigGuard(Arc::clone(&service))
     });
     let initial_state = service.state();
     if send_text(&mut socket, initial_state.clone()).await.is_err() {
@@ -1627,8 +1815,7 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
                 attach_request_id(&mut event, request_id);
                 if send_text(&mut socket, event).await.is_err() { break; }
             }
-            // Only the monitor shows Preview; the config page just edits and
-            // saves settings, so it gets state but never frames.
+            // Only the native monitor receives Preview; the host receives state only.
             changed = preview_rx.changed(), if role == ClientRole::Monitor => {
                 if changed.is_err() { break; }
                 if let Some(processed) = service.pipeline.latest() {
@@ -1642,9 +1829,9 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
                     }
                 }
             }
-            // Settings are applied by another authenticated WebSocket client (the
-            // browser config page). Keep every connected receiver client in sync
-            // even while the frame stream is busy sending binary preview data.
+            // Settings are applied by the authenticated native host client.
+            // Keep connected receiver clients in sync even while the frame
+            // stream is busy sending binary preview data.
             _ = state_ticker.tick() => {
                 let state = service.state();
                 if state != last_state {
@@ -1688,6 +1875,7 @@ fn movement_runtime(
             speed_x: auto.speed_x,
             speed_y: auto.speed_y,
             smooth_fov_degrees: auto.smooth_fov_degrees,
+            no_deadzone: false,
             trigger_button: auto.trigger_button.clone(),
             recoil: settings.recoil.clone(),
         };
@@ -1705,6 +1893,7 @@ fn movement_runtime(
         speed_x: settings.motion_speed_x,
         speed_y: settings.motion_speed_y,
         smooth_fov_degrees: settings.smooth_fov_degrees,
+        no_deadzone: settings.motion_no_deadzone,
         trigger_button: settings.trigger_button.clone(),
         recoil: settings.recoil.clone(),
     }
@@ -1712,6 +1901,11 @@ fn movement_runtime(
 
 fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bool {
     auto.enabled && trigger_held(device, &auto.trigger_button)
+}
+
+fn motion_target_active(settings: &AppSettings, device: &Value) -> bool {
+    settings.motion_enabled
+        && (settings.motion_always_on || trigger_held(device, &settings.trigger_button))
 }
 
 // Always-on owns routing and must also cancel a delayed Auto click without
@@ -1802,8 +1996,7 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
     // Color filter: the mask applied before processing, one bit per pixel,
     // sent between the metadata and the original JPEG; Preview blacks out the
     // same pixels, so it shows exactly the image Motion/Auto processed.
-    let mask = processed.mask.as_deref().map(crate::pixel_seek::pack_mask);
-    let color_mask = mask.as_ref().map(|bits| {
+    let color_mask = processed.mask.as_ref().map(|bits| {
         json!({"width":processed.result.processed_width, "height":processed.result.processed_height, "bytes":bits.len()})
     });
     let metadata = json!({
@@ -1817,7 +2010,7 @@ fn encode_frame(service: &ReceiverService, processed: &ProcessedFrame) -> Result
     });
     let bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
     let size = u32::try_from(bytes.len()).map_err(|_| "frame metadata too large")?;
-    let mask = mask.unwrap_or_default();
+    let mask = processed.mask.as_deref().unwrap_or_default();
     let mut output = Vec::with_capacity(4 + bytes.len() + mask.len() + jpeg.len());
     output.extend_from_slice(&size.to_be_bytes());
     output.extend_from_slice(&bytes);
@@ -1842,14 +2035,12 @@ pub async fn serve(
     data_dir: PathBuf,
     host: String,
     ws_port: u16,
-    config_root: Option<PathBuf>,
-    config_port: u16,
     udp_port: u16,
 ) -> Result<(), String> {
     if !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
         return Err("desktop IPC server must bind to loopback only".into());
     }
-    let service = ReceiverService::new(token.clone(), data_dir.clone(), udp_port)?;
+    let service = ReceiverService::new(token.clone(), data_dir, udp_port)?;
     let listener = TcpListener::bind((host.as_str(), ws_port))
         .await
         .map_err(|error| error.to_string())?;
@@ -1857,47 +2048,33 @@ pub async fn serve(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let (config_actual_port, config_task, config_error) = if let Some(root) = config_root {
-        match web_config::start(root, data_dir, token.clone(), actual_port, config_port).await {
-            Ok((port, task)) => (Some(port), Some(task), None),
-            Err(error) => (
-                None,
-                None,
-                Some(format!("Local configuration page could not start: {error}")),
-            ),
-        }
-    } else {
-        (None, None, None)
-    };
     let web_state = WebSocketState {
         service: Arc::clone(&service),
         token,
-        config_port: config_actual_port,
     };
     let app = Router::new()
         .route("/receiver", get(websocket_route))
         .with_state(web_state);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let ws_task: TokioJoinHandle<Result<(), std::io::Error>> = tokio::spawn(async move {
+    let mut ws_task: TokioJoinHandle<Result<(), std::io::Error>> = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
             .await
     });
-    println!(
-        "{}",
-        json!({"event":"ready","port":actual_port,"config_port":config_actual_port,"config_error":config_error})
-    );
-    let _ = tokio::io::stdout().flush().await;
-    wait_for_shutdown().await;
-    let _ = shutdown_tx.send(());
-    let _ = ws_task.await;
-    if let Some(task) = config_task {
-        task.abort();
+    if let Ok(line) = serde_json::to_string(&json!({"event":"ready","port":actual_port})) {
+        emit_stdout_line(&line);
     }
+    let server_result = tokio::select! {
+        _ = wait_for_shutdown() => {
+            let _ = shutdown_tx.send(());
+            ws_task.await.map_err(|error| error.to_string())?
+        }
+        result = &mut ws_task => result.map_err(|error| error.to_string())?,
+    };
     service.close();
-    Ok(())
+    server_result.map_err(|error| error.to_string())
 }
 
 async fn wait_for_shutdown() {
@@ -1937,6 +2114,40 @@ mod tests {
     use crate::config::{save_settings, AppSettings};
     use crate::udp::encode_jpeg_frame;
     use std::net::UdpSocket;
+
+    #[test]
+    fn udp_worker_panics_become_recoverable_receiver_errors() {
+        let error =
+            super::catch_receiver_panic(|| -> Result<(), crate::receiver::ReceiverError> {
+                panic!("simulated UDP receiver panic");
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("UDP receive worker recovered"));
+        assert!(error.to_string().contains("simulated UDP receiver panic"));
+    }
+
+    #[test]
+    fn receiver_source_recovers_after_a_poisoned_lock_and_retries_its_port() {
+        let now = Instant::now();
+        let source = Mutex::new(SourceState {
+            active: None,
+            active_port: 4200,
+            pending_port: None,
+            retry_at: now,
+            last_error: None,
+        });
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = source.lock().unwrap();
+            panic!("simulate receiver panic while source state is locked");
+        }));
+
+        let mut state = lock_source(&source);
+        assert!(!source.is_poisoned());
+        reset_source_after_failure(&mut state, now, "worker panic".into());
+        assert_eq!(state.pending_port, Some(4200));
+        assert_eq!(state.retry_at, now + UDP_RETRY);
+        assert_eq!(state.last_error.as_deref(), Some("worker panic"));
+    }
 
     fn arm_physical_capture(service: &ReceiverService) -> String {
         {
@@ -2072,8 +2283,7 @@ mod tests {
             }}]}))
             .unwrap();
         assert!(service.motion_renderer.lock().unwrap().profile.is_some());
-        // The config page persists through HTTP before applying runtime commands.
-        // Exercise that serializer here; apply_settings itself is runtime-only.
+        // Runtime apply is separate from durable settings persistence.
         save_settings(
             data_dir.join("app-settings.json"),
             &service.settings.lock().unwrap(),
@@ -2304,10 +2514,47 @@ mod tests {
             id += 1;
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(processed.mask.as_ref().map(Vec::len), Some(192 * 192));
+        assert_eq!(
+            processed.mask.as_ref().map(Vec::len),
+            Some((192 * 192 + 7) / 8)
+        );
         assert!(service
             .dispatch(json!({"version":1,"type":"set_color_filter"}))
             .is_err());
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn unavailable_object_detection_cannot_be_activated_at_runtime() {
+        let (service, data_dir) = test_service("unavailable-object-detection");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        let original = service.settings.lock().unwrap().clone();
+        let original_file = std::fs::read(&service.settings_path).unwrap();
+        let error = service
+            .dispatch(json!({
+                "version":1,
+                "type":"set_strategy",
+                "mode":"object_detection"
+            }))
+            .expect_err("the unavailable engine must not reconfigure the receiver");
+        assert!(error.contains("not available"), "{error}");
+        let mut requested = original.clone();
+        requested.strategy = "object_detection".into();
+        let error = service
+            .dispatch(json!({
+                "version":1,
+                "type":"apply_app_settings",
+                "settings":requested
+            }))
+            .expect_err("Apply Changes must reject the unavailable engine");
+        assert!(error.contains("not available"), "{error}");
+        assert_eq!(*service.settings.lock().unwrap(), original);
+        assert_eq!(
+            std::fs::read(&service.settings_path).unwrap(),
+            original_file
+        );
+        assert_eq!(service.pipeline.stats().processed_frames, 0);
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -2355,21 +2602,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_summary_reports_frames_and_center_hits() {
+    fn auto_summary_reports_frames_and_center_validity() {
         let mut summary = super::AutoSummary::default();
-        assert!(
-            summary.add(false, false, 36, 0.0).is_none(),
-            "nothing gathered"
-        );
+        assert!(summary.add(false, false, 36).is_none(), "nothing gathered");
         for frame in 0..10 {
-            assert!(summary.add(true, frame % 5 == 0, 36, 0.0).is_none());
+            assert!(summary.add(true, frame % 5 == 0, 36).is_none());
         }
         summary.started = Some(Instant::now() - Duration::from_secs(1));
-        let line = summary
-            .add(false, false, 36, 0.0)
-            .expect("released: summary");
+        let line = summary.add(false, false, 36).expect("released: summary");
         assert!(line.contains("10 frames"), "{line}");
-        assert!(line.contains("on center in 2"), "{line}");
+        assert!(line.contains("center-valid frames 2"), "{line}");
         assert!(line.contains("Auto FOV 36°"), "{line}");
     }
 
@@ -2405,18 +2647,16 @@ mod tests {
         ] {
             assert!(super::parse_device_status(&invalid).is_err());
         }
-        assert!(matches!(
+        assert_eq!(
             super::ClientRole::parse(Some("monitor")),
-            super::ClientRole::Monitor
-        ));
-        assert!(matches!(
+            Some(super::ClientRole::Monitor)
+        );
+        assert_eq!(
             super::ClientRole::parse(Some("host")),
-            super::ClientRole::Host
-        ));
-        assert!(matches!(
-            super::ClientRole::parse(None),
-            super::ClientRole::Config
-        ));
+            Some(super::ClientRole::Host)
+        );
+        assert_eq!(super::ClientRole::parse(None), None);
+        assert_eq!(super::ClientRole::parse(Some("config")), None);
     }
 
     #[test]
@@ -2449,6 +2689,28 @@ mod tests {
         let saved = load_settings(data_dir.join("app-settings.json"));
         assert_eq!(saved.active_profile, 1);
         assert_eq!(saved.profiles.len(), 2);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn motion_trigger_edge_advances_shared_movement_revision() {
+        let (service, data_dir) = test_service("motion-trigger-revision");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        service.settings.lock().unwrap().motion_enabled = true;
+        let revision = service.auto_events.lock().unwrap().revision;
+
+        service
+            .dispatch(json!({
+                "version": 1,
+                "type": "device_status",
+                "state": "connected",
+                "name": "Mock Medius",
+                "buttons": [false, true, false, false, false]
+            }))
+            .unwrap();
+
+        assert_eq!(service.auto_events.lock().unwrap().revision, revision + 1);
+        drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -2518,7 +2780,7 @@ mod tests {
         assert_eq!((aim.speed_x, aim.speed_y, aim.offset_x), (0.2, 0.3, -4.0));
         assert_eq!((aim.smooth_fov_degrees, aim.config_revision), (0, 7));
 
-        // Center crossing keeps blocking Motion while Auto is held.
+        // Auto keeps owning output routing while its trigger is held.
         settings.auto.mode = "center".into();
         settings.motion_enabled = true;
         let center = super::movement_runtime(&settings, &held, None, 7);
@@ -2527,15 +2789,9 @@ mod tests {
 
     #[test]
     fn websocket_origin_and_token_gates_reject_non_local_or_wrong_credentials() {
-        assert!(super::origin_allowed(Some("tauri://localhost"), None));
-        assert!(super::origin_allowed(
-            Some("http://127.0.0.1:4201"),
-            Some(4201)
-        ));
-        assert!(!super::origin_allowed(
-            Some("https://example.invalid"),
-            Some(4201)
-        ));
+        assert!(super::origin_allowed(Some("tauri://localhost")));
+        assert!(!super::origin_allowed(Some("http://127.0.0.1:4201")));
+        assert!(!super::origin_allowed(Some("https://example.invalid")));
         assert!(super::token_matches("same secret", "same secret"));
         assert!(!super::token_matches("same secret", "other secret"));
     }
@@ -2600,7 +2856,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = worker_service.dispatch(json!({"version":1,"type":"apply_settings",
-                "commands":[{"version":1,"type":"set_movement_calibration","sens":0.23,"motion_enabled":true}]}));
+                "commands":[
+                    {"version":1,"type":"set_movement_calibration","sens":0.23,"motion_enabled":true},
+                    {"version":1,"type":"set_motion_speed","x":0.12,"y":0.13,"smooth_fov_degrees":0,"no_deadzone":true}
+                ]}));
             let _ = tx.send(result);
         });
         let response = rx
@@ -2610,7 +2869,79 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(response["state"]["sens"], 0.23);
         assert_eq!(response["state"]["motion_enabled"], true);
+        assert_eq!(response["state"]["motion_no_deadzone"], true);
+        assert_eq!(response["state"]["motion_speed_x"], 0.12);
         drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn native_app_settings_are_saved_before_runtime_acknowledgement() {
+        let (service, data_dir) = test_service("native-app-settings");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        let initial = service
+            .dispatch(json!({"version":1,"type":"get_app_settings"}))
+            .expect("load native settings");
+        assert_eq!(initial["event"], "app_settings");
+        assert_eq!(initial["settings"]["motionNoDeadzone"], false);
+        let mut settings = AppSettings::default();
+        settings.motion_no_deadzone = true;
+        settings.color_filter = true;
+        settings.pixel_color = "red".into();
+        settings.port = service.state()["port"].as_u64().unwrap().to_string();
+
+        let response = service
+            .dispatch(json!({
+                "version":1,
+                "type":"apply_app_settings",
+                "settings":settings
+            }))
+            .expect("persist and apply native settings");
+        assert_eq!(response["event"], "ack");
+        assert_eq!(response["state"]["motion_no_deadzone"], true);
+        assert_eq!(response["state"]["color_filter"], true);
+        let saved = load_settings(service.settings_path.clone());
+        assert!(saved.motion_no_deadzone);
+        assert_eq!(saved.pixel_color, "red");
+        assert_eq!(
+            saved.profiles[0].settings["motionNoDeadzone"], true,
+            "active profile snapshot is synchronized before saving"
+        );
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn native_app_settings_with_busy_port_leave_disk_and_runtime_unchanged() {
+        let (service, data_dir) = test_service("native-app-settings-busy-port");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        let original_settings = service.settings.lock().unwrap().clone();
+        let original_file = std::fs::read(&service.settings_path).unwrap();
+        let original_port = service.state()["port"].as_u64().unwrap();
+        let busy = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let mut requested = original_settings.clone();
+        requested.port = busy.local_addr().unwrap().port().to_string();
+        requested.color_filter = !requested.color_filter;
+
+        let error = service
+            .dispatch(json!({
+                "version":1,
+                "type":"apply_app_settings",
+                "settings":requested
+            }))
+            .expect_err("a busy UDP port must reject the settings transaction");
+
+        assert!(!error.is_empty());
+        assert_eq!(*service.settings.lock().unwrap(), original_settings);
+        assert_eq!(service.state()["port"], original_port);
+        assert_eq!(
+            std::fs::read(&service.settings_path).unwrap(),
+            original_file
+        );
+
+        drop(busy);
+        drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

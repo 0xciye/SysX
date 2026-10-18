@@ -46,7 +46,7 @@ When the receiver sees datagrams from a new sender address, and again whenever C
 SYSCFG 1 CROP <resolution>
 ```
 
-ASCII, no terminator, `<resolution>` in 1–8192. The plugin accepts it only from its configured receiver address/port, ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged; while the sender streams, the receiver repeats it every second; a sender that never receives it keeps its `default_crop`.
+ASCII, no terminator, `<resolution>` in 1–5792. The upper bound keeps the square frame within the receiver's 33,554,432-pixel allocation budget. The plugin accepts it only from its configured receiver address/port, ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged; while the sender streams, the receiver repeats it every second; a sender that never receives it keeps its `default_crop`.
 
 ### Chunking rules
 
@@ -104,7 +104,7 @@ Pixel Seek exposes one selected target at a time: Yellow, Red, or Purple. The OB
 ## 5. Receiver operator workflow
 
 1. Install and launch the SysX desktop application on the secondary computer.
-2. In the local web config, set the UDP port (default `4200`) and Crop Resolution to a square that fits the OBS source; allow that port through the private-network firewall if needed.
+2. In native Settings, set the UDP port (default `4200`) and Crop Resolution to a square that fits the OBS source; the sender applies this centered crop on the GPU before encoding. Allow that port through the private-network firewall if needed.
 3. Install `sysx-canvas-sender.dll` into OBS's `obs-plugins\64bit` folder, after setting `kReceiverHost` (the Receiver computer's reachable LAN address) and `kReceiverPort` in `sysx_canvas_sender.cpp` and rebuilding, then restart OBS.
 4. For Object Detection, make the Crop Resolution match the active model input (square models are required by the square crop). Pixel Seek has no model-resolution requirement.
 5. Start the stream from OBS. The Receiver automatically changes to its live preview when valid frames arrive. Use its source resolution, processing FPS, preview FPS, processing latency, drop counters, and status to diagnose behavior.

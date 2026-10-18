@@ -1,8 +1,9 @@
 //! Native Slint receiver: GPU vector UI, no WebView/browser or Windows controls.
 use crate::native_monitor::{View, Workers};
-use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,7 +15,47 @@ use std::{
 use sysx_ui::layout::{fit_preview_image, fov_diameter, map_detection_box, map_detection_point};
 
 slint::slint! {
+    import { ScrollView } from "std-widgets.slint";
     export struct MouseKey { label: string, known: bool, down: bool }
+    export struct ConfigOption { label: string, value: string }
+    export struct ConfigField { key: string, label: string, value: string, kind: string, choices: [ConfigOption] }
+    component ConfigAction inherits FocusScope {
+        in property <string> caption;
+        in property <bool> active;
+        in property <bool> primary;
+        in property <bool> danger;
+        in property <length> control-height: 34px;
+        callback activated();
+        height: root.control-height;
+        key-pressed(event) => {
+            if !event.repeat && (event.text == Key.Return || event.text == Key.Space) {
+                root.activated();
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            width: parent.width; height: parent.height;
+            border-radius: 5px; border-width: root.has-focus ? 2px : 1px;
+            border-color: root.has-focus ? #e8b858 : (root.danger ? #ef6c6c : (root.active || root.primary ? #43cfa0 : #344454));
+            background: root.primary ? #43cfa0 : (root.danger ? #ef6c6c12 : (root.active ? #43cfa01a : #0f151c));
+            Text {
+                text: root.caption;
+                color: root.primary ? #08120f : (root.danger ? #ef6c6c : #ebf1f5);
+                font-family: "Segoe UI";
+                font-size: root.primary ? 13px : 12px;
+                font-weight: root.primary ? 700 : 400;
+                horizontal-alignment: root.primary ? center : left;
+                vertical-alignment: center;
+                x: root.primary ? 0px : 9px;
+                width: parent.width - (root.primary ? 0px : 18px);
+            }
+            TouchArea {
+                clicked => { root.focus(); root.activated(); }
+            }
+        }
+    }
     export component Receiver inherits Window {
         title: "SysX";
         icon: @image-url("icons/icon.png");
@@ -59,6 +100,7 @@ slint::slint! {
         in property <float> target-h;
         in property <color> target-ink: #e3bf4d;
         out property <float> feed-size: feed.width / 1px;
+        callback settings-requested();
         callback viewport-changed();
         changed feed-size => { root.viewport-changed(); }
         Rectangle {
@@ -83,6 +125,10 @@ slint::slint! {
                         Rectangle { width: 7px; height: 7px; y: 10px; border-radius: 4px; background: root.device-ink; }
                         Text { text: root.device; color: #ebf1f5; font-size: 12px; vertical-alignment: center; overflow: elide; }
                     }
+                }
+                ConfigAction {
+                    width: 70px; control-height: 28px; caption: "Settings";
+                    activated => { root.settings-requested(); }
                 }
             }
         }
@@ -148,9 +194,584 @@ slint::slint! {
             }
         }
     }
+
+    export component SettingsWindow inherits Window {
+        title: "SysX Settings";
+        preferred-width: 760px; preferred-height: 720px;
+        min-width: 620px; min-height: 560px;
+        background: #090c10;
+        in property <string> body-font: "Segoe UI";
+        in property <string> mono-font: "Consolas";
+        in property <[ConfigField]> fields;
+        in property <string> message;
+        callback field-edited(string, string);
+        callback field-activated(string);
+        callback field-selected(string, string);
+        callback apply-requested();
+        callback close-requested();
+        callback reset-scroll();
+        reset-scroll => { settings-list.viewport-y = 0px; }
+            VerticalLayout {
+                padding: 18px; spacing: 10px;
+            HorizontalLayout {
+                height: 48px; spacing: 10px;
+                VerticalLayout { spacing: 2px;
+                    Text { text: "SYSX  /  SETTINGS"; color: #43cfa0; font-size: 10px; font-weight: 700; }
+                    Text { text: "Configuration"; color: #ebf1f5; font-size: 20px; font-weight: 600; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if root.fields.length > 12: Text { text: "SCROLL FOR MORE"; color: #9aa9b4; font-family: root.mono-font; font-size: 10px; vertical-alignment: center; }
+                ConfigAction {
+                    width: 70px; control-height: 32px; caption: "Close";
+                    activated => { root.close-requested(); }
+                }
+            }
+            Rectangle { height: 1px; background: #263340; }
+            settings-list := ScrollView {
+                horizontal-stretch: 1; vertical-stretch: 1;
+                vertical-scrollbar-policy: ScrollBarPolicy.always-on;
+                VerticalLayout {
+                        width: parent.width; height: root.fields.length * 50px; spacing: 4px;
+                        for field in root.fields: Rectangle {
+                            width: parent.width; height: 46px;
+                            background: field.kind == "section" ? #0e151c : #090c10;
+                            border-radius: field.kind == "section" ? 4px : 0px;
+                            border-width: field.kind == "section" ? 1px : 0px;
+                            border-color: #263340;
+                            if field.kind == "section": HorizontalLayout {
+                                x: 10px; y: 4px; width: parent.width - 20px; height: 30px; spacing: 10px;
+                                Text { text: field.label; color: #43cfa0; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; height: 1px; background: #263340; }
+                            }
+                            if field.kind == "engine": HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle { horizontal-stretch: 1; height: 34px; border-radius: 5px; border-width: 1px; border-color: #43cfa0; background: #43cfa01a;
+                                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                        Text { text: "PIXEL SEEK"; color: #ebf1f5; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text { text: "AVAILABLE"; color: #43cfa0; font-family: root.mono-font; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; height: 34px; border-radius: 5px; border-width: 1px; border-color: #344454; background: #0f151c;
+                                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                        Text { text: "OBJECT DETECTION"; color: #9aa9b4; font-size: 12px; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text { text: "UNAVAILABLE"; color: #9aa9b4; font-family: root.mono-font; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                }
+                            }
+                            if field.kind != "section" && field.kind != "engine": HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: field.label; color: #c4d0d8; horizontal-stretch: 1; vertical-alignment: center; }
+                                if field.kind == "text" || field.kind == "number": Rectangle {
+                                    width: 250px; height: 34px; border-radius: 5px; border-width: 1px; border-color: #344454; background: #0f151c;
+                                    TextInput {
+                                        x: 9px; y: 2px; width: parent.width - 18px; height: parent.height - 4px;
+                                        text: field.value; font-family: root.mono-font; font-size: 12px; color: #ebf1f5;
+                                        edited => { root.field-edited(field.key, self.text); }
+                                    }
+                                }
+                            if field.kind == "toggle": ConfigAction {
+                                    width: 250px;
+                                    caption: field.value == "true" ? "On" : "Off";
+                                    active: field.value == "true";
+                                    activated => { root.field-activated(field.key); }
+                                }
+                                if field.kind == "choice": HorizontalLayout {
+                                    width: field.key == "profile.select" ? 460px : 250px; spacing: 4px;
+                                    for option in field.choices: ConfigAction {
+                                        horizontal-stretch: 1; caption: option.label;
+                                        active: option.value == field.value;
+                                        activated => { root.field-selected(field.key, option.value); }
+                                    }
+                                }
+                                if field.kind == "profile-actions": HorizontalLayout {
+                                    horizontal-stretch: 1; spacing: 8px;
+                                    for action in field.choices: ConfigAction {
+                                        horizontal-stretch: 1; caption: action.label;
+                                        danger: action.value == "profile.delete";
+                                        activated => { root.field-activated(action.value); }
+                                    }
+                                }
+                                if field.kind == "action": ConfigAction {
+                                    width: 120px; caption: field.value;
+                                    activated => { root.field-activated(field.key); }
+                                }
+                            }
+                        }
+                }
+            }
+            HorizontalLayout {
+                height: 42px; spacing: 12px;
+                Text { text: root.message; color: root.message == "Changes applied successfully." ? #43cfa0 : #e8b858; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                ConfigAction {
+                    width: 140px; control-height: 38px; caption: "Apply Changes"; primary: true;
+                    activated => { root.apply-requested(); }
+                }
+            }
+        }
+    }
 }
 fn ink(rgb: u32) -> slint::Color {
     slint::Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+fn setting_field(
+    fields: &mut Vec<ConfigField>,
+    settings: &serde_json::Value,
+    key: &str,
+    label: &str,
+    kind: &str,
+) {
+    let value = key
+        .split('.')
+        .try_fold(settings, |value, part| value.get(part))
+        .map(|value| {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_i64)
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+        })
+        .unwrap_or_default();
+    let choices = if kind == "choice" {
+        let items: &[(&str, &str)] = match key {
+            "pixelColor" => &[("Yellow", "yellow"), ("Red", "red"), ("Purple", "purple")],
+            "scale" => &[("Smooth", "Smooth"), ("Pixel perfect", "Pixel perfect")],
+            "triggerButton" | "auto.triggerButton" => {
+                &[("Right", "right"), ("M4", "m4"), ("M5", "m5")]
+            }
+            "auto.mode" => &[("Center crossing", "center"), ("Aim + fire", "aim")],
+            _ => &[],
+        };
+        items
+            .iter()
+            .map(|(label, value)| ConfigOption {
+                label: (*label).into(),
+                value: (*value).into(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    fields.push(ConfigField {
+        key: key.into(),
+        label: label.into(),
+        value: value.into(),
+        kind: kind.into(),
+        choices: ModelRc::new(VecModel::from(choices)),
+    });
+}
+
+fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
+    let mut fields = Vec::new();
+    let section = |fields: &mut Vec<ConfigField>, label: &str| {
+        fields.push(ConfigField {
+            key: "".into(),
+            label: label.into(),
+            value: String::new().into(),
+            kind: "section".into(),
+            choices: ModelRc::default(),
+        });
+    };
+    section(&mut fields, "PROFILES");
+    let profiles = settings
+        .get("profiles")
+        .and_then(serde_json::Value::as_array);
+    let active_profile = settings
+        .get("activeProfile")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let profile_options = profiles
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| profile.get("name").and_then(serde_json::Value::as_str))
+        .map(|name| ConfigOption {
+            label: name.into(),
+            value: name.into(),
+        })
+        .collect::<Vec<_>>();
+    fields.push(ConfigField {
+        key: "profile.select".into(),
+        label: "Active profile".into(),
+        value: profiles
+            .and_then(|items| items.get(active_profile))
+            .and_then(|profile| profile.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Default")
+            .into(),
+        kind: "choice".into(),
+        choices: ModelRc::new(VecModel::from(profile_options)),
+    });
+    fields.push(ConfigField {
+        key: "profile.rename".into(),
+        label: "Profile name".into(),
+        value: profiles
+            .and_then(|items| items.get(active_profile))
+            .and_then(|profile| profile.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Default")
+            .into(),
+        kind: "text".into(),
+        choices: ModelRc::default(),
+    });
+    fields.push(ConfigField {
+        key: "profile.actions".into(),
+        label: "Profile actions".into(),
+        value: String::new().into(),
+        kind: "profile-actions".into(),
+        choices: ModelRc::new(VecModel::from(vec![
+            ConfigOption {
+                label: "Create".into(),
+                value: "profile.create".into(),
+            },
+            ConfigOption {
+                label: "Clone".into(),
+                value: "profile.clone".into(),
+            },
+            ConfigOption {
+                label: "Rename".into(),
+                value: "profile.rename.apply".into(),
+            },
+            ConfigOption {
+                label: "Delete".into(),
+                value: "profile.delete".into(),
+            },
+        ])),
+    });
+    section(&mut fields, "DETECTION ENGINE");
+    fields.push(ConfigField {
+        key: "engine".into(),
+        label: String::new().into(),
+        value: String::new().into(),
+        kind: "engine".into(),
+        choices: ModelRc::default(),
+    });
+    section(&mut fields, "MAIN");
+    setting_field(
+        &mut fields,
+        settings,
+        "pixelColor",
+        "Pixel Seek color",
+        "choice",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "fovDegrees",
+        "FOV (degrees)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "colorFilter",
+        "Color Filter",
+        "toggle",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "cropResolution",
+        "Crop Resolution",
+        "number",
+    );
+    setting_field(&mut fields, settings, "scale", "Preview scaling", "choice");
+    section(&mut fields, "MOTION");
+    setting_field(&mut fields, settings, "motionEnabled", "Motion", "toggle");
+    setting_field(
+        &mut fields,
+        settings,
+        "motionAlwaysOn",
+        "Always on",
+        "toggle",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "motionNoDeadzone",
+        "No deadzone",
+        "toggle",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "triggerButton",
+        "Trigger button",
+        "choice",
+    );
+    setting_field(&mut fields, settings, "offsetX", "X offset (px)", "number");
+    setting_field(&mut fields, settings, "offsetY", "Y offset (px)", "number");
+    setting_field(&mut fields, settings, "motionSpeedX", "X speed", "number");
+    setting_field(&mut fields, settings, "motionSpeedY", "Y speed", "number");
+    setting_field(
+        &mut fields,
+        settings,
+        "smoothFovDegrees",
+        "Smooth FOV (degrees)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "smoothingXMin",
+        "X smoothing min",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "smoothingXMax",
+        "X smoothing max",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "smoothingYMin",
+        "Y smoothing min",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "smoothingYMax",
+        "Y smoothing max",
+        "number",
+    );
+    setting_field(&mut fields, settings, "sens", "Sensitivity", "number");
+    setting_field(
+        &mut fields,
+        settings,
+        "motionRenderer.enabled",
+        "Normal + ABCurves",
+        "toggle",
+    );
+    section(&mut fields, "AUTO");
+    setting_field(&mut fields, settings, "auto.enabled", "Auto", "toggle");
+    setting_field(&mut fields, settings, "auto.mode", "Mode", "choice");
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.triggerButton",
+        "Trigger button",
+        "choice",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.fovDegrees",
+        "FOV (degrees)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.delayMs",
+        "Delay (ms)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.cooldownMs",
+        "Cooldown (ms)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.sleepMs",
+        "Sleep (ms)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.offsetX",
+        "X offset (px)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "auto.offsetY",
+        "Y offset (px)",
+        "number",
+    );
+    if settings
+        .pointer("/auto/mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("aim")
+    {
+        setting_field(&mut fields, settings, "auto.speedX", "X speed", "number");
+        setting_field(&mut fields, settings, "auto.speedY", "Y speed", "number");
+        setting_field(
+            &mut fields,
+            settings,
+            "auto.smoothFovDegrees",
+            "Smooth FOV (degrees)",
+            "number",
+        );
+        setting_field(
+            &mut fields,
+            settings,
+            "auto.smoothingXMin",
+            "X smoothing min",
+            "number",
+        );
+        setting_field(
+            &mut fields,
+            settings,
+            "auto.smoothingXMax",
+            "X smoothing max",
+            "number",
+        );
+        setting_field(
+            &mut fields,
+            settings,
+            "auto.smoothingYMin",
+            "Y smoothing min",
+            "number",
+        );
+        setting_field(
+            &mut fields,
+            settings,
+            "auto.smoothingYMax",
+            "Y smoothing max",
+            "number",
+        );
+    }
+    section(&mut fields, "RECOIL");
+    setting_field(
+        &mut fields,
+        settings,
+        "recoil.recoilEnabled",
+        "Recoil",
+        "toggle",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "recoil.recoilLevels",
+        "Levels (comma-separated)",
+        "text",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "recoil.recoilPercentage",
+        "Strength (%)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "recoil.recoilStartDelayMs",
+        "Start delay (ms)",
+        "number",
+    );
+    setting_field(
+        &mut fields,
+        settings,
+        "recoil.recoilLevelDurationMs",
+        "Time per level (ms)",
+        "number",
+    );
+    section(&mut fields, "SETTINGS");
+    setting_field(&mut fields, settings, "port", "UDP input port", "number");
+    fields
+}
+
+fn update_setting(settings: &mut serde_json::Value, key: &str, input: &str) -> Result<(), String> {
+    let parts = key.split('.').collect::<Vec<_>>();
+    let (leaf, parents) = parts
+        .split_last()
+        .ok_or_else(|| "setting key is empty".to_owned())?;
+    let target = parents.iter().try_fold(settings, |value, part| {
+        value
+            .get_mut(*part)
+            .ok_or_else(|| format!("unknown setting {key}"))
+    })?;
+    let current = target
+        .get_mut(*leaf)
+        .ok_or_else(|| format!("unknown setting {key}"))?;
+    *current = if current.is_boolean() {
+        serde_json::Value::Bool(
+            input
+                .parse()
+                .map_err(|_| format!("{key} must be true or false"))?,
+        )
+    } else if current.is_number() {
+        if current.as_u64().is_some() {
+            serde_json::json!(input
+                .parse::<u64>()
+                .map_err(|_| format!("{key} must be a whole number"))?)
+        } else if current.as_i64().is_some() {
+            serde_json::json!(input
+                .parse::<i64>()
+                .map_err(|_| format!("{key} must be a whole number"))?)
+        } else {
+            let number = input
+                .parse::<f64>()
+                .map_err(|_| format!("{key} must be a number"))?;
+            if !number.is_finite() {
+                return Err(format!("{key} must be finite"));
+            }
+            serde_json::json!(number)
+        }
+    } else if current.is_array() && key == "recoil.recoilLevels" {
+        serde_json::json!(sysx_ui::settings::parse_recoil_levels(input).map_err(str::to_owned)?)
+    } else {
+        serde_json::Value::String(input.to_owned())
+    };
+    Ok(())
+}
+
+fn activate_setting(settings: &mut serde_json::Value, key: &str) -> Result<(), String> {
+    let current = key
+        .split('.')
+        .try_fold(&*settings, |value, part| value.get(part));
+    let choices: &[&str] = match key {
+        "pixelColor" => &["yellow", "red", "purple"],
+        "scale" => &["Smooth", "Pixel perfect"],
+        "triggerButton" | "auto.triggerButton" => &["right", "m4", "m5"],
+        "auto.mode" => &["center", "aim"],
+        "colorFilter"
+        | "motionEnabled"
+        | "motionAlwaysOn"
+        | "motionNoDeadzone"
+        | "motionRenderer.enabled"
+        | "auto.enabled"
+        | "recoil.recoilEnabled" => {
+            let value = current
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("unknown setting {key}"))?;
+            return update_setting(settings, key, if value { "false" } else { "true" });
+        }
+        _ => return Err(format!("setting {key} is not a toggle or choice")),
+    };
+    let current = current
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("unknown setting {key}"))?;
+    let next = choices
+        .iter()
+        .position(|choice| *choice == current)
+        .map(|index| choices[(index + 1) % choices.len()])
+        .unwrap_or(choices[0]);
+    update_setting(settings, key, next)
 }
 #[derive(Default)]
 struct RenderCache {
@@ -225,13 +846,11 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
     };
     let received = frame.received;
     if last.borrow().uploaded != Some(received) {
-        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            &frame.rgba,
-            frame.metadata.source_width,
-            frame.metadata.source_height,
-        );
-        app.set_preview(slint::Image::from_rgba8(buffer));
-        last.borrow_mut().uploaded = Some(received);
+        let mut rgba = crate::native_monitor::lock_recover(&frame.rgba);
+        if let Some(rgba) = rgba.take() {
+            app.set_preview(slint::Image::from_rgba8(rgba));
+            last.borrow_mut().uploaded = Some(received);
+        }
     }
     app.set_has_frame(true);
     let meta = &frame.metadata;
@@ -346,6 +965,31 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
         .into(),
     );
     app.set_has_target(layer.is_some());
+}
+
+static REFRESH_PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn catch_refresh(run: impl FnOnce()) -> Option<String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .err()
+        .map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic")
+                .to_owned()
+        })
+}
+
+fn refresh_guarded(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
+    if let Some(message) = catch_refresh(|| refresh(app, view, last)) {
+        if !REFRESH_PANIC_REPORTED.swap(true, Ordering::AcqRel) {
+            crate::diagnostics::record(&format!(
+                "Native receiver UI recovered from refresh panic: {message}"
+            ));
+        }
+    }
 }
 
 /// The ring marks the pixel being targeted; Object Detection keeps its
@@ -540,8 +1184,10 @@ pub fn run(
     port: u16,
     token: String,
     events: EventReceiver<crate::native_app::HostEvent>,
+    commands: std::sync::mpsc::SyncSender<serde_json::Value>,
 ) -> Result<(), String> {
     let app = Receiver::new().map_err(|e| e.to_string())?;
+    let settings_app = SettingsWindow::new().map_err(|e| e.to_string())?;
     let view = Arc::new(Mutex::new(View::default()));
     let queued = Arc::new(AtomicBool::new(false));
     // Coalesce UI wake-ups; workers keep at most one pending JPEG and one decoded frame.
@@ -549,7 +1195,7 @@ pub fn run(
     let update = Rc::new(move |app: &Receiver| {
         dirty.store(false, Ordering::Release);
         let snapshot = display.lock().map(|v| v.clone()).unwrap_or_default();
-        UPLOAD.with(|last| refresh(app, &snapshot, last));
+        UPLOAD.with(|last| refresh_guarded(app, &snapshot, last));
     });
     // UI closures live on the event-loop thread; worker notifications carry only a weak handle.
     let ui_update = Rc::clone(&update);
@@ -564,7 +1210,7 @@ pub fn run(
         .window()
         .set_rendering_notifier(move |state, _| {
             if matches!(state, slint::RenderingState::AfterRendering) {
-                drawn.store(false, Ordering::Release);
+                drawn.mark_drawn();
             }
         })
         .is_ok();
@@ -579,9 +1225,9 @@ pub fn run(
             let _ = weak.upgrade_in_event_loop(move |app| {
                 dirty.store(false, Ordering::Release);
                 let snapshot = view.lock().map(|v| v.clone()).unwrap_or_default();
-                UPLOAD.with(|last| refresh(&app, &snapshot, last));
+                UPLOAD.with(|last| refresh_guarded(&app, &snapshot, last));
                 if let Some(awaiting) = &release_on_upload {
-                    awaiting.store(false, Ordering::Release);
+                    awaiting.mark_drawn();
                 }
             });
         }
@@ -594,6 +1240,244 @@ pub fn run(
     )?)));
     let lifecycle = Rc::new(RefCell::new(None::<crate::native_app::MonitorLifecycle>));
     let hidden = Rc::new(Cell::new(false));
+    let settings_visible = Rc::new(Cell::new(false));
+    let settings_draft = Rc::new(RefCell::new(None::<serde_json::Value>));
+    let settings_dirty = Rc::new(Cell::new(false));
+    let invalid_settings = Rc::new(RefCell::new(HashSet::<String>::new()));
+    let profile_name = Rc::new(RefCell::new(String::new()));
+    let settings_weak = settings_app.as_weak();
+    app.on_settings_requested({
+        let visible = Rc::clone(&settings_visible);
+        let dirty = Rc::clone(&settings_dirty);
+        let commands = commands.clone();
+        move || {
+            let was_visible = visible.replace(true);
+            if let Some(settings) = settings_weak.upgrade() {
+                if !was_visible && !dirty.get() {
+                    settings.set_message("Loading settings…".into());
+                    let _ = commands.try_send(serde_json::json!({
+                        "version":1,"type":"get_app_settings"
+                    }));
+                }
+                let _ = settings.show();
+                settings.invoke_reset_scroll();
+            }
+        }
+    });
+    settings_app.window().on_close_requested({
+        let visible = Rc::clone(&settings_visible);
+        move || {
+            visible.set(false);
+            slint::CloseRequestResponse::HideWindow
+        }
+    });
+    settings_app.on_close_requested({
+        let visible = Rc::clone(&settings_visible);
+        let weak = settings_app.as_weak();
+        move || {
+            visible.set(false);
+            if let Some(settings) = weak.upgrade() {
+                settings.hide().ok();
+            }
+        }
+    });
+    settings_app.on_field_edited({
+        let draft = Rc::clone(&settings_draft);
+        let dirty = Rc::clone(&settings_dirty);
+        let invalid = Rc::clone(&invalid_settings);
+        let profile_name = Rc::clone(&profile_name);
+        let weak = settings_app.as_weak();
+        move |key, value| {
+            let result = if key == "profile.rename" {
+                *profile_name.borrow_mut() = value.to_string();
+                Ok(())
+            } else {
+                let result = draft
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| "Settings have not loaded yet".to_owned())
+                    .and_then(|settings| update_setting(settings, &key, &value));
+                dirty.set(true);
+                if result.is_ok() {
+                    invalid.borrow_mut().remove(key.as_str());
+                } else {
+                    invalid.borrow_mut().insert(key.to_string());
+                }
+                result
+            };
+            if let Some(app) = weak.upgrade() {
+                app.set_message(result.err().unwrap_or_default().into());
+            }
+        }
+    });
+    settings_app.on_field_selected({
+        let draft = Rc::clone(&settings_draft);
+        let dirty = Rc::clone(&settings_dirty);
+        let invalid = Rc::clone(&invalid_settings);
+        let commands = commands.clone();
+        let weak = settings_app.as_weak();
+        move |key, value| {
+            let result = if key == "profile.select" {
+                if dirty.get() {
+                    Err("Apply current settings before changing profiles.".to_owned())
+                } else {
+                    let index = draft
+                        .borrow()
+                        .as_ref()
+                        .and_then(|settings| settings.get("profiles")?.as_array())
+                        .and_then(|profiles| {
+                            profiles.iter().position(|profile| {
+                                profile.get("name").and_then(serde_json::Value::as_str)
+                                    == Some(value.as_str())
+                            })
+                        })
+                        .ok_or_else(|| "Profile is no longer available.".to_owned());
+                    index.and_then(|index| {
+                        commands
+                            .try_send(serde_json::json!({
+                                "version":1,"type":"activate_profile","index":index
+                            }))
+                            .map_err(|_| "Backend command queue is unavailable.".to_owned())
+                    })
+                }
+            } else {
+                let result = draft
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| "Settings have not loaded yet".to_owned())
+                    .and_then(|settings| update_setting(settings, &key, &value));
+                dirty.set(true);
+                if result.is_ok() {
+                    invalid.borrow_mut().remove(key.as_str());
+                }
+                result
+            };
+            if let Some(app) = weak.upgrade() {
+                if key != "profile.select" {
+                    if let Some(settings) = draft.borrow().as_ref() {
+                        app.set_fields(ModelRc::new(VecModel::from(settings_fields(settings))));
+                    }
+                }
+                app.set_message(if key == "profile.select" {
+                    result
+                        .map(|_| "Updating profile…".to_owned())
+                        .unwrap_or_else(|error| error)
+                        .into()
+                } else {
+                    result.err().unwrap_or_default().into()
+                });
+            }
+        }
+    });
+    settings_app.on_field_activated({
+        let draft = Rc::clone(&settings_draft);
+        let dirty = Rc::clone(&settings_dirty);
+        let invalid = Rc::clone(&invalid_settings);
+        let profile_name = Rc::clone(&profile_name);
+        let commands = commands.clone();
+        let weak = settings_app.as_weak();
+        move |key| {
+            if key.starts_with("profile.") {
+                let result = if dirty.get() {
+                    Err("Apply current settings before changing profiles.".to_owned())
+                } else {
+                    let draft = draft.borrow();
+                    let settings = draft.as_ref();
+                    let command = match key.as_str() {
+                        "profile.select" => settings
+                            .and_then(|settings| {
+                                let count = settings.get("profiles")?.as_array()?.len();
+                                let active = settings.get("activeProfile")?.as_u64()? as usize;
+                                (count > 0).then(|| serde_json::json!({
+                                    "version":1,"type":"activate_profile","index":(active + 1) % count
+                                }))
+                            })
+                            .ok_or_else(|| "Profiles are not available.".to_owned()),
+                        "profile.create" => Ok(serde_json::json!({
+                            "version":1,"type":"create_profile","duplicate":false
+                        })),
+                        "profile.clone" => Ok(serde_json::json!({
+                            "version":1,"type":"create_profile","duplicate":true
+                        })),
+                        "profile.delete" => Ok(serde_json::json!({
+                            "version":1,"type":"delete_profile"
+                        })),
+                        "profile.rename.apply" => Ok(serde_json::json!({
+                            "version":1,"type":"rename_profile","name":profile_name.borrow().trim()
+                        })),
+                        _ => Err(format!("Unknown profile action: {key}")),
+                    };
+                    command.and_then(|command| {
+                        commands
+                            .try_send(command)
+                            .map_err(|_| "Backend command queue is unavailable.".to_owned())
+                    })
+                };
+                if let Some(app) = weak.upgrade() {
+                    app.set_message(result.map(|_| "Updating profile…".to_owned()).unwrap_or_else(|error| error).into());
+                }
+                return;
+            }
+            let result = draft
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(|| "Settings have not loaded yet".to_owned())
+                .and_then(|settings| {
+                    if let Some(key) = invalid.borrow().iter().next() {
+                        Err(format!("Fix the invalid value for {key} before applying."))
+                    } else {
+                        activate_setting(settings, &key)
+                    }
+                });
+            if result.is_ok() {
+                dirty.set(true);
+                invalid.borrow_mut().remove(key.as_str());
+            }
+            if let Some(app) = weak.upgrade() {
+                match result {
+                    Ok(()) => {
+                        if let Some(settings) = draft.borrow().as_ref() {
+                            app.set_fields(ModelRc::new(VecModel::from(settings_fields(settings))));
+                        }
+                        app.set_message("".into());
+                    }
+                    Err(error) => app.set_message(error.into()),
+                }
+            }
+        }
+    });
+    settings_app.on_apply_requested({
+        let draft = Rc::clone(&settings_draft);
+        let invalid = Rc::clone(&invalid_settings);
+        let commands = commands.clone();
+        let weak = settings_app.as_weak();
+        move || {
+            let result = draft
+                .borrow()
+                .clone()
+                .ok_or_else(|| "Settings have not loaded yet".to_owned())
+                .and_then(|settings| {
+                    if let Some(key) = invalid.borrow().iter().next() {
+                        Err(format!("Fix the invalid value for {key} before applying."))
+                    } else {
+                        Ok(settings)
+                    }
+                })
+                .and_then(|settings| {
+                    commands
+                        .try_send(serde_json::json!({
+                            "version":1,
+                            "type":"apply_app_settings",
+                            "settings":settings,
+                            "request_id":"native-settings"
+                        }))
+                        .map_err(|_| "Backend command queue is unavailable".to_owned())
+                });
+            if let Some(app) = weak.upgrade() {
+                app.set_message(result.err().unwrap_or_else(|| "Applying…".into()).into());
+            }
+        }
+    });
     app.window().on_close_requested({
         let workers = Rc::clone(&workers);
         let lifecycle = Rc::clone(&lifecycle);
@@ -619,15 +1503,105 @@ pub fn run(
     let timer = slint::Timer::default();
     let weak = app.as_weak();
     let signal = crate::single_instance::MonitorSignal::new();
-    let mut counts = (0, 0);
+    let mut monitor_clients = 0;
+    let settings_draft_events = Rc::clone(&settings_draft);
+    let settings_dirty_events = Rc::clone(&settings_dirty);
+    let invalid_settings_events = Rc::clone(&invalid_settings);
+    let profile_name_events = Rc::clone(&profile_name);
+    let settings_visible_events = Rc::clone(&settings_visible);
+    let settings_weak_events = settings_app.as_weak();
+    let settings_commands_events = commands.clone();
+    let mut apply_success_until = None::<Instant>;
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(100),
         move || {
             loop {
                 match events.try_recv() {
-                    Ok(crate::native_app::HostEvent::ClientCounts { monitor, config }) => {
-                        counts = (monitor, config)
+                    Ok(crate::native_app::HostEvent::ClientCount(count)) => monitor_clients = count,
+                    Ok(crate::native_app::HostEvent::CommandResponse(value)) => {
+                        let event = value.get("event").and_then(|event| event.as_str());
+                        let command_type = value.get("type").and_then(|value| value.as_str());
+                        if event == Some("app_settings") && !settings_dirty_events.get() {
+                            apply_success_until = None;
+                            if let Some(settings) = value.get("settings") {
+                                *settings_draft_events.borrow_mut() = Some(settings.clone());
+                                settings_dirty_events.set(false);
+                                invalid_settings_events.borrow_mut().clear();
+                                *profile_name_events.borrow_mut() = settings
+                                    .get("profiles")
+                                    .and_then(serde_json::Value::as_array)
+                                    .and_then(|profiles| {
+                                        settings
+                                            .get("activeProfile")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .and_then(|index| profiles.get(index as usize))
+                                    })
+                                    .and_then(|profile| profile.get("name"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("Default")
+                                    .to_owned();
+                                if let Some(app) = settings_weak_events.upgrade() {
+                                    app.set_fields(ModelRc::new(VecModel::from(settings_fields(
+                                        settings,
+                                    ))));
+                                    app.set_message("".into());
+                                }
+                            }
+                        } else if command_type == Some("apply_app_settings") {
+                            if let Some(app) = settings_weak_events.upgrade() {
+                                if event == Some("ack") {
+                                    settings_dirty_events.set(false);
+                                    invalid_settings_events.borrow_mut().clear();
+                                    apply_success_until =
+                                        Some(Instant::now() + Duration::from_secs(3));
+                                    app.set_message("Changes applied successfully.".into());
+                                } else {
+                                    apply_success_until = None;
+                                    app.set_message(
+                                        value
+                                            .get("message")
+                                            .and_then(|message| message.as_str())
+                                            .unwrap_or("Settings were not applied.")
+                                            .into(),
+                                    );
+                                }
+                            }
+                        } else if event == Some("ack")
+                            && matches!(
+                                command_type,
+                                Some(
+                                    "activate_profile"
+                                        | "create_profile"
+                                        | "rename_profile"
+                                        | "delete_profile"
+                                )
+                            )
+                        {
+                            let _ = settings_commands_events.try_send(serde_json::json!({
+                                "version":1,"type":"get_app_settings"
+                            }));
+                        } else if event == Some("error")
+                            && command_type.is_some_and(|kind| kind.ends_with("profile"))
+                        {
+                            if let Some(app) = settings_weak_events.upgrade() {
+                                app.set_message(
+                                    value
+                                        .get("message")
+                                        .and_then(|message| message.as_str())
+                                        .unwrap_or("Profile action failed.")
+                                        .into(),
+                                );
+                            }
+                        } else if event == Some("error") {
+                            crate::diagnostics::record(&format!(
+                                "Native command failed: {}",
+                                value
+                                    .get("message")
+                                    .and_then(|message| message.as_str())
+                                    .unwrap_or("unknown error")
+                            ));
+                        }
                     }
                     Ok(crate::native_app::HostEvent::Disconnected)
                     | Err(TryRecvError::Disconnected) => {
@@ -635,6 +1609,14 @@ pub fn run(
                         return;
                     }
                     Err(TryRecvError::Empty) => break,
+                }
+            }
+            if apply_success_until.is_some_and(|deadline| Instant::now() >= deadline) {
+                apply_success_until = None;
+                if let Some(settings_app) = settings_weak_events.upgrade() {
+                    if settings_app.get_message().as_str() == "Changes applied successfully." {
+                        settings_app.set_message("".into());
+                    }
                 }
             }
             if signal.requested() {
@@ -653,10 +1635,11 @@ pub fn run(
                     app.window().request_redraw();
                 }
             }
+            let native_clients = monitor_clients + usize::from(settings_visible_events.get());
             if lifecycle
                 .borrow_mut()
                 .as_mut()
-                .is_some_and(|life| life.should_exit(Some(counts), Instant::now()))
+                .is_some_and(|life| life.should_exit(Some(native_clients), Instant::now()))
             {
                 let _ = slint::quit_event_loop();
                 return;
@@ -675,6 +1658,93 @@ thread_local! {static UPLOAD:RefCell<RenderCache>=const{RefCell::new(RenderCache
 
 #[cfg(test)]
 mod overlay_routing_tests {
+    use slint::Model;
+
+    #[test]
+    fn native_refresh_panics_are_caught_for_event_loop_recovery() {
+        let error = super::catch_refresh(|| panic!("simulated native refresh panic"));
+        assert!(error.is_some_and(|message| message.contains("simulated native refresh panic")));
+        assert!(super::catch_refresh(|| {}).is_none());
+    }
+
+    #[test]
+    fn native_settings_marks_only_pixel_seek_as_available() {
+        let fields = super::settings_fields(&serde_json::json!({}));
+        let engine = fields.iter().find(|field| field.key == "engine").unwrap();
+        assert_eq!(engine.kind, "engine");
+        let sections = fields
+            .iter()
+            .filter(|field| field.kind == "section")
+            .map(|field| field.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sections,
+            [
+                "PROFILES",
+                "DETECTION ENGINE",
+                "MAIN",
+                "MOTION",
+                "AUTO",
+                "RECOIL",
+                "SETTINGS"
+            ]
+        );
+    }
+
+    #[test]
+    fn native_settings_show_all_choice_options_and_active_profile() {
+        let fields = super::settings_fields(&serde_json::json!({
+            "profiles":[{"name":"Default"},{"name":"Low recoil"}],
+            "activeProfile":0,
+            "pixelColor":"red",
+            "scale":"Smooth",
+            "triggerButton":"right",
+            "auto":{"mode":"center","triggerButton":"m4"}
+        }));
+        let field = |key| fields.iter().find(|field| field.key == key).unwrap();
+        let colors = field("pixelColor")
+            .choices
+            .iter()
+            .map(|choice| choice.label.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(colors, ["Yellow", "Red", "Purple"]);
+        assert_eq!(field("pixelColor").value.as_str(), "red");
+        let profiles = field("profile.select")
+            .choices
+            .iter()
+            .map(|choice| choice.value.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(profiles, ["Default", "Low recoil"]);
+        assert_eq!(field("profile.actions").choices.row_count(), 4);
+    }
+
+    #[test]
+    fn native_aim_settings_hide_unused_auto_motion_fields() {
+        let mut settings = serde_json::json!({
+            "auto": {
+                "mode": "aim",
+                "speedX": 0.5,
+                "speedY": 0.5,
+                "smoothFovDegrees": 20,
+                "smoothingXMin": 1,
+                "smoothingXMax": 2,
+                "smoothingYMin": 1,
+                "smoothingYMax": 2,
+                "offsetX": 0,
+                "offsetY": 0
+            }
+        });
+        let fields = super::settings_fields(&settings);
+        assert!(fields.iter().any(|field| field.key == "auto.offsetX"));
+        assert!(!fields.iter().any(|field| field.key == "auto.speedX"));
+        assert!(!fields.iter().any(|field| field.key == "auto.smoothingXMin"));
+
+        settings["auto"]["mode"] = serde_json::json!("center");
+        let fields = super::settings_fields(&settings);
+        assert!(fields.iter().any(|field| field.key == "auto.speedX"));
+        assert!(fields.iter().any(|field| field.key == "auto.smoothingXMin"));
+    }
+
     #[test]
     fn auto_hides_reticle_through_center_loss_and_pending_delay() {
         let mut meta: sysx_ui::protocol::LiveFrame = serde_json::from_value(serde_json::json!({
@@ -790,8 +1860,9 @@ mod render_tests {
                 view.frame = Some(Arc::new(
                     crate::native_monitor::decode(crate::native_monitor::PendingFrame {
                         metadata: crate::native_monitor::sample_metadata(),
-                        mask: None,
-                        jpeg: include_bytes!("../../src/assets/red-cube-192.jpg").to_vec(),
+                        payload: include_bytes!("../../src/assets/red-cube-192.jpg").to_vec(),
+                        payload_start: 0,
+                        mask_bytes: 0,
                         received: Instant::now(),
                     })
                     .unwrap(),
@@ -822,5 +1893,52 @@ mod render_tests {
             }
         }
         app.hide().unwrap();
+        drop(app);
+
+        window.set_size(slint::PhysicalSize::new(760, 720));
+        let settings = SettingsWindow::new().unwrap();
+        if !cfg!(windows) {
+            settings.set_body_font("DejaVu Sans".into());
+            settings.set_mono_font("DejaVu Sans Mono".into());
+        }
+        settings.set_fields(ModelRc::new(VecModel::from(settings_fields(
+            &serde_json::json!({
+                "profiles":[{"name":"Default"},{"name":"Low recoil"}],"activeProfile":0,
+                "pixelColor":"yellow","fovDegrees":90,"colorFilter":false,
+                "cropResolution":256,"scale":"Smooth","motionEnabled":true,
+                "motionAlwaysOn":false,"motionNoDeadzone":true,"triggerButton":"right",
+                "offsetX":0,"offsetY":0,"motionSpeedX":0.045,"motionSpeedY":0.045,
+                "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
+                "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,
+                "motionRenderer":{"enabled":false},
+                "auto":{"enabled":false,"mode":"center","triggerButton":"m4",
+                    "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0,
+                    "offsetX":0,"offsetY":0,"speedX":0.045,"speedY":0.045,
+                    "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
+                    "smoothingYMin":1,"smoothingYMax":3},
+                "recoil":{"recoilEnabled":false,"recoilLevels":[1,2,3],
+                    "recoilPercentage":50,"recoilStartDelayMs":100,"recoilLevelDurationMs":50},
+                "port":4200
+            }),
+        ))));
+        settings.show().unwrap();
+        settings.invoke_reset_scroll();
+        let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
+        window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, 760);
+        });
+        assert!(pixels.iter().any(|p| p.r != 0 || p.g != 0 || p.b != 0));
+        if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw = pixels
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b])
+                .collect::<Vec<_>>();
+            image::RgbImage::from_raw(760, 720, raw)
+                .unwrap()
+                .save(std::path::Path::new(&dir).join("settings-native.png"))
+                .unwrap();
+        }
+        settings.hide().unwrap();
     }
 }

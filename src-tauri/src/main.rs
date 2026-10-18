@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod auto;
 #[path = "../../native-shared/diagnostics.rs"]
@@ -24,8 +27,12 @@ fn main() {
     }
     security::start_release_guard();
     timer_resolution::request_fine_timer();
-    native_app::run();
-    diagnostics::finish_session("native application returned normally");
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(native_app::run)) {
+        Ok(()) => diagnostics::finish_session("native application returned normally"),
+        Err(_) => diagnostics::finish_session(
+            "native host caught an unwinding panic; see the crash report for details",
+        ),
+    }
 }
 
 #[path = "../../native-shared/motion_capture.rs"]

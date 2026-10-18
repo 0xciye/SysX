@@ -15,21 +15,13 @@ jobs:
       ORT_SKIP_DOWNLOAD: '1'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - name: Install Rust and verified Trunk release
+      - name: Install Rust toolchain
         shell: pwsh
         run: |
           rustup update stable
           if ($LASTEXITCODE -ne 0) { throw 'Rust update failed' }
           rustup default stable
           if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
-          rustup target add wasm32-unknown-unknown
-          if ($LASTEXITCODE -ne 0) { throw 'WASM target install failed' }
-          gh release download v0.21.14 --repo trunk-rs/trunk --pattern 'trunk-x86_64-pc-windows-msvc.zip*' --dir "$env:RUNNER_TEMP/trunk"
-          if ($LASTEXITCODE -ne 0) { throw 'Trunk download failed' }
-          $zip = "$env:RUNNER_TEMP/trunk/trunk-x86_64-pc-windows-msvc.zip"
-          $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $expected) { throw 'Trunk checksum mismatch' }
-          Expand-Archive $zip -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
       - name: Install NASM for libjpeg-turbo SIMD
         shell: pwsh
         run: |

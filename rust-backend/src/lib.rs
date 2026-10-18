@@ -23,7 +23,6 @@ pub mod targeting;
 #[path = "../../native-shared/timer_resolution.rs"]
 pub mod timer_resolution;
 pub mod udp;
-pub mod web_config;
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     cli::run(args)

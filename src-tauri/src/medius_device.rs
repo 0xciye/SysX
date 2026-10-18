@@ -1,5 +1,6 @@
 //! All Medius output uses the vendor Rust SDK, never hand-written wire frames.
 use medius::{Button, Device};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 /// Press-to-release time of one Auto click, drawn per click. A press and
@@ -15,18 +16,26 @@ fn click_press() -> Duration {
     Duration::from_millis(CLICK_PRESS_MS.0 + offset)
 }
 
+fn release_left(device: &Device) -> Result<(), String> {
+    let release = || {
+        catch_unwind(AssertUnwindSafe(|| device.release(Button::LEFT)))
+            .map_err(|_| "Medius button release panicked".to_owned())?
+            .map_err(|error| error.to_string())
+    };
+    release().or_else(|_| release())
+}
+
 pub fn dispatch(device: &Device, record: &[u8]) -> Result<(), String> {
     if crate::serial_queue::is_medius_left_click(record) {
-        device
-            .press(Button::LEFT)
-            .map_err(|error| error.to_string())?;
+        let pressed = catch_unwind(AssertUnwindSafe(|| device.press(Button::LEFT)))
+            .map_err(|_| "Medius button press panicked".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
         // Runs on the output worker, so button telemetry keeps flowing.
-        std::thread::sleep(click_press());
-        // Retry once: a failed release would leave the button held.
-        device
-            .release(Button::LEFT)
-            .or_else(|_| device.release(Button::LEFT))
-            .map_err(|error| error.to_string())
+        if pressed.is_ok() {
+            std::thread::sleep(click_press());
+        }
+        let released = release_left(device);
+        pressed.and(released)
     } else {
         let (dx, dy) = crate::serial_queue::decode_medius_move(record)
             .ok_or_else(|| "unsupported Medius queue record".to_string())?;

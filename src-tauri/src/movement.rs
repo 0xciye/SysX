@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,8 @@ pub struct RecoilSettings {
 pub struct MovementTarget {
     #[serde(default, alias = "configRevision")]
     pub config_revision: u64,
+    #[serde(skip)]
+    target_track: u64,
     #[serde(alias = "targetValid")]
     pub target_valid: bool,
     pub dx: i64,
@@ -47,16 +50,52 @@ pub struct MovementState {
     /// Auto's aim move, so no later or older Motion event can merge it away.
     flick: Mutex<Option<MovementTarget>>,
     latest_target: Mutex<Option<MovementTarget>>,
+    latest_flick_target: Mutex<Option<MovementTarget>>,
     recoil: Mutex<RecoilSettings>,
+    next_target_track: AtomicU64,
 }
 
 pub fn set_target(state: &MovementState, value: &serde_json::Value) {
-    let Ok(target) = serde_json::from_value::<MovementTarget>(value.clone()) else {
+    let Ok(mut target) = serde_json::from_value::<MovementTarget>(value.clone()) else {
         return;
     };
     set_recoil_settings(state, target.recoil.clone());
+    let mut config_changed = false;
     if let Ok(mut latest) = state.latest_target.lock() {
+        let previous = latest.as_ref();
+        config_changed =
+            previous.is_some_and(|previous| previous.config_revision != target.config_revision);
+        if target.target_valid {
+            target.target_track = match previous.filter(|previous| {
+                previous.target_valid
+                    && previous.config_revision == target.config_revision
+                    && previous.flick == target.flick
+                    && previous.is_fresh_at(target.timestamp_ms)
+            }) {
+                Some(previous) => previous.target_track,
+                None if previous.is_none() => 0,
+                None => state.next_target_track.fetch_add(1, Ordering::Relaxed) + 1,
+            };
+        } else if let Some(previous) = previous {
+            target.target_track = previous.target_track;
+        }
         *latest = Some(target.clone());
+    }
+    if config_changed {
+        if let Ok(mut pending) = state.pending.lock() {
+            *pending = None;
+        }
+        if let Ok(mut flick) = state.flick.lock() {
+            *flick = None;
+        }
+        if let Ok(mut latest_flick) = state.latest_flick_target.lock() {
+            *latest_flick = None;
+        }
+    }
+    if target.flick {
+        if let Ok(mut latest) = state.latest_flick_target.lock() {
+            *latest = Some(target.clone());
+        }
     }
     if target.flick && (target.dx != 0 || target.dy != 0) {
         if let Ok(mut flick) = state.flick.lock() {
@@ -123,6 +162,22 @@ pub fn restore_remainder(state: &MovementState, remainder: MovementTarget) {
     if remainder.dx == 0 && remainder.dy == 0 {
         return;
     }
+    let latest_target = if remainder.flick {
+        &state.latest_flick_target
+    } else {
+        &state.latest_target
+    };
+    let belongs_to_latest = latest_target.lock().is_ok_and(|latest| {
+        latest.as_ref().is_some_and(|latest| {
+            latest.target_valid
+                && latest.config_revision == remainder.config_revision
+                && latest.target_track == remainder.target_track
+                && latest.flick == remainder.flick
+        })
+    });
+    if !belongs_to_latest {
+        return;
+    }
     if remainder.flick {
         if let Ok(mut flick) = state.flick.lock() {
             flick.get_or_insert(remainder);
@@ -163,6 +218,8 @@ impl MovementTarget {
             if let Some(previous) = previous.filter(|previous| {
                 previous.target_valid
                     && previous.config_revision == current.config_revision
+                    && previous.target_track == current.target_track
+                    && previous.flick == current.flick
                     && previous.is_fresh_at(current.timestamp_ms)
             }) {
                 current.dx = previous.dx.saturating_add(current.dx);
@@ -520,6 +577,14 @@ mod tests {
         assert_eq!(remainder.dy, 0, "recoil alone overflowed");
 
         let state = MovementState::default();
+        let event = |valid: bool, dx: i64, dy: i64| {
+            serde_json::json!({
+                "target_valid": valid, "dx": dx, "dy": dy, "motion_enabled": true,
+                "motion_always_on": false, "trigger_button": "right",
+                "timestamp_ms": 1_004, "recoil": {},
+            })
+        };
+        set_target(&state, &event(true, 0, 0));
         restore_remainder(
             &state,
             MovementTarget {
@@ -529,13 +594,6 @@ mod tests {
                 ..target.clone()
             },
         );
-        let event = |valid: bool, dx: i64, dy: i64| {
-            serde_json::json!({
-                "target_valid": valid, "dx": dx, "dy": dy, "motion_enabled": true,
-                "motion_always_on": false, "trigger_button": "right",
-                "timestamp_ms": 1_004, "recoil": {},
-            })
-        };
         set_target(&state, &event(true, 2, 1));
         let merged = state.pending.lock().unwrap().clone().unwrap();
         assert_eq!((merged.dx, merged.dy, merged.timestamp_ms), (15, -7, 1_004));
@@ -553,6 +611,64 @@ mod tests {
         );
         let merged = state.pending.lock().unwrap().clone().unwrap();
         assert_eq!((merged.dx, merged.dy, merged.target_valid), (0, 0, false));
+    }
+
+    #[test]
+    fn a_clamped_remainder_is_discarded_after_target_reacquisition() {
+        use super::take_target;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let event = |target_valid, dx| {
+            serde_json::json!({
+                "config_revision": 7, "target_valid": target_valid, "dx": dx, "dy": 0,
+                "motion_enabled": true, "motion_always_on": false,
+                "trigger_button": "right", "timestamp_ms": now_ms, "recoil": {},
+            })
+        };
+        let state = MovementState::default();
+        set_target(&state, &event(true, 45));
+        let old_target = take_target(&state).expect("initial track target");
+        let (_, old_remainder) = old_target.device_move(0);
+
+        set_target(&state, &event(false, 0));
+        set_target(&state, &event(true, 5));
+        restore_remainder(&state, old_remainder);
+
+        let new_target = take_target(&state).expect("reacquired track target");
+        assert_eq!(new_target.dx, 5, "old clipped motion cannot leak tracks");
+    }
+
+    #[test]
+    fn config_revision_change_clears_old_flick_before_queuing_new_motion() {
+        use super::{has_pending_move, take_target};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let event = |config_revision, flick, dx| {
+            serde_json::json!({
+                "config_revision": config_revision, "target_valid": true,
+                "dx": dx, "dy": 0, "flick": flick,
+                "motion_enabled": true, "motion_always_on": false,
+                "trigger_button": "right", "timestamp_ms": now_ms, "recoil": {},
+            })
+        };
+        let state = MovementState::default();
+
+        set_target(&state, &event(1, true, 300));
+        assert!(has_pending_move(&state));
+
+        set_target(&state, &event(2, false, 7));
+
+        let new_target = take_target(&state).expect("new-revision movement remains queued");
+        assert!(!new_target.flick);
+        assert_eq!(new_target.dx, 7);
+        assert!(
+            take_target(&state).is_none(),
+            "old-revision flick was cleared"
+        );
     }
 
     #[test]
