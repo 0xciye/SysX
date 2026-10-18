@@ -1880,6 +1880,7 @@ pub fn run(
     let settings_weak_events = settings_app.as_weak();
     let settings_commands_events = commands.clone();
     let mut apply_success_until = None::<Instant>;
+    let mut reloaded_for = None::<u8>;
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(100),
@@ -1891,7 +1892,8 @@ pub fn run(
                         let event = value.get("event").and_then(|event| event.as_str());
                         let command_type = value.get("type").and_then(|value| value.as_str());
                         if event == Some("app_settings") && !settings_dirty_events.get() {
-                            apply_success_until = None;
+                            // The reload right after Apply keeps its success message.
+                            let keep_status = apply_success_until.is_some();
                             if let Some(settings) = value.get("settings") {
                                 *settings_draft_events.borrow_mut() = Some(settings.clone());
                                 settings_dirty_events.set(false);
@@ -1912,14 +1914,24 @@ pub fn run(
                                 if let Some(app) = settings_weak_events.upgrade() {
                                     show_settings(&app, settings);
                                     sync_flags(&app, false, &HashSet::new());
-                                    set_status(&app, "".into());
+                                    if !keep_status {
+                                        set_status(&app, "".into());
+                                    }
                                 }
                             }
-                        } else if command_type == Some("apply_app_settings") {
+                        } else if command_type == Some("apply_app_settings")
+                            || value.get("request_id").and_then(|id| id.as_str())
+                                == Some("native-settings")
+                        {
                             if let Some(app) = settings_weak_events.upgrade() {
                                 if event == Some("ack") {
                                     settings_dirty_events.set(false);
                                     invalid_settings_events.borrow_mut().clear();
+                                    // Reload: the backend keeps a profile the
+                                    // middle button selected after this draft.
+                                    let _ = settings_commands_events.try_send(serde_json::json!({
+                                        "version":1,"type":"get_app_settings"
+                                    }));
                                     apply_success_until =
                                         Some(Instant::now() + Duration::from_secs(3));
                                     sync_flags(&app, false, &HashSet::new());
@@ -1979,6 +1991,28 @@ pub fn run(
                         return;
                     }
                     Err(TryRecvError::Empty) => break,
+                }
+            }
+            // The middle button cycled profiles: reload an unedited Settings
+            // draft so it shows (and later applies) the active profile.
+            if settings_visible_events.get() && !settings_dirty_events.get() {
+                let active = view
+                    .lock()
+                    .ok()
+                    .and_then(|view| view.state.as_ref().map(|state| state.profile_index));
+                let draft_active = settings_draft_events
+                    .borrow()
+                    .as_ref()
+                    .and_then(|settings| settings.get("activeProfile")?.as_u64());
+                if let (Some(active), Some(draft_active)) = (active, draft_active) {
+                    if u64::from(active) == draft_active {
+                        reloaded_for = None;
+                    } else if reloaded_for != Some(active) {
+                        reloaded_for = Some(active);
+                        let _ = settings_commands_events.try_send(serde_json::json!({
+                            "version":1,"type":"get_app_settings"
+                        }));
+                    }
                 }
             }
             if apply_success_until.is_some_and(|deadline| Instant::now() >= deadline) {

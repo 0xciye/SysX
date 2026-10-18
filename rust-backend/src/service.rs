@@ -33,6 +33,10 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 const UDP_RETRY: Duration = Duration::from_secs(3);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// WebSocket limit above the command limit, so an oversized command gets an
+/// error reply instead of closing the socket (closing the host's socket
+/// stops the backend).
+const MAX_SOCKET_MESSAGE_BYTES: usize = 1024 * 1024;
 
 fn emit_stdout_line(line: &str) {
     let mut stdout = std::io::stdout().lock();
@@ -925,6 +929,22 @@ impl ReceiverService {
                         .clone();
                 }
                 settings.sync_active_profile();
+                // Settings changes profiles only through activate_profile; a
+                // draft whose profile differs was taken before a middle-click
+                // cycle. Save its edits into that profile but keep the current
+                // one active instead of switching back.
+                let current_active = self
+                    .settings
+                    .lock()
+                    .map_err(|_| "settings lock poisoned")?
+                    .active_profile;
+                if settings.active_profile != current_active
+                    && usize::from(current_active) < settings.profiles.len()
+                {
+                    settings
+                        .activate_profile(usize::from(current_active))
+                        .map_err(|error| error.to_string())?;
+                }
                 settings.validate().map_err(|error| error.to_string())?;
                 let port = settings
                     .port
@@ -1745,8 +1765,8 @@ async fn websocket_route(
     let Some(role) = ClientRole::parse(query.role.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "unsupported client role").into_response();
     };
-    ws.max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES)
+    ws.max_message_size(MAX_SOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_SOCKET_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             socket_loop(socket, state.service, role).await;
             // The native host keeps one role=host connection for its whole
@@ -1794,7 +1814,9 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
             message = socket.recv() => {
                 let Some(Ok(Message::Text(text))) = message else { break; };
                 if text.len() > MAX_MESSAGE_BYTES {
-                    if send_text(&mut socket, json!({"event":"error","message":"commands must be under 64 KiB"})).await.is_err() { break; }
+                    let mut event = oversized_command_error(&text);
+                    service.record_error("commands must be under 64 KiB".into());
+                    if send_text(&mut socket, event).await.is_err() { break; }
                     continue;
                 }
                 let parsed = serde_json::from_str::<Value>(&text);
@@ -1977,6 +1999,27 @@ fn parse_device_status(command: &Value) -> Result<Value, String> {
         })
         .ok_or("device buttons must be five booleans or nulls")?;
     Ok(json!({"state":state,"name":name,"buttons":buttons}))
+}
+
+#[derive(serde::Deserialize)]
+struct CommandHeader {
+    #[serde(rename = "type")]
+    kind: Option<Value>,
+    request_id: Option<Value>,
+}
+
+/// The error for a command too large to run, with its type and request id
+/// so the client that sent it is told it failed.
+fn oversized_command_error(text: &str) -> Value {
+    let header = serde_json::from_str::<CommandHeader>(text).ok();
+    let (kind, request_id) = header.map_or((None, None), |header| (header.kind, header.request_id));
+    let mut event = json!({
+        "event":"error",
+        "type":kind,
+        "message":"commands must be under 64 KiB"
+    });
+    attach_request_id(&mut event, request_id);
+    event
 }
 
 fn attach_request_id(event: &mut Value, request_id: Option<Value>) {
@@ -2919,6 +2962,54 @@ mod tests {
             saved.profiles[0].settings["motionNoDeadzone"], true,
             "active profile snapshot is synchronized before saving"
         );
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn an_oversized_command_is_answered_with_its_type_and_request_id() {
+        let padding = "x".repeat(MAX_MESSAGE_BYTES);
+        let text = json!({
+            "version":1,"type":"apply_app_settings","request_id":"native-settings",
+            "settings":{"padding":padding}
+        })
+        .to_string();
+        let event = oversized_command_error(&text);
+        assert_eq!(event["event"], "error");
+        assert_eq!(event["type"], "apply_app_settings");
+        assert_eq!(event["request_id"], "native-settings");
+        assert_eq!(oversized_command_error("not json")["event"], "error");
+        assert!(MAX_SOCKET_MESSAGE_BYTES > MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn applying_a_draft_from_before_a_profile_cycle_keeps_the_new_profile_active() {
+        let (service, data_dir) = test_service("native-app-settings-profile-cycle");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        service
+            .dispatch(json!({"version":1,"type":"create_profile","duplicate":true}))
+            .expect("create a second profile");
+        service
+            .dispatch(json!({"version":1,"type":"activate_profile","index":0}))
+            .expect("select the first profile");
+        let draft = service
+            .dispatch(json!({"version":1,"type":"get_app_settings"}))
+            .expect("load the Settings draft")["settings"]
+            .clone();
+        // The middle button cycles to the second profile while Settings edits.
+        service.cycle_profile().expect("cycle profiles");
+        let mut draft: AppSettings = serde_json::from_value(draft).unwrap();
+        draft.motion_no_deadzone = true;
+        service
+            .dispatch(json!({"version":1,"type":"apply_app_settings","settings":draft}))
+            .expect("apply the stale draft");
+
+        let saved = load_settings(service.settings_path.clone());
+        assert_eq!(saved.active_profile, 1, "the cycled profile stays active");
+        assert!(!saved.motion_no_deadzone);
+        assert_eq!(saved.profiles[0].settings["motionNoDeadzone"], true);
+        assert_eq!(service.state()["profile_index"], 1);
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
