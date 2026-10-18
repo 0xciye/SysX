@@ -1,6 +1,6 @@
 use crate::crop::CropRect;
 use crate::results::DetectionObject;
-use crate::targeting::{fov_radius_px, fov_row_bounds, highest_pixel_in_fov, FrameCoordinate};
+use crate::targeting::{highest_pixel_in_fov, highest_pixel_in_fov_within, FrameCoordinate};
 use image::RgbImage;
 use std::sync::OnceLock;
 
@@ -38,8 +38,6 @@ pub struct PixelSeekOutput {
     pub objects: Vec<DetectionObject>,
     pub target: Option<FrameCoordinate>,
     pub mask: Vec<u8>,
-    /// No target was found inside the current fresh lock region.
-    pub lock_miss: bool,
 }
 
 #[derive(Default)]
@@ -80,12 +78,6 @@ impl PixelSeekScratch {
         let was_visited = self.visited_words[word] & bit != 0;
         self.visited_words[word] |= bit;
         !was_visited
-    }
-
-    fn is_visited(&self, index: usize) -> bool {
-        let word = index / u64::BITS as usize;
-        self.visited_epochs.get(word) == Some(&self.generation)
-            && self.visited_words[word] & (1u64 << (index % u64::BITS as usize)) != 0
     }
 }
 
@@ -192,49 +184,28 @@ pub(crate) fn try_pack_mask(mask: &[u8]) -> Option<Vec<u8>> {
 const LOCK_MARGIN_PX: f32 = 12.0;
 /// Lock margin as a fraction of the previous box's larger side.
 const LOCK_MARGIN_RATIO: f32 = 0.5;
-/// Reject detached candidates beyond this unpredicted frame-to-frame gap.
-const MAX_LOCK_GAP_PX: f32 = 6.0;
-/// Keep associations inside the lock region rather than accepting edge noise.
-const MAX_LOCK_ASSOCIATION_DISTANCE_SQUARED: f32 = 1.0;
-pub(crate) const MAX_PIXEL_TRACK_SPEED_PX_PER_SECOND: f32 = 64.0 * 360.0;
-/// Prediction error may grow the search region, but never without a bound.
-const MAX_LOCK_PREDICTION_ERROR_PX: f32 = 16.0;
 
 /// Search window for a locked target: the previous blob's box (original-frame
 /// coordinates) grown by a margin, in crop pixels `[left, top, right, bottom)`.
 /// Higher pixels that appear next to the target fall inside it, so the target
 /// keeps climbing; a separate blob elsewhere in the FOV does not.
-fn lock_region(
-    previous: [f32; 4],
-    predicted_shift: [f32; 2],
-    crop: CropRect,
-    width: u32,
-    height: u32,
-) -> Option<[u32; 4]> {
+fn lock_region(previous: [f32; 4], crop: CropRect, width: u32, height: u32) -> Option<[u32; 4]> {
     if !previous.iter().all(|value| value.is_finite()) {
         return None;
     }
-    let predicted_shift = predicted_shift.map(|value| if value.is_finite() { value } else { 0.0 });
     let [left, top, right, bottom] = [
-        previous[0] + predicted_shift[0] - crop.x as f32,
-        previous[1] + predicted_shift[1] - crop.y as f32,
-        previous[2] + predicted_shift[0] - crop.x as f32,
-        previous[3] + predicted_shift[1] - crop.y as f32,
+        previous[0] - crop.x as f32,
+        previous[1] - crop.y as f32,
+        previous[2] - crop.x as f32,
+        previous[3] - crop.y as f32,
     ];
-    if right <= 0.0 || bottom <= 0.0 || left >= width as f32 || top >= height as f32 {
-        return None;
-    }
-    let prediction_error =
-        predicted_shift.map(|value| (value.abs() * 0.25).min(MAX_LOCK_PREDICTION_ERROR_PX));
     let margin = LOCK_MARGIN_PX.max((right - left).max(bottom - top) * LOCK_MARGIN_RATIO);
-    let margin_x = margin + prediction_error[0];
-    let margin_y = margin + prediction_error[1];
     let clamp = |value: f32, max: u32| value.clamp(0.0, max as f32) as u32;
     let region = [
-        clamp((left - margin_x).floor(), width),
-        clamp((top - margin_y).floor(), height),
-        clamp((right + margin_x).ceil(), width),
-        clamp((bottom + margin_y).ceil(), height),
+        clamp((left - margin).floor(), width),
+        clamp((top - margin).floor(), height),
+        clamp((right + margin).ceil(), width),
+        clamp((bottom + margin).ceil(), height),
     ];
     (region[0] < region[2] && region[1] < region[3]).then_some(region)
 }
@@ -242,17 +213,15 @@ fn lock_region(
 struct PixelBlob {
     bbox_xyxy: [f32; 4],
     count: u32,
-    target: FrameCoordinate,
 }
 
+/// The connected (8-neighbour) mask component containing `seed`.
 fn extract_blob(
     mask: &[u8],
     width: u32,
     height: u32,
     source_crop: CropRect,
     seed: FrameCoordinate,
-    anchor_x: f32,
-    fov_radius: f32,
     scratch: &mut PixelSeekScratch,
 ) -> Result<PixelBlob, ()> {
     let start = (seed.y as u32 * width + seed.x as u32) as usize;
@@ -264,10 +233,6 @@ fn extract_blob(
     scratch.mark_visited(start);
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
     let mut count = 0u32;
-    let mut target_pixel: Option<(u32, u32)> = None;
-    let mut target_x_distance_squared = f32::INFINITY;
-    let (center_x, center_y) = (width as f32 / 2.0, height as f32 / 2.0);
-    let mut allocation_failed = false;
 
     while let Some(index) = scratch.stack.pop() {
         let index = index as usize;
@@ -278,22 +243,6 @@ fn extract_blob(
         max_x = max_x.max(x);
         max_y = max_y.max(y);
         count += 1;
-        let (dx, dy) = (x as f32 + 0.5 - center_x, y as f32 + 0.5 - center_y);
-        if dx * dx + dy * dy <= fov_radius * fov_radius
-            && target_pixel.is_none_or(|(_, target_y)| y <= target_y)
-        {
-            let x_delta = x as f32 + 0.5 - anchor_x;
-            let x_distance_squared = x_delta * x_delta;
-            if target_pixel.is_none_or(|(target_x, target_y)| {
-                y < target_y
-                    || (y == target_y
-                        && (x_distance_squared < target_x_distance_squared
-                            || (x_distance_squared == target_x_distance_squared && x < target_x)))
-            }) {
-                target_pixel = Some((x, y));
-                target_x_distance_squared = x_distance_squared;
-            }
-        }
         for ny in y.saturating_sub(1)..=y.saturating_add(1).min(height - 1) {
             for nx in x.saturating_sub(1)..=x.saturating_add(1).min(width - 1) {
                 if nx == x && ny == y {
@@ -304,25 +253,14 @@ fn extract_blob(
                     if scratch.stack.len() == scratch.stack.capacity() {
                         let additional = scratch.stack.capacity().max(64);
                         if scratch.stack.try_reserve(additional).is_err() {
-                            allocation_failed = true;
-                            break;
+                            return Err(());
                         }
                     }
                     scratch.stack.push(next as u32);
                 }
             }
-            if allocation_failed {
-                break;
-            }
-        }
-        if allocation_failed {
-            break;
         }
     }
-    if allocation_failed {
-        return Err(());
-    }
-    let target = target_pixel.ok_or(())?;
     Ok(PixelBlob {
         bbox_xyxy: [
             min_x as f32 + source_crop.x as f32,
@@ -331,178 +269,7 @@ fn extract_blob(
             (max_y + 1) as f32 + source_crop.y as f32,
         ],
         count,
-        target: FrameCoordinate {
-            x: target.0 as f32 + 0.5 + source_crop.x as f32,
-            y: target.1 as f32 + 0.5 + source_crop.y as f32,
-        },
     })
-}
-
-fn lock_overlap_score(
-    bbox: [f32; 4],
-    previous: [f32; 4],
-    predicted_shift: [f32; 2],
-) -> Option<f32> {
-    let predicted = [
-        previous[0] + predicted_shift[0],
-        previous[1] + predicted_shift[1],
-        previous[2] + predicted_shift[0],
-        previous[3] + predicted_shift[1],
-    ];
-    let x_gap = ((bbox[0] + bbox[2]) - (predicted[0] + predicted[2])).abs() * 0.5;
-    let y_gap = ((bbox[1] + bbox[3]) - (predicted[1] + predicted[3])).abs() * 0.5;
-    let lock_gap = MAX_LOCK_GAP_PX.max(
-        (predicted[2] - predicted[0])
-            .max(predicted[3] - predicted[1])
-            .max(0.0)
-            * LOCK_MARGIN_RATIO,
-    );
-    let prediction_error =
-        predicted_shift.map(|value| (value.abs() * 0.25).min(MAX_LOCK_PREDICTION_ERROR_PX));
-    let max_gap_x = lock_gap + prediction_error[0];
-    let max_gap_y = lock_gap + prediction_error[1];
-    if (x_gap / max_gap_x).powi(2) + (y_gap / max_gap_y).powi(2) > 1.0 {
-        return None;
-    }
-
-    let intersection = (bbox[2].min(predicted[2]) - bbox[0].max(predicted[0])).max(0.0)
-        * (bbox[3].min(predicted[3]) - bbox[1].max(predicted[1])).max(0.0);
-    let area = (bbox[2] - bbox[0]).max(0.0) * (bbox[3] - bbox[1]).max(0.0);
-    let predicted_area =
-        (predicted[2] - predicted[0]).max(0.0) * (predicted[3] - predicted[1]).max(0.0);
-    let union = area + predicted_area - intersection;
-    Some(if union > 0.0 {
-        intersection / union
-    } else {
-        0.0
-    })
-}
-
-fn best_locked_blob(
-    mask: &[u8],
-    width: u32,
-    height: u32,
-    source_crop: CropRect,
-    degrees: u16,
-    region: [u32; 4],
-    anchor: [f32; 2],
-    previous: [f32; 4],
-    predicted_shift: [f32; 2],
-    scratch: &mut PixelSeekScratch,
-) -> Result<Option<PixelBlob>, ()> {
-    if !(1..=360).contains(&degrees) || !anchor.iter().all(|value| value.is_finite()) {
-        return Ok(None);
-    }
-    let [left, region_top, right, region_bottom] = [
-        region[0].min(width),
-        region[1].min(height),
-        region[2].min(width),
-        region[3].min(height),
-    ];
-    let radius = fov_radius_px(width, height, degrees);
-    let radius_squared = radius * radius;
-    let (center_x, center_y) = (width as f32 / 2.0, height as f32 / 2.0);
-    let (fov_top, fov_bottom) = fov_row_bounds(height, radius);
-    let top = region_top.max(fov_top);
-    let bottom = region_bottom.min(fov_bottom);
-    let predicted_center = [
-        (previous[0] + previous[2]) * 0.5 + predicted_shift[0],
-        (previous[1] + previous[3]) * 0.5 + predicted_shift[1],
-    ];
-    let lock_gap = MAX_LOCK_GAP_PX.max(
-        (previous[2] - previous[0])
-            .max(previous[3] - previous[1])
-            .max(0.0)
-            * LOCK_MARGIN_RATIO,
-    );
-    let prediction_error =
-        predicted_shift.map(|value| (value.abs() * 0.25).min(MAX_LOCK_PREDICTION_ERROR_PX));
-    let max_gap_x = lock_gap + prediction_error[0];
-    let max_gap_y = lock_gap + prediction_error[1];
-    let previous_area =
-        ((previous[2] - previous[0]).max(0.0) * (previous[3] - previous[1]).max(0.0)) as u64;
-    let mut best: Option<((f32, f32), PixelBlob)> = None;
-
-    for y in top..bottom {
-        let dy = y as f32 + 0.5 - center_y;
-        let dy_squared = dy * dy;
-        if dy_squared > radius_squared {
-            continue;
-        }
-        let half_width = (radius_squared - dy_squared).max(0.0).sqrt();
-        let row_left = ((center_x - half_width - 0.5).floor() as i64)
-            .max(left as i64)
-            .max(0) as u32;
-        let row_right = ((center_x + half_width - 0.5).ceil() as i64 + 1)
-            .min(right as i64)
-            .min(width as i64)
-            .max(0) as u32;
-        for x in row_left..row_right {
-            let index = (y * width + x) as usize;
-            if mask[index] == 0 || scratch.is_visited(index) {
-                continue;
-            }
-            let dx = x as f32 + 0.5 - center_x;
-            if dx * dx + dy_squared > radius_squared {
-                continue;
-            }
-            let blob = extract_blob(
-                mask,
-                width,
-                height,
-                source_crop,
-                FrameCoordinate {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                },
-                anchor[0],
-                radius,
-                scratch,
-            )?;
-            let Some(overlap) = lock_overlap_score(blob.bbox_xyxy, previous, predicted_shift)
-            else {
-                continue;
-            };
-            // A one-pixel speck inside a formerly large blob is not enough
-            // evidence to inherit its lock; small targets remain valid when
-            // their prior footprint was small too.
-            if u64::from(blob.count) * 256 < previous_area {
-                continue;
-            }
-            let target = [
-                blob.target.x - source_crop.x as f32,
-                blob.target.y - source_crop.y as f32,
-            ];
-            // Balance blob continuity against center motion: a tiny overlap
-            // must not beat a much closer candidate solely due to box size.
-            let center = [
-                (blob.bbox_xyxy[0] + blob.bbox_xyxy[2]) * 0.5,
-                (blob.bbox_xyxy[1] + blob.bbox_xyxy[3]) * 0.5,
-            ];
-            let pixel_distance = (target[0] - anchor[0]).powi(2) + (target[1] - anchor[1]).powi(2);
-            let normalized_center_distance = (center[0] - predicted_center[0]).powi(2)
-                / max_gap_x.powi(2)
-                + (center[1] - predicted_center[1]).powi(2) / max_gap_y.powi(2);
-            if normalized_center_distance > MAX_LOCK_ASSOCIATION_DISTANCE_SQUARED {
-                continue;
-            }
-            let score = (
-                normalized_center_distance + 6.0 * (1.0 - overlap),
-                pixel_distance,
-            );
-            let is_better = best.as_ref().is_none_or(|(best_score, best_blob)| {
-                score < *best_score
-                    || (score == *best_score
-                        && (blob.target.y < best_blob.target.y
-                            || (blob.target.y == best_blob.target.y
-                                && blob.target.x < best_blob.target.x)))
-            });
-            if is_better {
-                best = Some((score, blob));
-            }
-        }
-    }
-    Ok(best.map(|(_, blob)| blob))
 }
 
 pub fn process_pixel_seek(
@@ -512,225 +279,69 @@ pub fn process_pixel_seek(
     fov_degrees: u16,
     locked: Option<[f32; 4]>,
 ) -> PixelSeekOutput {
-    process_pixel_seek_with_prediction(image, source_crop, color, fov_degrees, locked, [0.0; 2])
-}
-
-pub(crate) fn process_pixel_seek_with_prediction(
-    image: &RgbImage,
-    source_crop: CropRect,
-    color: PixelTargetColor,
-    fov_degrees: u16,
-    locked: Option<[f32; 4]>,
-    predicted_shift: [f32; 2],
-) -> PixelSeekOutput {
-    process_pixel_seek_with_mask(
-        image,
-        source_crop,
-        color,
-        fov_degrees,
-        locked,
-        predicted_shift,
-        color_mask(image, color),
-    )
-}
-
-pub(crate) fn process_pixel_seek_with_mask(
-    image: &RgbImage,
-    source_crop: CropRect,
-    color: PixelTargetColor,
-    fov_degrees: u16,
-    locked: Option<[f32; 4]>,
-    predicted_shift: [f32; 2],
-    mask: Vec<u8>,
-) -> PixelSeekOutput {
-    process_pixel_seek_with_mask_anchor(
-        image,
-        source_crop,
-        color,
-        fov_degrees,
-        locked,
-        predicted_shift,
-        None,
-        mask,
-    )
-}
-
-pub(crate) fn process_pixel_seek_with_mask_anchor(
-    image: &RgbImage,
-    source_crop: CropRect,
-    color: PixelTargetColor,
-    fov_degrees: u16,
-    locked: Option<[f32; 4]>,
-    predicted_shift: [f32; 2],
-    prior_pixel_target: Option<[f32; 2]>,
-    mask: Vec<u8>,
-) -> PixelSeekOutput {
     process_pixel_seek_with_scratch(
         image,
         source_crop,
         color,
         fov_degrees,
         locked,
-        predicted_shift,
-        prior_pixel_target,
-        mask,
+        color_mask(image, color),
         &mut PixelSeekScratch::default(),
     )
 }
 
+/// Exactly one target per frame. While a fresh lock exists, take the topmost
+/// FOV pixel near the locked target so two targets in the FOV do not
+/// alternate; when the locked target is gone, take the topmost mask pixel in
+/// the whole FOV. Only the blob containing it is reported.
 pub(crate) fn process_pixel_seek_with_scratch(
     image: &RgbImage,
     source_crop: CropRect,
     color: PixelTargetColor,
     fov_degrees: u16,
     locked: Option<[f32; 4]>,
-    predicted_shift: [f32; 2],
-    prior_pixel_target: Option<[f32; 2]>,
-    mask: Vec<u8>,
-    scratch: &mut PixelSeekScratch,
-) -> PixelSeekOutput {
-    process_pixel_seek_with_scratch_and_pixel_prediction(
-        image,
-        source_crop,
-        color,
-        fov_degrees,
-        locked,
-        predicted_shift,
-        predicted_shift,
-        prior_pixel_target,
-        mask,
-        scratch,
-    )
-}
-
-pub(crate) fn process_pixel_seek_with_scratch_and_pixel_prediction(
-    image: &RgbImage,
-    source_crop: CropRect,
-    color: PixelTargetColor,
-    fov_degrees: u16,
-    locked: Option<[f32; 4]>,
-    predicted_shift: [f32; 2],
-    predicted_pixel_shift: [f32; 2],
-    prior_pixel_target: Option<[f32; 2]>,
     mask: Vec<u8>,
     scratch: &mut PixelSeekScratch,
 ) -> PixelSeekOutput {
     let width = image.width();
     let height = image.height();
     scratch.release_oversized(width as usize * height as usize);
+    let empty = |mask| PixelSeekOutput {
+        objects: Vec::new(),
+        target: None,
+        mask,
+    };
     if width == 0
         || height == 0
         || mask.len() != width as usize * height as usize
         || mask.len() > u32::MAX as usize
     {
-        return PixelSeekOutput {
-            objects: Vec::new(),
-            target: None,
-            mask,
-            lock_miss: locked.is_some(),
-        };
+        return empty(mask);
     }
-    // Exactly one target per frame. While a fresh lock exists, evaluate all
-    // components in the bounded expanded lock ROI once; a plausible distractor
-    // in the old box must not hide a closer match to the moving target.
-    let predicted_shift = predicted_shift.map(|value| if value.is_finite() { value } else { 0.0 });
-    let predicted_pixel_shift =
-        predicted_pixel_shift.map(|value| if value.is_finite() { value } else { 0.0 });
-    let anchor = locked.map(|previous| {
-        let point = prior_pixel_target
-            .filter(|point| point.iter().all(|value| value.is_finite()))
-            .unwrap_or([
-                (previous[0] + previous[2]) * 0.5,
-                (previous[1] + previous[3]) * 0.5,
-            ]);
-        [
-            point[0] + predicted_pixel_shift[0] - source_crop.x as f32,
-            point[1] + predicted_pixel_shift[1] - source_crop.y as f32,
-        ]
-    });
+    let found = locked
+        .and_then(|previous| lock_region(previous, source_crop, width, height))
+        .and_then(|region| {
+            highest_pixel_in_fov_within(&mask, width, height, fov_degrees, region, None)
+        })
+        .or_else(|| highest_pixel_in_fov(&mask, width, height, fov_degrees));
+    let Some(top) = found else {
+        return empty(mask);
+    };
     let visited_words = mask.len().div_ceil(u64::BITS as usize);
     if scratch.visited_words.len() < visited_words {
         let more = visited_words - scratch.visited_words.len();
         if scratch.visited_words.try_reserve_exact(more).is_err()
             || scratch.visited_epochs.try_reserve_exact(more).is_err()
         {
-            return PixelSeekOutput {
-                objects: Vec::new(),
-                target: None,
-                mask,
-                lock_miss: locked.is_some(),
-            };
+            return empty(mask);
         }
         scratch.visited_words.resize(visited_words, 0);
         scratch.visited_epochs.resize(visited_words, 0);
     }
     scratch.advance_generation();
-    if scratch.stack.capacity() < 64 && scratch.stack.try_reserve(64).is_err() {
-        return PixelSeekOutput {
-            objects: Vec::new(),
-            target: None,
-            mask,
-            lock_miss: locked.is_some(),
-        };
-    }
-    let lock_search =
-        locked.map(|previous| lock_region(previous, predicted_shift, source_crop, width, height));
-    if lock_search.is_some_and(|search| search.is_none()) {
-        return PixelSeekOutput {
-            objects: Vec::new(),
-            target: None,
-            mask,
-            lock_miss: true,
-        };
-    }
     let (class_id, class_name) = color.class();
-    let blob = if let Some(previous) = locked {
-        let Some(region) = lock_search.flatten() else {
-            return PixelSeekOutput {
-                objects: Vec::new(),
-                target: None,
-                mask,
-                lock_miss: true,
-            };
-        };
-        let anchor = anchor.unwrap_or([width as f32 / 2.0, height as f32 / 2.0]);
-        match best_locked_blob(
-            &mask,
-            width,
-            height,
-            source_crop,
-            fov_degrees,
-            region,
-            anchor,
-            previous,
-            predicted_shift,
-            scratch,
-        ) {
-            Ok(blob) => blob,
-            Err(()) => None,
-        }
-    } else {
-        highest_pixel_in_fov(&mask, width, height, fov_degrees).and_then(|seed| {
-            extract_blob(
-                &mask,
-                width,
-                height,
-                source_crop,
-                seed,
-                width as f32 / 2.0,
-                fov_radius_px(width, height, fov_degrees),
-                scratch,
-            )
-            .ok()
-        })
-    };
-    let Some(blob) = blob else {
-        return PixelSeekOutput {
-            objects: Vec::new(),
-            target: None,
-            mask,
-            lock_miss: locked.is_some(),
-        };
+    let Ok(blob) = extract_blob(&mask, width, height, source_crop, top, scratch) else {
+        return empty(mask);
     };
     PixelSeekOutput {
         objects: vec![DetectionObject {
@@ -740,9 +351,11 @@ pub(crate) fn process_pixel_seek_with_scratch_and_pixel_prediction(
             confidence: None,
             pixel_count: Some(blob.count),
         }],
-        target: Some(blob.target),
+        target: Some(FrameCoordinate {
+            x: top.x + source_crop.x as f32,
+            y: top.y + source_crop.y as f32,
+        }),
         mask,
-        lock_miss: false,
     }
 }
 
@@ -1045,8 +658,6 @@ mod tests {
                 PixelTargetColor::Red,
                 360,
                 None,
-                [0.0; 2],
-                None,
                 color_mask(&image, PixelTargetColor::Red),
                 scratch,
             )
@@ -1154,335 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn locked_scan_clips_each_row_to_a_small_fov() {
-        let mut image = RgbImage::from_pixel(200, 200, Rgb([0, 0, 0]));
-        paint(&mut image, 99, 99, 2);
-        paint(&mut image, 25, 25, 3);
-        let output = process_pixel_seek(
-            &image,
-            crop(200),
-            PixelTargetColor::Red,
-            10,
-            Some([99.0, 99.0, 101.0, 101.0]),
-        );
-        assert_eq!(output.objects.len(), 1);
-        assert_eq!(output.objects[0].bbox_xyxy, [99.0, 99.0, 101.0, 101.0]);
-    }
-
-    #[test]
-    fn locked_target_wins_same_row_tie_over_blob_nearer_to_screen_center() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 62, 40, 4); // locked target
-        paint(&mut image, 58, 40, 3); // competitor inside the tight lock margin
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([62.0, 40.0, 66.0, 44.0]),
-        );
-        assert_eq!(output.objects[0].bbox_xyxy, [62.0, 40.0, 66.0, 44.0]);
-    }
-
-    #[test]
-    fn a_candidate_in_the_padding_cannot_steal_a_target_still_in_its_predicted_box() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 60, 40, 1); // locked target remains in the predicted box
-        paint(&mut image, 70, 40, 1); // competitor is closer to the previous pixel
-        let output = process_pixel_seek_with_mask_anchor(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([60.0, 40.0, 70.0, 44.0]),
-            [0.0; 2],
-            Some([69.5, 40.5]),
-            color_mask(&image, PixelTargetColor::Red),
-        );
-        assert_eq!(output.objects[0].bbox_xyxy, [60.0, 40.0, 61.0, 41.0]);
-    }
-
-    #[test]
-    fn moving_target_in_lock_padding_beats_a_valid_blob_in_the_old_core() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 31, 49, 2); // valid distractor inside the old lock box
-        paint(&mut image, 49, 55, 2); // selected target moved just below that box
-        let output = process_pixel_seek_with_mask_anchor(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([30.0, 45.0, 70.0, 55.0]),
-            [0.0; 2],
-            Some([32.5, 49.5]),
-            color_mask(&image, PixelTargetColor::Red),
-        );
-
-        assert_eq!(output.objects[0].bbox_xyxy, [49.0, 55.0, 51.0, 57.0]);
-        assert_eq!(output.target, Some(FrameCoordinate { x: 49.5, y: 55.5 }));
-    }
-
-    #[test]
-    fn stable_blob_center_beats_a_distractor_near_the_old_top_pixel() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 64, 64, 4); // locked target remains near its predicted center
-        paint(&mut image, 59, 50, 2); // closer to the old top-pixel anchor
-        let output = process_pixel_seek_with_mask_anchor(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 40.0, 100.0, 100.0]),
-            [0.0; 2],
-            Some([60.5, 50.5]),
-            color_mask(&image, PixelTargetColor::Red),
-        );
-
-        assert_eq!(output.objects[0].bbox_xyxy, [64.0, 64.0, 68.0, 68.0]);
-    }
-
-    #[test]
-    fn overlapping_moving_target_beats_a_nearer_small_distractor() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 47, 40, 8); // same target, moved while retaining overlap
-        paint(&mut image, 49, 49, 2); // nearer to the previous center, but separate noise
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 40.0, 60.0, 60.0]),
-        );
-
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [47.0, 40.0, 55.0, 48.0]);
-    }
-
-    #[test]
-    fn rejected_nearby_blob_does_not_hide_the_moving_locked_target() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 47, 40, 20); // locked blob moved right by 7 px
-        paint(&mut image, 42, 40, 2); // nearer to the old pixel, but not associated
-        let output = process_pixel_seek_with_mask_anchor(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 40.0, 60.0, 60.0]),
-            [0.0; 2],
-            Some([40.5, 40.5]),
-            color_mask(&image, PixelTargetColor::Red),
-        );
-
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [47.0, 40.0, 67.0, 60.0]);
-        assert_eq!(output.target, Some(FrameCoordinate { x: 47.5, y: 40.5 }));
-    }
-
-    #[test]
-    fn a_higher_separate_blob_cannot_steal_a_fresh_target_lock() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 62, 40, 4); // locked target
-        paint(&mut image, 62, 32, 4); // separate, higher target inside the lock window
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([62.0, 40.0, 66.0, 44.0]),
-        );
-        assert_eq!(output.objects[0].bbox_xyxy, [62.0, 40.0, 66.0, 44.0]);
-    }
-
-    #[test]
-    fn a_nearby_blob_cannot_inherit_a_lock_after_the_target_disappears() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 60, 42, 4); // separate blob inside the expanded search region
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([60.0, 50.0, 64.0, 54.0]),
-        );
-        assert!(output.objects.is_empty());
-        assert!(output.target.is_none());
-        assert!(output.lock_miss);
-    }
-
-    #[test]
-    fn diagonal_nearby_blob_cannot_inherit_a_lock_from_two_axis_gaps() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 66, 56, 4); // 6 px away on both axes from the old box
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([60.0, 50.0, 64.0, 54.0]),
-        );
-        assert!(output.objects.is_empty());
-        assert!(output.target.is_none());
-        assert!(output.lock_miss);
-    }
-
-    #[test]
-    fn noisy_lock_region_does_not_switch_to_detached_blobs() {
-        let mut image = RgbImage::from_pixel(200, 200, Rgb([0, 0, 0]));
-        for x in (80..=112).step_by(2) {
-            paint(&mut image, x, 80, 1);
-        }
-        let output = process_pixel_seek_with_mask_anchor(
-            &image,
-            crop(200),
-            PixelTargetColor::Red,
-            360,
-            Some([80.0, 80.0, 120.0, 120.0]),
-            [0.0; 2],
-            Some([80.5, 80.5]),
-            color_mask(&image, PixelTargetColor::Red),
-        );
-
-        assert!(output.objects.is_empty());
-        assert!(output.target.is_none());
-        assert!(output.lock_miss);
-    }
-
-    #[test]
-    fn velocity_prediction_keeps_a_moving_target_ahead_of_a_competitor() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 60, 50, 4); // same target, moved 20 px right
-        paint(&mut image, 10, 10, 4); // unrelated target remains higher
-        let output = process_pixel_seek_with_prediction(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 50.0, 44.0, 54.0]),
-            [20.0, 0.0],
-        );
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [60.0, 50.0, 64.0, 54.0]);
-        let target = output.target.unwrap();
-        assert!((60.5..=63.5).contains(&target.x));
-        assert_eq!(target.y, 50.5);
-    }
-
-    #[test]
-    fn pixel_anchor_prediction_is_independent_of_blob_center_shape_change() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 44, 40, 4);
-        for y in 42..46 {
-            for x in 48..54 {
-                image.put_pixel(x, y, Rgb([255, 0, 0]));
-            }
-        }
-        let output = process_pixel_seek_with_scratch_and_pixel_prediction(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 40.0, 44.0, 44.0]),
-            [7.0, 1.0], // blob-center motion
-            [4.0, 0.0], // selected top-pixel motion
-            Some([41.5, 40.5]),
-            color_mask(&image, PixelTargetColor::Red),
-            &mut PixelSeekScratch::default(),
-        );
-
-        assert!(!output.lock_miss);
-        assert_eq!(output.target, Some(FrameCoordinate { x: 45.5, y: 40.5 }));
-    }
-
-    #[test]
-    fn prediction_over_64_pixels_keeps_lock_on_the_moving_target() {
-        let mut image = RgbImage::from_pixel(160, 120, Rgb([0, 0, 0]));
-        paint(&mut image, 110, 50, 4); // locked target, moved 100 px
-        paint(&mut image, 85, 50, 4); // competitor near the old clamped prediction
-        let output = process_pixel_seek_with_prediction(
-            &image,
-            crop(160),
-            PixelTargetColor::Red,
-            360,
-            Some([10.0, 50.0, 14.0, 54.0]),
-            [100.0, 0.0],
-        );
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [110.0, 50.0, 114.0, 54.0]);
-    }
-
-    #[test]
-    fn an_offscreen_prediction_does_not_reassign_the_lock_to_an_edge_blob() {
-        let mut image = RgbImage::from_pixel(160, 120, Rgb([0, 0, 0]));
-        paint(&mut image, 145, 50, 4); // unrelated blob at the edge
-        let output = process_pixel_seek_with_prediction(
-            &image,
-            crop(160),
-            PixelTargetColor::Red,
-            360,
-            Some([10.0, 50.0, 14.0, 54.0]),
-            [170.0, 0.0],
-        );
-        assert!(output.objects.is_empty());
-        assert!(output.lock_miss);
-    }
-
-    #[test]
-    fn velocity_padding_recovers_a_target_that_lags_its_prediction() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 60, 50, 4); // 4 px behind the predicted bbox
-        paint(&mut image, 10, 10, 4); // unrelated target outside the lock region
-        let output = process_pixel_seek_with_prediction(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([40.0, 50.0, 44.0, 54.0]),
-            [12.0, 0.0],
-        );
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [60.0, 50.0, 64.0, 54.0]);
-    }
-
-    #[test]
-    fn small_target_motion_can_bootstrap_velocity_without_losing_its_lock() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        paint(&mut image, 53, 50, 1); // target moved 3 px before velocity was known
-        paint(&mut image, 20, 20, 2); // unrelated higher blob
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([50.0, 50.0, 51.0, 51.0]),
-        );
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [53.0, 50.0, 54.0, 51.0]);
-        assert_eq!(output.target.unwrap(), FrameCoordinate { x: 53.5, y: 50.5 });
-    }
-
-    #[test]
-    fn a_single_pixel_target_can_move_beyond_three_pixels_before_velocity_is_known() {
-        let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
-        image.put_pixel(56, 50, Rgb([255, 0, 0]));
-        paint(&mut image, 20, 20, 2); // unrelated blob remains outside the lock
-        let output = process_pixel_seek(
-            &image,
-            crop(100),
-            PixelTargetColor::Red,
-            360,
-            Some([50.0, 50.0, 51.0, 51.0]),
-        );
-        assert!(!output.lock_miss);
-        assert_eq!(output.objects[0].bbox_xyxy, [56.0, 50.0, 57.0, 51.0]);
-        assert_eq!(output.target, Some(FrameCoordinate { x: 56.5, y: 50.5 }));
-    }
-
-    #[test]
     fn a_locked_target_still_climbs_to_higher_pixels_next_to_it() {
         let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
         paint(&mut image, 60, 50, 4); // previous target box
-        paint(&mut image, 61, 46, 4); // higher pixels connected to the same target
+        paint(&mut image, 61, 42, 2); // higher pixels appearing just above it
         paint(&mut image, 30, 10, 4); // unrelated higher target
         let output = process_pixel_seek(
             &image,
@@ -1491,51 +777,12 @@ mod tests {
             360,
             Some([60.0, 50.0, 64.0, 54.0]),
         );
-        assert_eq!(output.target.unwrap().y, 46.5);
-        assert_eq!(output.objects[0].bbox_xyxy, [60.0, 46.0, 65.0, 54.0]);
+        assert_eq!(output.target.unwrap().y, 42.5);
+        assert_eq!(output.objects[0].bbox_xyxy, [61.0, 42.0, 63.0, 44.0]);
     }
 
     #[test]
-    fn a_moving_locked_blob_stays_selected_while_a_higher_blob_remains_in_the_fov() {
-        let mut scratch = PixelSeekScratch::default();
-        let mut locked = None;
-        let mut prior_pixel = None;
-        let mut velocity = [0.0; 2];
-        for frame in 0..5 {
-            let target_x = 60 + frame * 4;
-            let mut image = RgbImage::from_pixel(160, 120, Rgb([0, 0, 0]));
-            paint(&mut image, target_x, 50, 4);
-            if frame > 0 {
-                paint(&mut image, 50, 25, 2);
-            }
-            let output = process_pixel_seek_with_scratch(
-                &image,
-                crop(160),
-                PixelTargetColor::Red,
-                360,
-                locked,
-                velocity,
-                prior_pixel,
-                color_mask(&image, PixelTargetColor::Red),
-                &mut scratch,
-            );
-            assert_eq!(
-                output.objects[0].bbox_xyxy,
-                [target_x as f32, 50.0, target_x as f32 + 4.0, 54.0]
-            );
-            let point = output.target.unwrap();
-            assert!(point.x >= target_x as f32 + 0.5 && point.x <= target_x as f32 + 3.5);
-            assert_eq!(point.y, 50.5);
-            velocity = prior_pixel.map_or([0.0; 2], |previous| {
-                [point.x - previous[0], point.y - previous[1]]
-            });
-            prior_pixel = Some([point.x, point.y]);
-            locked = output.objects.first().map(|object| object.bbox_xyxy);
-        }
-    }
-
-    #[test]
-    fn a_missing_target_does_not_switch_away_from_a_fresh_lock() {
+    fn a_lost_lock_falls_back_to_the_topmost_target_in_the_fov() {
         let mut image = RgbImage::from_pixel(100, 100, Rgb([0, 0, 0]));
         paint(&mut image, 30, 20, 4);
         let output = process_pixel_seek(
@@ -1545,9 +792,7 @@ mod tests {
             360,
             Some([60.0, 50.0, 64.0, 54.0]),
         );
-        assert!(output.objects.is_empty());
-        assert!(output.target.is_none());
-        assert!(output.lock_miss);
+        assert_eq!(output.objects[0].bbox_xyxy, [30.0, 20.0, 34.0, 24.0]);
     }
 
     #[test]
