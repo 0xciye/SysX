@@ -322,7 +322,6 @@ mod tests {
                     processed_size: (64, 64),
                     received_s: tick as f64 * 0.004,
                     age_s: 0.0,
-                    on_center: false,
                 };
                 let normal = controller.delta(
                     &sample,
@@ -464,7 +463,6 @@ mod tests {
                 processed_size: (64, 64),
                 received_s: frame_id as f64 * 0.004,
                 age_s: 0.0,
-                on_center: false,
             };
             let intent = controller.delta(
                 &sample,

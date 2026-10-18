@@ -744,12 +744,8 @@ fn monitor_medius(
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
     let mut auto_state = crate::auto::AutoState::new();
     let mut next_health_check = Instant::now() + Duration::from_millis(250);
-    // While an Aim + fire trigger is held the loop runs every 1 ms, so its
-    // move and click go out at once; otherwise every 4 ms.
-    let mut aim_held = false;
     loop {
-        let poll = Duration::from_millis(if aim_held { 1 } else { 4 });
-        if let Some(event) = events.recv_timeout(poll) {
+        if let Some(event) = events.recv_timeout(Duration::from_millis(4)) {
             let usage = match event.input {
                 Input::Press(usage) | Input::Release(usage) => Some(usage),
                 Input::Motion { .. } => None,
@@ -822,12 +818,8 @@ fn monitor_medius(
                 .iter()
                 .any(|usage| usage.id == button)
         });
-        aim_held = auto_input.aims() && auto_held;
-        // Aim mode clicks only once its move has fully reached the device.
-        let aim_moving = auto_input.aims() && crate::movement::has_pending_move(movement_state);
-        if let Some(crate::auto::AutoAction::LeftClick) = (!aim_moving)
-            .then(|| auto_input.action(&mut auto_state, auto_held, Instant::now()))
-            .flatten()
+        if let Some(crate::auto::AutoAction::LeftClick) =
+            auto_input.action(&mut auto_state, auto_held, Instant::now())
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {

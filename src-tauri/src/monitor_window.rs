@@ -750,7 +750,6 @@ impl SettingsPage {
             "triggerButton" | "auto.triggerButton" => {
                 &[("Right", "right"), ("M4", "m4"), ("M5", "m5")]
             }
-            "auto.mode" => &[("Center crossing", "center"), ("Aim + fire", "aim")],
             _ => &[],
         };
         let mut row = field(key, label, kind);
@@ -900,7 +899,6 @@ fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
 
     page.section("Auto");
     page.setting(settings, "auto.enabled", "Auto", "toggle", "");
-    page.setting(settings, "auto.mode", "Mode", "choice", "");
     page.setting(
         settings,
         "auto.triggerButton",
@@ -912,22 +910,6 @@ fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
     page.setting(settings, "auto.delayMs", "Delay", "number", "ms");
     page.setting(settings, "auto.cooldownMs", "Cooldown", "number", "ms");
     page.setting(settings, "auto.sleepMs", "Sleep", "number", "ms");
-    // Only Aim + fire moves, with its own offset; Center crossing uses none
-    // of Auto's movement values.
-    if settings
-        .pointer("/auto/mode")
-        .and_then(serde_json::Value::as_str)
-        == Some("aim")
-    {
-        page.pair(
-            settings,
-            "Aim offset",
-            ("auto.offsetX", "X"),
-            ("auto.offsetY", "Y"),
-            "px",
-        );
-    }
-
     page.section("Recoil");
     page.setting(settings, "recoil.recoilEnabled", "Recoil", "toggle", "");
     page.setting(settings, "recoil.recoilLevels", "Levels", "text", "");
@@ -1023,8 +1005,6 @@ fn setting_label(key: &str) -> &str {
         "auto.delayMs" => "Auto delay",
         "auto.cooldownMs" => "Auto cooldown",
         "auto.sleepMs" => "Auto sleep",
-        "auto.offsetX" => "Aim offset X",
-        "auto.offsetY" => "Aim offset Y",
         "recoil.recoilLevels" => "Recoil levels",
         "recoil.recoilPercentage" => "Recoil strength",
         "recoil.recoilStartDelayMs" => "Recoil start delay",
@@ -1109,7 +1089,6 @@ fn activate_setting(settings: &mut serde_json::Value, key: &str) -> Result<(), S
         "pixelColor" => &["yellow", "red", "purple"],
         "scale" => &["Smooth", "Pixel perfect"],
         "triggerButton" | "auto.triggerButton" => &["right", "m4", "m5"],
-        "auto.mode" => &["center", "aim"],
         "colorFilter"
         | "motionEnabled"
         | "motionAlwaysOn"
@@ -1461,8 +1440,8 @@ fn target_layer(
     color: &str,
 ) -> Option<TargetLayer> {
     use std::fmt::Write;
-    // Center-crossing Auto has no target; its aim mode does.
-    if meta.detection.auto_active && !meta.detection.auto_aim {
+    // Auto has no target.
+    if meta.detection.auto_active {
         return None;
     }
     let (pw, ph, cx, cy) = (
@@ -2125,7 +2104,7 @@ mod overlay_routing_tests {
             "pixelColor":"red",
             "scale":"Smooth",
             "triggerButton":"right",
-            "auto":{"mode":"center","triggerButton":"m4"}
+            "auto":{"triggerButton":"m4"}
         }));
         let field = |key| fields.iter().find(|field| field.key == key).unwrap();
         let colors = field("pixelColor")
@@ -2149,45 +2128,10 @@ mod overlay_routing_tests {
     }
 
     #[test]
-    fn native_aim_settings_hide_unused_auto_motion_fields() {
-        let mut settings = serde_json::json!({
-            "auto": {
-                "mode": "aim",
-                "speedX": 0.5,
-                "speedY": 0.5,
-                "smoothFovDegrees": 20,
-                "smoothingXMin": 1,
-                "smoothingXMax": 2,
-                "smoothingYMin": 1,
-                "smoothingYMax": 2,
-                "offsetX": 0,
-                "offsetY": 0
-            }
-        });
-        let fields = super::settings_fields(&settings);
-        let aim_offset = fields
-            .iter()
-            .find(|field| field.key == "auto.offsetX")
-            .unwrap();
-        assert_eq!(aim_offset.key2.as_str(), "auto.offsetY");
-        assert!(!fields.iter().any(|field| field.key == "auto.speedX"));
-        assert!(!fields.iter().any(|field| field.key == "auto.smoothingXMin"));
-
-        // Center crossing moves nothing, so none of Auto's movement values show.
-        settings["auto"]["mode"] = serde_json::json!("center");
-        let fields = super::settings_fields(&settings);
-        assert!(!fields
-            .iter()
-            .any(|field| field.key.starts_with("auto.offset")));
-        assert!(!fields.iter().any(|field| field.key == "auto.speedX"));
-        assert!(!fields.iter().any(|field| field.key == "auto.smoothingXMin"));
-    }
-
-    #[test]
     fn each_settings_section_is_its_own_page_laid_out_from_the_top() {
         let pages = super::settings_page(&serde_json::json!({
             "profiles":[{"name":"Default"}],"activeProfile":0,
-            "auto":{"mode":"aim"}
+            "auto":{}
         }));
         assert_eq!(pages.len(), 6);
         for page in &pages {
@@ -2376,11 +2320,8 @@ mod render_tests {
             "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
             "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,
             "motionRenderer":{"enabled":false},
-            "auto":{"enabled":false,"mode":"center","triggerButton":"m4",
-                "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0,
-                "offsetX":0,"offsetY":0,"speedX":0.045,"speedY":0.045,
-                "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
-                "smoothingYMin":1,"smoothingYMax":3},
+            "auto":{"enabled":false,"triggerButton":"m4",
+                "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0},
             "recoil":{"recoilEnabled":false,"recoilLevels":[1,2,3],
                 "recoilPercentage":50,"recoilStartDelayMs":100,"recoilLevelDurationMs":50},
             "port":4200

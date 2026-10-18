@@ -82,7 +82,6 @@ impl AutoEvents {
             "delay_ms": self.settings.delay_ms,
             "cooldown_ms": self.settings.cooldown_ms,
             "sleep_ms": self.settings.sleep_ms,
-            "mode": self.settings.mode,
             "target_valid": target_valid,
             "timestamp_ms": timestamp_ms,
         })
@@ -331,7 +330,6 @@ impl ReceiverService {
             auto_fov_degrees: app.auto.fov_degrees,
             auto_target_active: false,
             target_lock_active: app.motion_enabled && app.motion_always_on,
-            auto_aim: false,
             auto_config_revision: 0,
             color_filter: app.color_filter,
             smoothing_x: app.smoothing_x(),
@@ -366,7 +364,6 @@ impl ReceiverService {
         let ticker_device = Arc::clone(&device);
         let ticker_auto = Arc::clone(&auto_events);
         let ticker_batcher = Arc::clone(&movement_batcher);
-        let aim_auto = Arc::clone(&auto_events);
         let movement_ticker = Arc::new(
             MovementTicker::new(
                 app.sens,
@@ -382,23 +379,7 @@ impl ReceiverService {
                         config_revision,
                     ))
                 }),
-                Arc::new(move |event| {
-                    // Aim mode reached its target: fire now, not on the next
-                    // frame's callback.
-                    if event.aim_done {
-                        if let Ok(events) = aim_auto.lock() {
-                            events.target(event.config_revision, true);
-                        }
-                    }
-                    // Auto's aim move goes out at once, not after the 4 ms batch.
-                    if event.flick && (event.dx != 0 || event.dy != 0) {
-                        if let Ok(line) = serde_json::to_string(&event) {
-                            emit_stdout_line(&line);
-                        }
-                    } else {
-                        ticker_batcher.submit(event);
-                    }
-                }),
+                Arc::new(move |event| ticker_batcher.submit(event)),
             )
             .map_err(|error| format!("could not start movement ticker: {error}"))?,
         );
@@ -424,7 +405,7 @@ impl ReceiverService {
                     callback_ticker.update(MovementTargetSample {
                         config_revision: processed.auto_config_revision,
                         frame_id: processed.frame.frame_id,
-                        target: if processed.result.auto_active && !processed.result.auto_aim {
+                        target: if processed.result.auto_active {
                             None
                         } else {
                             processed.result.target_xy.map(point)
@@ -440,17 +421,9 @@ impl ReceiverService {
                         ),
                         received_s: 0.0,
                         age_s: processed.frame.received.elapsed().as_secs_f64(),
-                        on_center: processed.result.auto_aim && processed.result.auto_target_valid,
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
-                    // Aim mode fires once a frame after its last move shows
-                    // the crosshair on the target.
-                    let target_valid = auto_active
-                        && if settings.auto.aims() {
-                            callback_ticker.flick_done()
-                        } else {
-                            processed.result.auto_target_valid
-                        };
+                    let target_valid = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, target_valid);
                     if let Ok(mut summary) = auto_summary.lock() {
                         if let Some(line) =
@@ -792,19 +765,10 @@ impl ReceiverService {
             auto_fov_degrees: settings.auto.fov_degrees,
             auto_target_active,
             target_lock_active,
-            auto_aim: auto_target_active && settings.auto.aims(),
             auto_config_revision: 0, // filled atomically by reconfigure()
             color_filter: settings.color_filter,
-            smoothing_x: if auto_target_active && settings.auto.aims() {
-                settings.auto.smoothing_x()
-            } else {
-                settings.smoothing_x()
-            },
-            smoothing_y: if auto_target_active && settings.auto.aims() {
-                settings.auto.smoothing_y()
-            } else {
-                settings.smoothing_y()
-            },
+            smoothing_x: settings.smoothing_x(),
+            smoothing_y: settings.smoothing_y(),
             model,
             model_backend: settings.model_backend.clone(),
             compute_target: settings.compute_target.clone(),
@@ -1892,9 +1856,8 @@ fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(published_ns) < 1_000_000_000
 }
 
-/// Whether the device status reports the configured trigger button as held.
-/// What the movement ticker runs with: Motion's values, or Auto's own while
-/// its aim mode holds the trigger.
+/// What the movement ticker runs with. A held Auto trigger owns routing
+/// and turns Motion off.
 fn movement_runtime(
     settings: &AppSettings,
     device: &Value,
@@ -1902,35 +1865,12 @@ fn movement_runtime(
     config_revision: u64,
 ) -> MovementRuntimeSettings {
     let auto_active = effective_detection_settings(settings, device).2;
-    // Auto's aim mode moves with Motion's logic and its own values
-    // while the Auto trigger is held.
-    if auto_active && settings.auto.aims() {
-        let auto = &settings.auto;
-        return MovementRuntimeSettings {
-            renderer_profile,
-            config_revision,
-            motion_enabled: true,
-            motion_always_on: false,
-            trigger_held: true,
-            auto_flick: true,
-            sens: settings.sens,
-            offset_x: auto.offset_x,
-            offset_y: auto.offset_y,
-            speed_x: auto.speed_x,
-            speed_y: auto.speed_y,
-            smooth_fov_degrees: auto.smooth_fov_degrees,
-            no_deadzone: false,
-            trigger_button: auto.trigger_button.clone(),
-            recoil: settings.recoil.clone(),
-        };
-    }
     MovementRuntimeSettings {
         renderer_profile,
         config_revision,
         motion_enabled: settings.motion_enabled && !auto_active,
         motion_always_on: settings.motion_always_on,
         trigger_held: trigger_held(device, &settings.trigger_button),
-        auto_flick: false,
         sens: settings.sens,
         offset_x: settings.offset_x,
         offset_y: settings.offset_y,
@@ -2819,37 +2759,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_aim_moves_with_its_own_values_only_while_its_trigger_is_held() {
+    fn a_held_auto_trigger_turns_motion_off() {
         let mut settings = AppSettings::default();
-        settings.motion_enabled = false;
-        settings.motion_speed_x = 0.05;
-        settings.offset_x = 3.0;
+        settings.motion_enabled = true;
         settings.auto.enabled = true;
-        settings.auto.mode = "aim".into();
         settings.auto.trigger_button = "m4".into();
-        settings.auto.speed_x = 0.2;
-        settings.auto.speed_y = 0.3;
-        settings.auto.offset_x = -4.0;
-        settings.auto.smooth_fov_degrees = 0;
         let released = json!({"state":"connected","buttons":[false,false,false,false,false]});
         let held = json!({"state":"connected","buttons":[false,false,false,true,false]});
-
-        let motion = super::movement_runtime(&settings, &released, None, 7);
-        assert!(!motion.motion_enabled, "Motion is off");
-        assert_eq!((motion.speed_x, motion.offset_x), (0.05, 3.0));
-
-        let aim = super::movement_runtime(&settings, &held, None, 7);
-        assert!(aim.motion_enabled && aim.trigger_held && !aim.motion_always_on);
-        assert!(aim.auto_flick && !motion.auto_flick);
-        assert_eq!(aim.trigger_button, "m4");
-        assert_eq!((aim.speed_x, aim.speed_y, aim.offset_x), (0.2, 0.3, -4.0));
-        assert_eq!((aim.smooth_fov_degrees, aim.config_revision), (0, 7));
-
-        // Auto keeps owning output routing while its trigger is held.
-        settings.auto.mode = "center".into();
-        settings.motion_enabled = true;
-        let center = super::movement_runtime(&settings, &held, None, 7);
-        assert!(!center.motion_enabled);
+        assert!(super::movement_runtime(&settings, &released, None, 7).motion_enabled);
+        let auto = super::movement_runtime(&settings, &held, None, 7);
+        assert!(!auto.motion_enabled);
+        assert_eq!(auto.config_revision, 7);
     }
 
     #[test]
