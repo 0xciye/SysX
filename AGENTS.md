@@ -120,7 +120,7 @@ The user tested and confirmed Motion's per-frame Normal logic on branch `stable/
 
 ### macOS receiver
 
-- Keep the macOS-specific pieces small and behind `cfg(target_os = "macos")`: the latency-critical `NSProcessInfo` activity in `native-shared/timer_resolution.rs` (App Nap and timer coalescing otherwise slow a hidden SysX), the stepped UDP receive buffer in `receiver.rs`, `/dev/cu.*`-only Medius ports, Helvetica Neue/Menlo fonts, and the `atexit` cleanup for Quit in `native_app.rs`. `scripts/build-macos.sh` ad-hoc signs the backend before the host embeds and hashes it, then signs the bundle. `.github/workflows/macos-build.yml` is manual-only like the Windows workflows. As of 2026-10-18 macOS code only type-checks from Linux; it has not been built, linked or run on a Mac.
+- Keep the macOS-specific pieces small and behind `cfg(target_os = "macos")`: the latency-critical `NSProcessInfo` activity in `native-shared/timer_resolution.rs` (App Nap and timer coalescing otherwise slow a hidden SysX), the stepped UDP receive buffer in `receiver.rs`, `/dev/cu.*`-only Medius ports, Helvetica Neue/Menlo fonts, and the `atexit` cleanup for Quit in `native_app.rs`. `scripts/build-macos.sh` ad-hoc signs the backend before the host embeds and hashes it, then signs the bundle. `.github/workflows/macos-build.yml` is manual-only like the Windows workflows. On 2026-10-18 the workflow (run 39099722129, macos-14 arm64, commit `76c3d24`) passed backend 195/2 ignored + 55 integration, host 98 and UI 18 tests, built and verified the ad-hoc signed `SysX.app`, and received one 192×192 fixture frame over loopback UDP. The app window, Medius, OBS and LAN were not exercised; Intel Macs were not built.
 
 ### Release hardening
 
