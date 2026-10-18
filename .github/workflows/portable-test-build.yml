@@ -73,7 +73,7 @@ jobs:
           ./scripts/package-windows.ps1 -SkipBuild
           $note = @'
           SysX Windows x64 release build with native debug symbols in a separate PDB archive.
-          Built-in release hardening and runtime integrity are enabled. VMProtect has NOT been applied.
+          No debugger guard or runtime integrity check is built in. VMProtect has NOT been applied.
           Only Pixel Seek is usable; Object Detection is unavailable. Only Medius is supported.
           Windows unit, UDP and application lifecycle smoke checks ran on a hosted runner.
           Physical Medius, OBS and game behavior have not been tested by this build.

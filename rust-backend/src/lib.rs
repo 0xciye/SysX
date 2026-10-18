@@ -17,7 +17,6 @@ pub mod pipeline;
 pub mod pixel_seek;
 pub mod receiver;
 pub mod results;
-pub mod security;
 pub mod service;
 pub mod targeting;
 #[path = "../../native-shared/timer_resolution.rs"]

@@ -1786,7 +1786,13 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
     loop {
         tokio::select! {
             message = socket.recv() => {
-                let Some(Ok(Message::Text(text))) = message else { break; };
+                // Only a closed or failed socket ends the loop: for the host
+                // that exits the backend, so a ping or other frame must not.
+                let text = match message {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => continue,
+                    _ => break,
+                };
                 if text.len() > MAX_MESSAGE_BYTES {
                     let event = oversized_command_error(&text);
                     service.record_error("commands must be under 64 KiB".into());

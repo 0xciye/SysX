@@ -1555,6 +1555,7 @@ pub fn run(
         .map(|view| Arc::clone(&view.awaiting_draw))
         .unwrap_or_default();
     let drawn = Arc::clone(&awaiting);
+    let recover_gate = Arc::clone(&awaiting);
     let notified = app
         .window()
         .set_rendering_notifier(move |state, _| {
@@ -1590,6 +1591,10 @@ pub fn run(
     let lifecycle = Rc::new(RefCell::new(None::<crate::native_app::MonitorLifecycle>));
     let hidden = Rc::new(Cell::new(false));
     let settings_visible = Rc::new(Cell::new(false));
+    // Set before every quit_event_loop(): any other end of the event loop is
+    // a render or window error to recover from, not a request to exit.
+    let quit_requested = Rc::new(Cell::new(false));
+    let monitor_hidden = Rc::clone(&hidden);
     let settings_draft = Rc::new(RefCell::new(None::<serde_json::Value>));
     let settings_dirty = Rc::new(Cell::new(false));
     let invalid_settings = Rc::new(RefCell::new(HashSet::<String>::new()));
@@ -1879,6 +1884,7 @@ pub fn run(
     let invalid_settings_events = Rc::clone(&invalid_settings);
     let profile_name_events = Rc::clone(&profile_name);
     let settings_visible_events = Rc::clone(&settings_visible);
+    let quit_events = Rc::clone(&quit_requested);
     let settings_weak_events = settings_app.as_weak();
     let settings_commands_events = commands.clone();
     let mut apply_success_until = None::<Instant>;
@@ -1989,6 +1995,7 @@ pub fn run(
                     }
                     Ok(crate::native_app::HostEvent::Disconnected)
                     | Err(TryRecvError::Disconnected) => {
+                        quit_events.set(true);
                         let _ = slint::quit_event_loop();
                         return;
                     }
@@ -2047,6 +2054,7 @@ pub fn run(
                 .as_mut()
                 .is_some_and(|life| life.should_exit(Some(native_clients), Instant::now()))
             {
+                quit_events.set(true);
                 let _ = slint::quit_event_loop();
                 return;
             }
@@ -2058,7 +2066,48 @@ pub fn run(
         },
     );
     app.show().map_err(|e| e.to_string())?;
-    slint::run_event_loop_until_quit().map_err(|e| e.to_string())
+    let mut failures = std::collections::VecDeque::new();
+    loop {
+        let error = match slint::run_event_loop_until_quit() {
+            Ok(()) => return Ok(()),
+            Err(error) if quit_requested.get() => return Err(error.to_string()),
+            Err(error) => error,
+        };
+        // A draw, resize or focus error (the OpenGL context lost to a
+        // driver reset, a game switching fullscreen or display mode, sleep)
+        // ends Slint's event loop. That used to close SysX mid-use without a
+        // crash. Rebuild the visible windows and keep running; give up only
+        // if it keeps failing.
+        let now = Instant::now();
+        failures.retain(|at| now.duration_since(*at) < Duration::from_secs(10));
+        failures.push_back(now);
+        if failures.len() > MAX_EVENT_LOOP_FAILURES {
+            return Err(error.to_string());
+        }
+        recover_window(app.window(), !monitor_hidden.get());
+        recover_window(settings_app.window(), settings_visible.get());
+        // The failed draw never reported a finished frame; let the decoder
+        // go on instead of waiting for it.
+        recover_gate.mark_drawn();
+    }
+}
+
+/// Event loop errors tolerated within 10 s before SysX gives up.
+const MAX_EVENT_LOOP_FAILURES: usize = 5;
+
+/// Destroy and recreate a shown window, so it gets a new native window and
+/// graphics context in place of the one that failed.
+fn recover_window(window: &slint::Window, visible: bool) {
+    if !visible {
+        return;
+    }
+    // On Windows, hide() only hides the native window unless this is set;
+    // with it, the window and its OpenGL context are dropped.
+    std::env::set_var("SLINT_DESTROY_WINDOW_ON_HIDE", "1");
+    let _ = window.hide();
+    std::env::remove_var("SLINT_DESTROY_WINDOW_ON_HIDE");
+    let _ = window.show();
+    window.request_redraw();
 }
 thread_local! {static UPLOAD:RefCell<RenderCache>=const{RefCell::new(RenderCache{uploaded:None,overlay:String::new(),target:String::new()})};}
 

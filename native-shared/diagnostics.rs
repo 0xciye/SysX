@@ -84,17 +84,105 @@ pub fn install(component: &str) -> io::Result<()> {
             Backtrace::force_capture()
         ));
         #[cfg(windows)]
-        write_dump(std::ptr::null());
+        request_dump(std::ptr::null());
         write_crash_report(&format!("Rust panic: {info}"));
         previous(info);
     }));
     #[cfg(windows)]
+    {
+        set_exception_filter();
+        start_dump_writer();
+        // C code (libjpeg-turbo, ABCurves) that calls abort() raises SIGABRT
+        // first; without this it ends the process with no dump.
+        extern "C" {
+            fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGABRT: i32 = 22;
+        unsafe {
+            signal(SIGABRT, on_abort);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+extern "C" fn on_abort(_: i32) {
+    request_dump(std::ptr::null());
+}
+
+#[cfg(windows)]
+fn set_exception_filter() {
     unsafe {
         windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
             unhandled_exception,
         ));
     }
-    Ok(())
+}
+
+/// A dump is written from this thread, not the crashing one: after a stack
+/// overflow the crashing thread has only a few KiB left, and formatting,
+/// file I/O and MiniDumpWriteDump there overflow again and kill the process
+/// before any dump exists.
+#[cfg(windows)]
+static DUMP_WRITER: OnceLock<std::thread::Thread> = OnceLock::new();
+#[cfg(windows)]
+static DUMP_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static DUMP_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static DUMP_POINTERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(windows)]
+static DUMP_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(windows)]
+fn start_dump_writer() {
+    let spawned = std::thread::Builder::new()
+        .name("sysx-dump-writer".into())
+        .spawn(|| loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(2));
+            // Graphics drivers and overlays (GPU, RTSS, Discord, Steam) load
+            // later and often install their own filter, which would send our
+            // crashes to Windows Error Reporting instead of a dump.
+            set_exception_filter();
+            if DUMP_PENDING.swap(false, Ordering::AcqRel) {
+                write_dump(
+                    DUMP_POINTERS.load(Ordering::Acquire) as *const _,
+                    DUMP_THREAD.load(Ordering::Acquire),
+                );
+                DUMP_DONE.store(true, Ordering::Release);
+            }
+        });
+    if let Ok(handle) = spawned {
+        let _ = DUMP_WRITER.set(handle.thread().clone());
+    }
+}
+
+/// Write a dump of the current thread's crash, through the writer thread when
+/// it runs (waiting up to 30 s for it), else in place.
+#[cfg(windows)]
+fn request_dump(
+    pointers: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    let thread = unsafe { GetCurrentThreadId() };
+    let Some(writer) = DUMP_WRITER
+        .get()
+        .filter(|writer| writer.id() != std::thread::current().id())
+    else {
+        write_dump(pointers, thread);
+        return;
+    };
+    DUMP_POINTERS.store(pointers as usize, Ordering::Release);
+    DUMP_THREAD.store(thread, Ordering::Release);
+    DUMP_DONE.store(false, Ordering::Release);
+    DUMP_PENDING.store(true, Ordering::Release);
+    writer.unpark();
+    for _ in 0..30_000 {
+        if DUMP_DONE.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// Mark the owning process after singleton acquisition, so a second launch
@@ -313,12 +401,14 @@ unsafe extern "system" fn unhandled_exception(
 ) -> i32 {
     if let Some(info) = pointers.as_ref() {
         if let Some(exception) = info.ExceptionRecord.as_ref() {
+            // First, while the stack may be nearly gone: the dump is written
+            // by the writer thread.
+            request_dump(pointers);
             let kind = windows_exception_name(exception.ExceptionCode as u32);
             record(&format!(
                 "unhandled Windows exception kind={kind} code=0x{:08x} address={:p} flags=0x{:08x}",
                 exception.ExceptionCode, exception.ExceptionAddress, exception.ExceptionFlags
             ));
-            write_dump(pointers);
             write_crash_report(&format!(
                 "unhandled Windows exception: {kind} (0x{:08x}) at {:p}",
                 exception.ExceptionCode, exception.ExceptionAddress
@@ -326,7 +416,7 @@ unsafe extern "system" fn unhandled_exception(
             return 0;
         }
     }
-    write_dump(pointers);
+    request_dump(pointers);
     write_crash_report("unhandled Windows exception with missing exception details");
     0 // EXCEPTION_CONTINUE_SEARCH: preserve normal Windows crash handling.
 }
@@ -346,15 +436,16 @@ fn windows_exception_name(code: u32) -> &'static str {
 }
 
 #[cfg(windows)]
-fn write_dump(pointers: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) {
+fn write_dump(
+    pointers: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    thread: u32,
+) {
     use std::os::windows::io::AsRawHandle;
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         MiniDumpNormal, MiniDumpWriteDump, MINIDUMP_EXCEPTION_INFORMATION,
     };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
     static WRITING: AtomicBool = AtomicBool::new(false);
     if WRITING.swap(true, Ordering::AcqRel) {
         return;
@@ -366,7 +457,7 @@ fn write_dump(pointers: *const windows_sys::Win32::System::Diagnostics::Debug::E
     let result = (|| -> io::Result<()> {
         let file = File::create(&session.dump)?;
         let exception = MINIDUMP_EXCEPTION_INFORMATION {
-            ThreadId: unsafe { GetCurrentThreadId() },
+            ThreadId: thread,
             ExceptionPointers: pointers.cast_mut(),
             ClientPointers: 0,
         };

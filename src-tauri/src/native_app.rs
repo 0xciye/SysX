@@ -33,7 +33,6 @@ struct BackendRuntime {
     child: Arc<Mutex<Child>>,
     shutdown_requested: Arc<AtomicBool>,
     runtime_dir: Option<PathBuf>,
-    integrity: Option<crate::integrity::IntegrityGuard>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +69,6 @@ impl DeviceStatus {
 
 impl Drop for BackendRuntime {
     fn drop(&mut self) {
-        drop(self.integrity.take());
         self.shutdown_requested.store(true, Ordering::Release);
         crate::diagnostics::record("requesting backend shutdown because the host is exiting");
         // Child::kill uses the owned OS process handle on Windows, avoiding a
@@ -260,7 +258,6 @@ fn start_backend(
     let data_dir = app_data_dir();
     fs::create_dir_all(&data_dir).map_err(|error| format!("Cannot create app data: {error}"))?;
     let (executable, runtime_dir) = prepare_runtime(&data_dir)?;
-    let verified = verify_release_runtime(runtime_dir.as_deref())?;
     let mut command = Command::new(&executable);
     command
         .args(["serve", "--host", "127.0.0.1", "--port", "0", "--data-dir"])
@@ -296,11 +293,10 @@ fn start_backend(
         .take()
         .ok_or_else(|| "Backend stdout was not available".to_string())?;
     // Any subsequent startup error now runs the ordinary owned-child cleanup.
-    let mut runtime = BackendRuntime {
+    let runtime = BackendRuntime {
         child: Arc::new(Mutex::new(child)),
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         runtime_dir,
-        integrity: None,
     };
     monitor_backend_exit(
         Arc::clone(&runtime.child),
@@ -335,14 +331,6 @@ fn start_backend(
             }
         })
         .map_err(|error| error.to_string())?;
-    if let Some(verified) = verified {
-        let owned_child = Arc::clone(&runtime.child);
-        runtime.integrity = Some(
-            verified
-                .watch_backend(owned_child)
-                .map_err(|error| format!("Could not start runtime integrity watchdog: {error}"))?,
-        );
-    }
     let port = ready_rx
         .recv_timeout(Duration::from_secs(12))
         .map_err(|_| "Backend did not become ready within 12 seconds".to_string())?;
@@ -935,25 +923,6 @@ fn prepare_runtime(_data_dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
                 .map_err(|error| error.to_string())?;
         }
         Ok((executable, Some(runtime_dir)))
-    }
-}
-
-/// Hash every immutable runtime file before starting any backend/UI code.
-/// Debug and test launches retain the ordinary editable development runtime.
-fn verify_release_runtime(
-    root: Option<&Path>,
-) -> Result<Option<crate::integrity::VerifiedRuntime>, String> {
-    #[cfg(all(not(debug_assertions), not(test)))]
-    {
-        let root = root.ok_or("Release runtime was not extracted")?;
-        crate::integrity::VerifiedRuntime::open(root, EMBEDDED_RUNTIME_HASHES)
-            .map(Some)
-            .map_err(|error| format!("Runtime integrity verification failed: {error}"))
-    }
-    #[cfg(any(debug_assertions, test))]
-    {
-        let _ = root;
-        Ok(None)
     }
 }
 

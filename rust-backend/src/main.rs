@@ -3,7 +3,6 @@ fn main() {
     if std::env::args().any(|arg| arg == "--diagnostics-self-test") {
         panic!("SysX diagnostics self-test");
     }
-    sysx_backend::security::start_release_guard();
     sysx_backend::timer_resolution::request_fine_timer();
     if let Err(error) = sysx_backend::run(std::env::args().skip(1).collect()) {
         sysx_backend::diagnostics::record(&format!("fatal backend error: {error}"));
