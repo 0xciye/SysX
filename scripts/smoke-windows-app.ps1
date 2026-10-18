@@ -64,7 +64,9 @@ $testBackendIds = @()
 $monitor = @()
 
 try {
-    $app = Start-Process -FilePath $appExe -WorkingDirectory $appDir -PassThru
+    # --supervised runs the app itself, without the restarting parent, so the
+    # window and backend belong to this PID and a closed window is not reopened.
+    $app = Start-Process -FilePath $appExe -ArgumentList '--supervised' -WorkingDirectory $appDir -PassThru
     # Windows PowerShell 5.1 only reports ExitCode if the process handle was opened.
     $null = $app.Handle
     $startupDeadline = (Get-Date).AddSeconds(120)

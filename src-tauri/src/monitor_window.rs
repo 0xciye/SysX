@@ -1594,6 +1594,10 @@ pub fn run(
     // Set before every quit_event_loop(): any other end of the event loop is
     // a render or window error to recover from, not a request to exit.
     let quit_requested = Rc::new(Cell::new(false));
+    // The backend went away (it crashed or was killed): SysX did not end
+    // because the user closed it.
+    let backend_lost = Rc::new(Cell::new(false));
+    let backend_lost_events = Rc::clone(&backend_lost);
     let monitor_hidden = Rc::clone(&hidden);
     let settings_draft = Rc::new(RefCell::new(None::<serde_json::Value>));
     let settings_dirty = Rc::new(Cell::new(false));
@@ -1995,6 +1999,7 @@ pub fn run(
                     }
                     Ok(crate::native_app::HostEvent::Disconnected)
                     | Err(TryRecvError::Disconnected) => {
+                        backend_lost_events.set(true);
                         quit_events.set(true);
                         let _ = slint::quit_event_loop();
                         return;
@@ -2069,6 +2074,7 @@ pub fn run(
     let mut failures = std::collections::VecDeque::new();
     loop {
         let error = match slint::run_event_loop_until_quit() {
+            Ok(()) if backend_lost.get() => return Err("backend connection lost".into()),
             Ok(()) => return Ok(()),
             Err(error) if quit_requested.get() => return Err(error.to_string()),
             Err(error) => error,

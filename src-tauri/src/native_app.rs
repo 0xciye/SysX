@@ -90,7 +90,9 @@ impl Drop for BackendRuntime {
     }
 }
 
-pub fn run() {
+/// Runs SysX until it ends; true when that was not the user closing it, so
+/// the supervisor should start it again.
+pub fn run() -> bool {
     let Some(_instance) = crate::single_instance::acquire() else {
         crate::diagnostics::record(
             "shutdown reason: another SysX instance already owns the receiver",
@@ -99,7 +101,7 @@ pub fn run() {
         if !crate::single_instance::focus_monitor_window() {
             crate::single_instance::request_monitor();
         }
-        return;
+        return false;
     };
     crate::diagnostics::begin_session();
     let movement_state = Arc::new(crate::movement::MovementState::default());
@@ -112,7 +114,7 @@ pub fn run() {
             Err(error) => {
                 crate::diagnostics::record(&format!("SysX could not start: {error}"));
                 eprintln!("SysX could not start: {error}");
-                return;
+                return true;
             }
         };
     if let Err(error) = start_device_monitor(
@@ -143,6 +145,7 @@ pub fn run() {
     let monitor_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::monitor_window::run(port, token, event_rx, command_tx)
     }));
+    let restart = !matches!(monitor_result, Ok(Ok(())));
     match monitor_result {
         Ok(Ok(())) => crate::diagnostics::record(
             "shutdown reason: native receiver closed normally after its client lifecycle ended",
@@ -165,6 +168,7 @@ pub fn run() {
     drop(terminate::release());
     #[cfg(not(target_os = "macos"))]
     drop(runtime);
+    restart
 }
 
 /// Quit (Cmd+Q, the Dock menu, logout) makes AppKit call `exit()` from inside
