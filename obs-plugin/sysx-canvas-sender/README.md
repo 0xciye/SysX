@@ -7,11 +7,11 @@ A UI-less OBS global module for Windows. Once loaded it:
 3. JPEG-encodes the crop on two worker threads with libjpeg-turbo (frame IDs assigned in capture order; a frame finishing after a newer one is rejected by the receiver) (BGRA input, 4:4:4 chroma by default so small Pixel Seek colors are not smeared),
 4. sends it to SysX with the `RCVR` v1 UDP protocol (`docs/OBS_RECEIVER_PROTOCOL.md`): 30-byte big-endian header, 1,170-byte JPEG chunks, ≤1,200-byte datagrams.
 
-The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <resolution>` and repeats it whenever Crop Resolution changes. The plugin accepts that message only from the configured receiver address and recreates its GPU crop resources, so the receiver's Crop Resolution stays authoritative. Only the newest frame is kept; a slow encoder or network drops obsolete frames instead of queueing them.
+The receiver answers the first datagram from a new sender with `SYSCFG 1 CROP <resolution>` and repeats it whenever Crop Resolution changes. The plugin accepts that message only from its receiver's address and recreates its GPU crop resources, so the receiver's Crop Resolution stays authoritative. Only the newest frame is kept; a slow encoder or network drops obsolete frames instead of queueing them.
 
 ## Configuration
 
-Configuration is compile-time (no ini file). Set the receiver IP with `scripts/build-obs-plugin.ps1 -ReceiverIp 192.168.88.59` or CMake `-DSYSX_RECEIVER_IP=192.168.88.59`. The manual GitHub DLL workflow provides a receiver-IP field. JPEG/port/crop constants remain in `sysx_canvas_sender.cpp`:
+Configuration is compile-time (no ini file). By default (`-ReceiverIp auto`, CMake `-DSYSX_RECEIVER_IP=auto`) the plugin finds SysX on the LAN by a once-a-second `SYSXFIND 1` broadcast until a receiver answers, so one DLL works on every machine (see `docs/OBS_RECEIVER_PROTOCOL.md` section 2.2). A fixed IPv4 address (`-ReceiverIp 192.168.88.59`) skips discovery; use it across routers or with more than one SysX on the LAN. The manual GitHub DLL workflow provides a receiver-IP field (default `auto`). JPEG/port/crop constants remain in `sysx_canvas_sender.cpp`:
 
 ```cpp
 // kReceiverHost comes from the SYSX_RECEIVER_IP CMake build option.

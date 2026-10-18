@@ -95,6 +95,8 @@ pub struct UdpDecodedFrameSource {
 /// sender on a stale crop, so it is repeated while the sender keeps streaming.
 const CROP_CONFIG_RESEND: Duration = Duration::from_secs(1);
 const RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Broadcast by an OBS sender built without a receiver address.
+const DISCOVERY_PROBE: &[u8] = b"SYSXFIND 1";
 /// More than a full receive buffer of datagrams.
 const MAX_DRAINED_DATAGRAMS: usize = 16_384;
 
@@ -283,6 +285,16 @@ impl UdpDecodedFrameSource {
     }
 
     fn accept(&mut self, length: usize, sender: std::net::SocketAddr, expire: bool) {
+        // A sender without a configured address looks for SysX on the LAN;
+        // the reply tells it where to stream. It does not make it the
+        // active sender until its frames arrive.
+        if &self.datagram[..length] == DISCOVERY_PROBE {
+            if let Some(socket) = &self.socket {
+                let message = format!("SYSCFG 1 CROP {}", self.crop_resolution);
+                let _ = socket.send_to(message.as_bytes(), sender);
+            }
+            return;
+        }
         // Only a real RCVR sender may become the crop recipient;
         // stray LAN datagrams must not redirect SYSCFG.
         if self.datagram[..length].starts_with(b"RCVR") {
@@ -477,6 +489,30 @@ mod tests {
         let _ = source.read(Duration::from_millis(300)).unwrap();
         let length = sender.recv(&mut reply).expect("repeated SYSCFG");
         assert_eq!(&reply[..length], b"SYSCFG 1 CROP 256");
+    }
+
+    #[test]
+    fn a_discovery_probe_gets_the_crop_reply_without_becoming_the_sender() {
+        let mut source = UdpDecodedFrameSource::new("127.0.0.1", 1).unwrap();
+        source.port = 0; // ephemeral for the test
+        source.open().unwrap();
+        source.set_crop_resolution(320);
+        let target = source.local_addr().unwrap().unwrap();
+        let finder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        finder
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        finder.send_to(b"SYSXFIND 1", target).unwrap();
+        let _ = source.read(Duration::from_millis(200)).unwrap();
+        let mut reply = [0u8; 64];
+        let (length, from) = finder.recv_from(&mut reply).expect("probe reply");
+        assert_eq!(&reply[..length], b"SYSCFG 1 CROP 320");
+        assert_eq!(from, target, "the reply comes from the receiver's own port");
+        assert_eq!(source.sender, None);
+        // Anything else that is not RCVR gets no reply.
+        finder.send_to(b"SYSXFIND 2", target).unwrap();
+        let _ = source.read(Duration::from_millis(200)).unwrap();
+        assert!(finder.recv(&mut reply).is_err());
     }
 
     #[test]

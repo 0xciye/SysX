@@ -1,11 +1,11 @@
-name: Build OBS DLL (manual, receiver IP)
+name: Build OBS DLL (manual, receiver IP or auto)
 on:
   workflow_dispatch:
     inputs:
       receiver_ip:
-        description: 'Receiver IPv4 address (UDP 4200)'
+        description: 'Receiver IPv4 address (UDP 4200), or auto to find it on the LAN'
         required: true
-        default: '192.168.88.59'
+        default: 'auto'
         type: string
 permissions:
   contents: write
@@ -22,11 +22,12 @@ jobs:
         shell: pwsh
         run: |
           $ip = $null
-          if ($env:RECEIVER_IP -notmatch '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$' -or
+          if ($env:RECEIVER_IP -ne 'auto' -and (
+              $env:RECEIVER_IP -notmatch '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$' -or
               -not [Net.IPAddress]::TryParse($env:RECEIVER_IP, [ref]$ip) -or
               $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
-              $ip.ToString() -ne $env:RECEIVER_IP) {
-            throw 'Enter a canonical IPv4 address, for example 192.168.88.59.'
+              $ip.ToString() -ne $env:RECEIVER_IP)) {
+            throw 'Enter auto or a canonical IPv4 address, for example 192.168.88.59.'
           }
       - name: Prepare OBS headers and static JPEG SDK
         shell: pwsh

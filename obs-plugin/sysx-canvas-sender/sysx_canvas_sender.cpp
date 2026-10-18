@@ -7,6 +7,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <d3d11.h>
 
@@ -69,6 +70,11 @@ static_assert(static_cast<uint64_t>(kMaxCropResolution) * kMaxCropResolution <=
                       (kMaxCropResolution + 1) >
                   kMaxFramePixels);
 constexpr char kControlPrefix[] = "SYSCFG 1 CROP ";
+// Receiver discovery: without a configured address the sender broadcasts this
+// once a second on the LAN (and to loopback) until a receiver answers with
+// SYSCFG, then streams to the address that answered.
+constexpr char kDiscoveryProbe[] = "SYSXFIND 1";
+constexpr uint64_t kDiscoveryIntervalNs = 1000000000ull;
 constexpr int kSendBufferBytes = 8 * 1024 * 1024;
 // JPEG encoders: a 640 x 640 4:4:4 encode takes about as long as a 240 FPS
 // frame interval, so one thread alone dropped frames whenever the game loaded
@@ -87,9 +93,10 @@ constexpr uint32_t kIdleFps = 2;
 constexpr size_t kSpareBuffers = kEncoderThreads + 1;
 
 // ---- Sender configuration: edit these and rebuild the DLL. ----
-// SysX receiver IPv4 address (or hostname) and UDP port.
+// SysX receiver IPv4 address (or hostname) and UDP port. "auto" finds the
+// receiver on the LAN, so one DLL works on every machine.
 #ifndef SYSX_RECEIVER_HOST
-#define SYSX_RECEIVER_HOST "192.168.88.59"
+#define SYSX_RECEIVER_HOST "auto"
 #endif
 constexpr char kReceiverHost[] = SYSX_RECEIVER_HOST;
 constexpr uint16_t kReceiverPort = 4200;
@@ -245,17 +252,22 @@ class Sender {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return false;
     winsock_ready_ = true;
 
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo *resolved = nullptr;
-    const std::string port = std::to_string(config.port);
-    if (getaddrinfo(config.host.c_str(), port.c_str(), &hints, &resolved) != 0 || !resolved) {
-      close_socket();
-      return false;
+    discover_ = config.host.empty() || config.host == "auto";
+    if (!discover_) {
+      addrinfo hints{};
+      hints.ai_family = AF_INET;
+      hints.ai_socktype = SOCK_DGRAM;
+      addrinfo *resolved = nullptr;
+      const std::string port = std::to_string(config.port);
+      if (getaddrinfo(config.host.c_str(), port.c_str(), &hints, &resolved) != 0 || !resolved) {
+        close_socket();
+        return false;
+      }
+      sockaddr_in address{};
+      std::memcpy(&address, resolved->ai_addr, sizeof(address));
+      freeaddrinfo(resolved);
+      set_receiver(address);
     }
-    std::memcpy(&destination_, resolved->ai_addr, sizeof(destination_));
-    freeaddrinfo(resolved);
 
     socket_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_ == INVALID_SOCKET) {
@@ -267,6 +279,9 @@ class Sender {
     const int send_buffer = kSendBufferBytes;
     setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&send_buffer),
                sizeof(send_buffer));
+    const BOOL broadcast = TRUE;
+    setsockopt(socket_, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char *>(&broadcast),
+               sizeof(broadcast));
     u_long nonblocking = 1;
     if (ioctlsocket(socket_, FIONBIO, &nonblocking) != 0) {
       close_socket();
@@ -316,6 +331,8 @@ class Sender {
     return last != 0 && now - last < kReceiverQuietNs;
   }
   uint32_t max_fps() const { return config_.max_fps; }
+  // A receiver address is known (configured, or found by discovery).
+  bool has_receiver() const { return receiver_address_.load() != 0; }
 
   void submit_mapped(const uint8_t *data, uint32_t width, uint32_t height, uint32_t stride,
                      uint64_t timestamp) {
@@ -376,10 +393,16 @@ class Sender {
  private:
   void control_loop() {
     std::array<char, 128> message{};
+    uint64_t next_probe = 0;
     for (;;) {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_) return;
+      }
+      const uint64_t now = monotonic_ns();
+      if (discover_ && !receiver_active(now) && now >= next_probe) {
+        send_discovery_probes();
+        next_probe = now + kDiscoveryIntervalNs;
       }
       fd_set readable;
       FD_ZERO(&readable);
@@ -391,8 +414,12 @@ class Sender {
       const int received = ::recvfrom(socket_, message.data(), static_cast<int>(message.size() - 1),
                                       0, reinterpret_cast<sockaddr *>(&from), &from_size);
       if (received <= 0) continue;
-      // Only the configured receiver may change the crop.
-      if (from.sin_addr.s_addr != destination_.sin_addr.s_addr || from.sin_port != destination_.sin_port)
+      // Only the current receiver may change the crop. With discovery, any
+      // receiver on the SysX port may answer while none is active.
+      const bool from_receiver = from.sin_addr.s_addr == receiver_address_.load() &&
+                                 from.sin_port == receiver_port_.load();
+      if (!from_receiver &&
+          (!discover_ || from.sin_port != htons(config_.port) || receiver_active(monotonic_ns())))
         continue;
       message[static_cast<size_t>(received)] = '\0';
       constexpr size_t prefix_size = sizeof(kControlPrefix) - 1;
@@ -403,6 +430,7 @@ class Sender {
                                     static_cast<size_t>(received) - prefix_size);
       uint32_t resolution = 0;
       if (parse_crop_resolution(digits, resolution)) {
+        if (!from_receiver) set_receiver(from);
         crop_size_.store(resolution);
         last_control_ns_.store(monotonic_ns());
       }
@@ -603,6 +631,11 @@ class Sender {
     // The send mutex and monotonic frame IDs preserve output order.
     latest_sent_frame_id_.store(frame.id, std::memory_order_relaxed);
     const uint64_t frame_id = frame.id;
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_addr.s_addr = receiver_address_.load();
+    destination.sin_port = receiver_port_.load();
+    if (destination.sin_addr.s_addr == 0) return;
     std::array<uint8_t, kHeaderBytes> header{};
     std::memcpy(header.data(), "RCVR", 4);
     header[4] = 1; // version
@@ -626,8 +659,8 @@ class Sender {
       buffers[1].len = static_cast<ULONG>(bytes);
       DWORD sent = 0;
       const int result = WSASendTo(socket_, buffers, 2, &sent, 0,
-                                   reinterpret_cast<const sockaddr *>(&destination_),
-                                   sizeof(destination_), nullptr, nullptr);
+                                   reinterpret_cast<const sockaddr *>(&destination),
+                                   sizeof(destination), nullptr, nullptr);
       // The socket is nonblocking. A full send buffer means this frame is
       // incomplete, so skip its remaining chunks instead of burning syscalls.
       if (result == SOCKET_ERROR || sent != kHeaderBytes + bytes) break;
@@ -640,6 +673,55 @@ class Sender {
   }
   static void put_u64(uint8_t *out, uint64_t value) {
     for (int i = 7; i >= 0; --i) out[7 - i] = static_cast<uint8_t>(value >> (i * 8));
+  }
+
+  void set_receiver(const sockaddr_in &address) {
+    receiver_port_.store(address.sin_port);
+    receiver_address_.store(address.sin_addr.s_addr);
+  }
+
+  // One probe to the limited broadcast address, to loopback (a receiver on
+  // this machine) and to each adapter's own subnet broadcast: Windows sends
+  // 255.255.255.255 out of one adapter only, which misses the LAN when a VPN
+  // or virtual adapter is preferred.
+  void send_discovery_probes() {
+    const auto probe = [this](uint32_t address_host_order) {
+      sockaddr_in to{};
+      to.sin_family = AF_INET;
+      to.sin_port = htons(config_.port);
+      to.sin_addr.s_addr = htonl(address_host_order);
+      ::sendto(socket_, kDiscoveryProbe, static_cast<int>(sizeof(kDiscoveryProbe) - 1), 0,
+               reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+    };
+    probe(INADDR_BROADCAST);
+    probe(INADDR_LOOPBACK);
+    try {
+      ULONG size = 16 * 1024;
+      std::vector<uint8_t> buffer;
+      ULONG result = ERROR_BUFFER_OVERFLOW;
+      for (int attempt = 0; attempt < 3 && result == ERROR_BUFFER_OVERFLOW; ++attempt) {
+        buffer.resize(size);
+        result = GetAdaptersAddresses(
+            AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buffer.data()), &size);
+      }
+      if (result != NO_ERROR) return;
+      for (auto *adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buffer.data()); adapter;
+           adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp ||
+            adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+          continue;
+        for (auto *unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+          const auto *address = reinterpret_cast<const sockaddr_in *>(unicast->Address.lpSockaddr);
+          const ULONG prefix = unicast->OnLinkPrefixLength;
+          if (!address || address->sin_family != AF_INET || prefix == 0 || prefix >= 31) continue;
+          const uint32_t host = ntohl(address->sin_addr.s_addr);
+          probe(host | (0xffffffffu >> prefix));
+        }
+      }
+    } catch (...) {
+      // Discovery retries next second; never let it escape the thread.
+    }
   }
 
   void close_socket() {
@@ -669,7 +751,10 @@ class Sender {
   std::atomic<uint64_t> latest_submitted_frame_id_{0};
   std::atomic<uint64_t> latest_sent_frame_id_{0};
   SOCKET socket_ = INVALID_SOCKET;
-  sockaddr_in destination_{};
+  bool discover_ = false;
+  // Receiver address and port in network byte order; 0 = not found yet.
+  std::atomic<uint32_t> receiver_address_{0};
+  std::atomic<uint16_t> receiver_port_{0};
 };
 
 Sender sender;
@@ -996,10 +1081,19 @@ int main(int argc, char **argv) {
       should_release_buffer(8u * 1024u * 1024u, 2u * 1024u * 1024u))
     return 6;
   Config config;
-  config.host = "127.0.0.1"; // Self-test never sends to the production LAN host.
+  // Self-test never sends to the production LAN host. `<port> <seconds> auto`
+  // finds the test receiver by discovery instead (it answers the probe).
+  const bool discover = argc > 3 && std::string_view(argv[3]) == "auto";
+  config.host = discover ? "auto" : "127.0.0.1";
   config.port = static_cast<uint16_t>(argc > 1 ? std::atoi(argv[1]) : 4299);
   config.default_crop = 320; // the receiver must replace this with its 640
   if (!sender.start(config)) return 1;
+  for (int i = 0; i < 100 && !sender.has_receiver(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  if (!sender.has_receiver()) {
+    sender.stop();
+    return 7;
+  }
   struct Size { uint32_t width, height, padding; };
   for (const Size size : {Size{320, 320, 0}, Size{200, 120, 64}, Size{1, 1, 0}}) {
     const uint32_t stride = size.width * 4u + size.padding;
@@ -1017,7 +1111,7 @@ int main(int argc, char **argv) {
   }
   for (int i = 0; i < 20 && sender.crop_size() != 640; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  const uint32_t crop = sender.crop_size();
+  const uint32_t receiver_crop = sender.crop_size();
   // Optional: `<port> <seconds>` keeps streaming a 640x640 dark frame with a
   // moving red square (a Pixel Seek "red" target) at ~60 FPS for UI checks.
   const int seconds = argc > 2 ? std::atoi(argv[2]) : 0;
@@ -1038,7 +1132,7 @@ int main(int argc, char **argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
   }
   sender.stop();
-  std::printf("{\"event\":\"selftest\",\"receiver_crop\":%u}\n", crop);
-  return crop == 640 ? 0 : 2;
+  std::printf("{\"event\":\"selftest\",\"receiver_crop\":%u}\n", receiver_crop);
+  return receiver_crop == 640 ? 0 : 2;
 }
 #endif

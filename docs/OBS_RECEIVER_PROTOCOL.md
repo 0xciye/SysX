@@ -46,7 +46,11 @@ When the receiver sees datagrams from a new sender address, and again whenever C
 SYSCFG 1 CROP <resolution>
 ```
 
-ASCII, no terminator, `<resolution>` in 1–5792. The upper bound keeps the square frame within the receiver's 33,554,432-pixel allocation budget. The plugin accepts it only from its configured receiver address/port, ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged; while the sender streams, the receiver repeats it every second; a sender that never receives it keeps its `default_crop`.
+ASCII, no terminator, `<resolution>` in 1–5792. The upper bound keeps the square frame within the receiver's 33,554,432-pixel allocation budget. The plugin accepts it only from its receiver's address/port (configured, or found by discovery, section 2.2), ignores anything else, and recreates its GPU crop resources for the new size. The message is not acknowledged; while the sender streams, the receiver repeats it every second; a sender that never receives it keeps its `default_crop`.
+
+### 2.2 Receiver discovery
+
+A plugin built with `SYSX_RECEIVER_IP=auto` (the default) has no receiver address. Until a receiver answers, once a second it sends the ASCII datagram `SYSXFIND 1` to UDP `kReceiverPort` (4200) at 255.255.255.255, at 127.0.0.1 and at each active adapter's subnet broadcast address (Windows sends 255.255.255.255 out of one adapter only). The receiver answers a probe with `SYSCFG 1 CROP <resolution>` from its UDP 4200 socket without making the prober its active sender; the plugin takes the answer's source address as its receiver and streams there. While that receiver keeps answering (within 3 s) the plugin ignores other receivers; when it goes quiet, probing resumes and the first receiver to answer wins. With more than one SysX on the LAN, build the DLL with a fixed IPv4 address instead. Broadcasts do not cross routers, so discovery works only within one subnet.
 
 ### Chunking rules
 
@@ -93,7 +97,7 @@ The plugin:
 3. Assign a frame ID and capture timestamp, split the JPEG into 1,170-byte payloads, write the v1 header in big-endian order, and send all chunks to the Receiver IP and port.
 4. Run capture conversion, compression, and socket sends outside OBS's render callback. Use a bounded queue with latest-frame behavior; discard obsolete unsent frames if encoding or the network falls behind.
 5. Send chunks in order for efficiency, while still tolerating receiver-side reordering. Do not use IP fragmentation or datagrams larger than the 1,200-byte protocol limit.
-6. Takes its configuration from compile-time constants in `sysx_canvas_sender.cpp` (`kReceiverHost = "192.168.88.59"`, `kReceiverPort = 4200`, `kJpegQuality = 80`, `kMaxFps = 0`, `kChroma444 = true`, `kDefaultCrop = 640`), uses an 8 MiB socket send buffer, writes nothing to the OBS log, and drops encode/socket failures without blocking OBS. The protocol has no frame acknowledgement, so a successful local `sendto` call does not prove that the Receiver accepted or processed that frame.
+6. Takes its configuration from compile-time constants in `sysx_canvas_sender.cpp` (`kReceiverHost` from the `SYSX_RECEIVER_IP` build option, default `auto`, `kReceiverPort = 4200`, `kJpegQuality = 80`, `kMaxFps = 0`, `kChroma444 = true`, `kDefaultCrop = 640`), uses an 8 MiB socket send buffer, writes nothing to the OBS log, and drops encode/socket failures without blocking OBS. The protocol has no frame acknowledgement, so a successful local `sendto` call does not prove that the Receiver accepted or processed that frame.
 
 Respect the cadence of the source OBS output. The requested 180–360 FPS is a system target to benchmark, not a promise that every source, encoder, network, Receiver, or UI can sustain it. At high rates, JPEG encoding and packets per second can become the bottleneck. Measure sender encode FPS, bytes per second, datagrams per second, Receiver source FPS, processing FPS, dropped frames, and preview FPS separately. Receiver source FPS counts valid decoded frames observed over a trailing one-second window. Preview forwards every processed frame (the sender's JPEG, not re-encoded), so preview FPS follows the input rate; what is visible is still limited by the display refresh rate. With a 240 FPS libobs source (headless, 2026-10-15) the monitor page received 230.3 and drew 229.7 frames/s; a raw WebSocket client received 224.8 frames/s.
 
@@ -128,10 +132,10 @@ Verified so far (Windows 10, loopback): the plugin's headless `sysx-sender-selft
 
 ## 7. Running across a LAN (router)
 
-1. On the OBS computer set `kReceiverHost` to the SysX computer's LAN IPv4 address (keep `kReceiverPort = 4200`), rebuild the DLL, and install it. The plugin accepts `SYSCFG` only from that exact `host:port`; the receiver answers from its UDP 4200 socket, so the reply matches as long as the SysX computer uses that address on the LAN.
+1. Install the DLL on the OBS computer. Built with `auto` (default) it finds SysX on the same subnet by broadcast (section 2.2), so one DLL works for every pair of computers. Built with a fixed address it streams to that `host:4200` and accepts `SYSCFG` only from it; use that across routers or with more than one SysX on the LAN.
 2. On the SysX computer allow inbound UDP 4200 on the Private network profile once (elevated prompt):
    `netsh advfirewall firewall add rule name="SysX UDP 4200" dir=in action=allow protocol=UDP localport=4200 profile=private`
-   SysX now extracts its backend to the fixed `%LOCALAPPDATA%\SysX\runtime\receiver-backend.exe`, so an app-based allow rule granted at the Windows prompt also persists across launches. The OBS side needs no rule: the `SYSCFG` reply comes back on the flow OBS opened.
+   SysX now extracts its backend to the fixed `%LOCALAPPDATA%\SysX\runtime\receiver-backend.exe`, so an app-based allow rule granted at the Windows prompt also persists across launches. The OBS side needs no rule: the `SYSCFG` reply comes back on the flow OBS opened (for discovery, Windows treats the reply to a broadcast the same way; if a third-party firewall blocks it, allow OBS inbound UDP or use a fixed address).
 3. The receiver repeats `SYSCFG` every second while a sender streams, so a crop message dropped by the router is corrected within ~1 s. Only senders whose datagrams start with `RCVR` can become the `SYSCFG` recipient.
 4. The receiver socket uses an 8 MiB receive buffer (the sender uses an 8 MiB send buffer) so a frame's burst of ~100 datagrams is not dropped while the previous JPEG decodes.
 5. Bandwidth: a 640 × 640 crop at quality 80 with 4:4:4 chroma measured 75–97 KiB per frame here, about 150–190 Mbit/s at 240 FPS. Use wired gigabit Ethernet. On Wi-Fi or 100 Mbit links lower `kMaxFps`, set `kChroma444 = false`, or reduce `kJpegQuality`; otherwise incomplete frames are dropped (watch the transport-drop counter).

@@ -102,7 +102,7 @@ The [continuity report](docs/SECURITY_CONTINUITY_REPORT.md) records a Linux synt
 
 The Rust backend keeps UDP packet reassembly in `rust-backend/src/udp.rs`, decoded input in `receiver.rs`, and crop geometry in `crop.rs`. Native Settings are read and applied through the authenticated host connection; the backend exposes no web-config HTTP endpoint. The movement ticker and native host aggregate fresh deltas and discard targets older than 100 ms. Motion normally requires the configured physical trigger; Motion's **Always on** option bypasses that held-button gate while retaining the fresh-target and enabled-motion checks. Auto is unavailable while Always on is enabled, but its saved settings are preserved. The native host adds sampled recoil and clamps each axis to ±32. Only Medius receives output: internal queue records are retained until a worker invokes `medius_device.rs` through the official Rust SDK on a cloned `Device`. SDK I/O timeouts apply, and library call completion does not acknowledge a game event. Windows/device validation remains pending.
 
-The current LAN sender DLL targets `192.168.88.59:4200` and is built separately from the receiver.
+The LAN sender DLL is built separately from the receiver. By default it finds SysX on the same subnet by itself (UDP broadcast discovery), so one DLL works on every machine; it can still be built for a fixed receiver address.
 
 ## Windows portable build validation (2026-10-16)
 
@@ -112,7 +112,7 @@ These results describe the earlier build recorded below. The native PDB/crash-di
 
 ## Manual builds and crash diagnostics
 
-Open **Actions** and choose **Build SysX EXE (manual)** or **Build OBS DLL (manual, receiver IP)**, then **Run workflow** on `main`. The DLL workflow has a `receiver_ip` field (default `192.168.88.59`, UDP 4200). Neither workflow runs automatically on push/PR. Successful outputs are saved under **Releases → draft release** instead of Actions artifacts.
+Open **Actions** and choose **Build SysX EXE (manual)** or **Build OBS DLL (manual, receiver IP or auto)**, then **Run workflow** on `main`. The DLL workflow has a `receiver_ip` field (default `auto`, or a fixed IPv4 address; UDP 4200). Neither workflow runs automatically on push/PR. Successful outputs are saved under **Releases → draft release** instead of Actions artifacts.
 
 Native host/backend release builds retain full PDB information (`debug = 2`, `strip = "none"`) with LTO and the release security guards still enabled. The EXE workflow creates separate app and symbols ZIPs; the DLL workflow produces only the image-sender DLL, without PDBs or custom diagnostics. Keep the matching PDB archive for each exact build. PDBs are not required on a computer that only runs the app. The manual workflow summary reports actual EXE/ZIP sizes; no new size is known until a build runs. The desktop build no longer embeds or strips WASM settings assets.
 

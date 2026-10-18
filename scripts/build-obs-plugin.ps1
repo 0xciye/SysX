@@ -1,6 +1,8 @@
 param(
-    [ValidatePattern('^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')]
-    [string] $ReceiverIp = '192.168.88.59',
+    # 'auto' finds the receiver on the LAN at run time (one DLL for every
+    # machine); an IPv4 address fixes the destination.
+    [ValidatePattern('^(?:auto|(?:[0-9]{1,3}\.){3}[0-9]{1,3})$')]
+    [string] $ReceiverIp = 'auto',
     # libobs headers (OBS source release) plus the folder containing obsconfig.h.
     [string] $ObsInclude = "work/obs-source/obs-studio-32.2.2/libobs;work/obs-config",
     [string] $JpegInclude = "C:/libjpeg-turbo64/include",
@@ -9,14 +11,15 @@ param(
 )
 # Builds the OBS sender plugin on its own (separate from the SysX package) and
 # copies the DLL to dist-package\OBS-plugin\. The receiver IP/port are
-# compile-time configuration: ReceiverIp selects the destination IP; the
+# compile-time configuration: ReceiverIp selects the destination IP or auto; the
 # source kReceiverPort constant selects the port. No runtime INI is emitted.
 $ErrorActionPreference = "Stop"
 $receiverAddress = $null
-if (-not [System.Net.IPAddress]::TryParse($ReceiverIp, [ref]$receiverAddress) -or
+if ($ReceiverIp -ne 'auto' -and (
+    -not [System.Net.IPAddress]::TryParse($ReceiverIp, [ref]$receiverAddress) -or
     $receiverAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
-    $receiverAddress.ToString() -ne $ReceiverIp) {
-    throw 'ReceiverIp must be a canonical IPv4 address, for example 192.168.88.59.'
+    $receiverAddress.ToString() -ne $ReceiverIp)) {
+    throw 'ReceiverIp must be auto or a canonical IPv4 address, for example 192.168.88.59.'
 }
 $root = Split-Path -Parent $PSScriptRoot
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
