@@ -32,6 +32,7 @@ fn backend_wire_reaches_the_host_for_held_trigger_and_always_on() {
                 ..RecoilSettings::default()
             },
             flick: false,
+            aim_done: false,
         };
         let wire = serde_json::to_string(&event).unwrap();
         let value = serde_json::from_str(&wire).unwrap();
@@ -99,6 +100,7 @@ fn host_pending_queue_keeps_only_the_current_revision() {
             timestamp_ms: now,
             recoil: RecoilSettings::default(),
             flick: false,
+            aim_done: false,
         };
         host_movement::set_target(&state, &serde_json::to_value(event).unwrap());
     }

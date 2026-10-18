@@ -145,6 +145,10 @@ pub struct MovementEvent {
     /// Auto's aim move: the host sends it in one command instead of ±32 steps.
     #[serde(default)]
     pub flick: bool,
+    /// Aim mode reached its target on this event (backend only: the
+    /// service reports it to Auto at once instead of on the next frame).
+    #[serde(skip)]
+    pub aim_done: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +197,8 @@ pub struct MovementTargetSample {
     /// How long ago the receiver had this frame (decode and processing);
     /// `received_s` and freshness count from then, not from publication.
     pub age_s: f64,
+    /// Aim mode: Auto's center gate sees the target on the crosshair.
+    pub on_center: bool,
 }
 
 struct TickerState {
@@ -291,6 +297,7 @@ impl MovementTicker {
                 let mut rendered = abcurves::MotionOutput::default();
                 let mut controller = MovementController::new(initial_sens);
                 let mut sens = initial_sens;
+                let mut flick_sens = initial_sens;
                 let mut sent_invalid = false;
                 let mut summary = MotionSummary::default();
                 loop {
@@ -343,6 +350,7 @@ impl MovementTicker {
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
                                     flick: false,
+                                    aim_done: false,
                                 });
                                 sent_invalid = true;
                             }
@@ -356,19 +364,35 @@ impl MovementTicker {
                                 let _ = controller.set_sensitivity(runtime.sens);
                                 sens = runtime.sens;
                             }
-                            let found = flick
-                                .searching()
-                                .then(|| flick_target(&sample, &runtime))
-                                .flatten();
-                            let (dx, dy) = flick.step(found, counts_per_px(sens));
+                            if flick_sens != sens {
+                                // Learned px per count belongs to one Sens.
+                                flick.forget();
+                                flick_sens = sens;
+                            }
+                            let was_done = flick.done();
+                            let (dx, dy) = flick.step(
+                                flick::FlickFrame {
+                                    frame_id: sample.frame_id,
+                                    arrival_s: sample.received_s,
+                                    error: flick_target(&sample, &runtime),
+                                    on_center: sample.on_center,
+                                },
+                                counts_per_px(sens),
+                                monotonic_seconds(),
+                            );
+                            // Done only from a frame that shows the last
+                            // move (never with a move on this event), so the
+                            // click can never overtake it.
+                            worker_flick_done.store(flick.done(), Ordering::Release);
                             on_event(MovementEvent {
                                 config_revision: runtime.config_revision,
                                 event: "movement_target".into(),
                                 frame_id: sample.frame_id,
-                                // Valid from the lock on, so the host keeps
-                                // the rest of the move until it is sent.
+                                // Valid from the first move on, so the host
+                                // keeps each move until it is sent.
                                 target_valid: !flick.searching(),
                                 flick: true,
+                                aim_done: !was_done && flick.done(),
                                 dx,
                                 dy,
                                 motion_enabled: true,
@@ -377,11 +401,8 @@ impl MovementTicker {
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
                             });
-                            // Done only after the move was handed on, so the
-                            // click can never overtake it.
-                            worker_flick_done.store(flick.done(), Ordering::Release);
                             sent_invalid = false;
-                            // Poll for the first target every 1 ms instead of
+                            // Poll for each new frame every 1 ms instead of
                             // waiting for the next tick.
                             thread::sleep(Duration::from_millis(1));
                             continue;
@@ -405,6 +426,7 @@ impl MovementTicker {
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
                                     flick: false,
+                                    aim_done: false,
                                 });
                                 sent_invalid = true;
                             }
@@ -478,6 +500,7 @@ impl MovementTicker {
                             timestamp_ms: unix_ms(),
                             recoil: runtime.recoil,
                             flick: false,
+                            aim_done: false,
                         });
                         sent_invalid = false;
                     } else if !sent_invalid {
@@ -499,6 +522,7 @@ impl MovementTicker {
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
                                 flick: false,
+                                aim_done: false,
                             });
                         }
                         sent_invalid = true;
@@ -755,6 +779,7 @@ mod tests {
             timestamp_ms,
             recoil: RecoilSettings::default(),
             flick: false,
+            aim_done: false,
         }
     }
 
@@ -788,6 +813,7 @@ mod tests {
             processed_size: (64, 64),
             received_s: 1.0,
             age_s: 0.0,
+            on_center: false,
         }
     }
 

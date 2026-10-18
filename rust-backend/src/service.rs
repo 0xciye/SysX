@@ -366,6 +366,7 @@ impl ReceiverService {
         let ticker_device = Arc::clone(&device);
         let ticker_auto = Arc::clone(&auto_events);
         let ticker_batcher = Arc::clone(&movement_batcher);
+        let aim_auto = Arc::clone(&auto_events);
         let movement_ticker = Arc::new(
             MovementTicker::new(
                 app.sens,
@@ -382,6 +383,13 @@ impl ReceiverService {
                     ))
                 }),
                 Arc::new(move |event| {
+                    // Aim mode reached its target: fire now, not on the next
+                    // frame's callback.
+                    if event.aim_done {
+                        if let Ok(events) = aim_auto.lock() {
+                            events.target(event.config_revision, true);
+                        }
+                    }
                     // Auto's aim move goes out at once, not after the 4 ms batch.
                     if event.flick && (event.dx != 0 || event.dy != 0) {
                         if let Ok(line) = serde_json::to_string(&event) {
@@ -432,9 +440,11 @@ impl ReceiverService {
                         ),
                         received_s: 0.0,
                         age_s: processed.frame.received.elapsed().as_secs_f64(),
+                        on_center: processed.result.auto_aim && processed.result.auto_target_valid,
                     });
                     let auto_active = effective_detection_settings(&settings, &device).2;
-                    // Aim mode fires once its move reached the locked target.
+                    // Aim mode fires once a frame after its last move shows
+                    // the crosshair on the target.
                     let target_valid = auto_active
                         && if settings.auto.aims() {
                             callback_ticker.flick_done()

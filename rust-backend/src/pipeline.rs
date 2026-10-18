@@ -627,11 +627,19 @@ fn process_frame_with_scratch(
     let crosshair_px = crosshair.radius_px();
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
     let target_xy = output.target.map(|point| [point.x, point.y]);
-    // Aim mode fires on the target it aims at, as Motion selects it inside
-    // Auto FOV; center-crossing mode needs the target to pass the center.
+    // Aim mode: whether the target covers the crosshair now (the movement
+    // ticker fires on it only from a frame that shows its last move);
+    // center-crossing mode needs the target to pass the center.
     let auto_target_valid = if auto_aim {
         crossing.reset();
-        target_xy.is_some()
+        center_sides(
+            &output.mask,
+            processed.width(),
+            processed.height(),
+            config.auto_fov_degrees,
+            crosshair_px,
+        )
+        .covers()
     } else if config.auto_target_active {
         let sides = center_sides(
             &output.mask,
@@ -1021,6 +1029,7 @@ mod tests {
                         ),
                         received_s: 0.0,
                         age_s: processed.frame.received.elapsed().as_secs_f64(),
+                        on_center: false,
                     });
                 }
                 callback_count.fetch_add(1, Ordering::Relaxed);
@@ -1226,8 +1235,8 @@ mod tests {
         assert!(result.auto_active && result.auto_aim);
         assert_eq!(result.target_xy, Some([38.5, 32.5]), "pixel centers");
         assert!(
-            result.auto_target_valid,
-            "a valid target fires, off center too"
+            !result.auto_target_valid,
+            "off center: the ticker moves first, nothing covers the crosshair"
         );
         assert_eq!(result.fov_degrees, 20);
 
@@ -1237,6 +1246,12 @@ mod tests {
         let result = run(image, 2, &mut smoother, &mut cache);
         assert_eq!(result.target_xy, None);
         assert!(!result.auto_target_valid);
+
+        // The target on the crosshair: the center gate reports it.
+        let mut image = image::RgbImage::new(64, 64);
+        image.put_pixel(32, 32, image::Rgb([255, 0, 0]));
+        let result = run(image, 3, &mut smoother, &mut cache);
+        assert!(result.auto_target_valid);
     }
 
     #[test]
