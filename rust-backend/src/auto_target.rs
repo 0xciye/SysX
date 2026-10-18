@@ -27,6 +27,10 @@ const MIN_SAMPLES: u32 = 30;
 const STATIC_RATE: f32 = 0.1;
 /// Search this far beyond the measured crosshair radius.
 pub const CROSSHAIR_MARGIN_PX: f32 = 3.0;
+/// Without a measured crosshair, how far from the center row (column) the
+/// pixels left and right (above and below) of the center may lie: about what
+/// a crosshair arm and the JPEG bleed beside it hide.
+pub const CENTER_BAND_PX: f32 = 4.0;
 
 /// Measures how far the game's crosshair hides the center: the crosshair is
 /// drawn over the scene, so while the scene moves its pixels stay the same.
@@ -131,7 +135,10 @@ impl CrosshairTracker {
 
 /// Returns `true` when the target covers the screen center: a nonzero mask
 /// pixel in the center cells, or mask pixels inside the Auto FOV on all four
-/// sides of the center (left, right, above and below). When a measured
+/// sides of the center, close to the center row (left and right) and the
+/// center column (above and below), where a crosshair would hide the rest.
+/// Pixels far up or down on both sides, such as two separate targets or the
+/// two edges of a gap with the center between them, do not count. When a measured
 /// crosshair (`crosshair_px`, see [`CrosshairTracker`]) is larger than the
 /// FOV, the surround search reaches [`CROSSHAIR_MARGIN_PX`] past it instead.
 ///
@@ -153,16 +160,24 @@ pub fn has_target_at_center(
 pub struct CenterSides {
     /// A mask pixel in the center cells.
     pub center: bool,
+    /// Pixels anywhere left, right, above and below the center (for
+    /// [`CenterCrossing`]).
     pub west: bool,
     pub east: bool,
     pub north: bool,
     pub south: bool,
+    /// Pixels left and right of the center next to the center row, and
+    /// above and below it next to the center column.
+    pub row_west: bool,
+    pub row_east: bool,
+    pub column_north: bool,
+    pub column_south: bool,
 }
 
 impl CenterSides {
     /// The target covers the center in this frame.
     pub fn covers(self) -> bool {
-        self.center || (self.west && self.east && self.north && self.south)
+        self.center || (self.row_west && self.row_east && self.column_north && self.column_south)
     }
 }
 
@@ -197,6 +212,7 @@ pub fn center_sides(
         0.0
     };
     let radius = fov_radius_px(width, height, degrees).max(crosshair.min(limit));
+    let band = CENTER_BAND_PX.max(crosshair);
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
     let reach = radius.ceil() as u32 + 1;
     let (x0, x1) = (left.saturating_sub(reach), (right + reach).min(width - 1));
@@ -212,6 +228,14 @@ pub fn center_sides(
             sides.east |= dx > 0.0;
             sides.north |= dy < 0.0;
             sides.south |= dy > 0.0;
+            if dy.abs() <= band {
+                sides.row_west |= dx < 0.0;
+                sides.row_east |= dx > 0.0;
+            }
+            if dx.abs() <= band {
+                sides.column_north |= dy < 0.0;
+                sides.column_south |= dy > 0.0;
+            }
             if sides.covers() {
                 return sides;
             }
@@ -311,14 +335,33 @@ mod tests {
         }
         let outline = mask(&points);
         assert!(has_target_at_center(&outline, 64, 64, 36, 0.0));
-        // Pixels only in two diagonal corners still surround the center.
-        assert!(has_target_at_center(
+        // Pixels only in two diagonal corners do not.
+        assert!(!has_target_at_center(
             &mask(&[(27, 27), (37, 37)]),
             64,
             64,
             36,
             0.0
         ));
+    }
+
+    /// User report: two separate colored strips left and right of the
+    /// center, each reaching above and below it, fired with nothing on the
+    /// center between them.
+    #[test]
+    fn two_strips_with_the_center_between_them_do_not_count() {
+        let mut points = Vec::new();
+        for y in 18..46u32 {
+            points.extend([(22, y), (23, y), (41, y), (42, y)]);
+        }
+        let strips = mask(&points);
+        assert!(!has_target_at_center(&strips, 64, 64, 90, 0.0));
+        // The same strips joined above and below the center (an outline
+        // around it) do.
+        for x in 22..43u32 {
+            points.extend([(x, 18), (x, 45)]);
+        }
+        assert!(has_target_at_center(&mask(&points), 64, 64, 90, 0.0));
     }
 
     #[test]
@@ -345,7 +388,7 @@ mod tests {
     fn pixels_outside_the_fov_are_ignored() {
         // 36° is a 32 px radius (fixed 640 px reference); ±40 px is outside.
         let mut far = vec![0; 256 * 256];
-        for (x, y) in [(88, 88), (168, 168)] {
+        for (x, y) in [(88, 128), (168, 128), (128, 88), (128, 168)] {
             far[y * 256 + x] = 1;
         }
         assert!(!has_target_at_center(&far, 256, 256, 36, 0.0));
