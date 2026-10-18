@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleExecutable</key>
 	<string>SysX</string>
+	<key>CFBundleIconFile</key>
+	<string>SysX</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.sysx.receiver</string>
 	<key>CFBundleName</key>
@@ -18,5 +20,7 @@
 	<string>12.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
 </dict>
 </plist>

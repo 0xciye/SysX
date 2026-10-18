@@ -1814,7 +1814,7 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
             message = socket.recv() => {
                 let Some(Ok(Message::Text(text))) = message else { break; };
                 if text.len() > MAX_MESSAGE_BYTES {
-                    let mut event = oversized_command_error(&text);
+                    let event = oversized_command_error(&text);
                     service.record_error("commands must be under 64 KiB".into());
                     if send_text(&mut socket, event).await.is_err() { break; }
                     continue;

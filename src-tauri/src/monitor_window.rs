@@ -43,7 +43,6 @@ slint::slint! {
             Text {
                 text: root.caption;
                 color: root.primary ? #08120f : (root.danger ? #ef6c6c : #ebf1f5);
-                font-family: "Segoe UI";
                 font-size: root.primary ? 13px : 12px;
                 font-weight: root.primary ? 700 : 400;
                 horizontal-alignment: root.primary ? center : left;
@@ -1550,6 +1549,15 @@ pub fn run(
 ) -> Result<(), String> {
     let app = Receiver::new().map_err(|e| e.to_string())?;
     let settings_app = SettingsWindow::new().map_err(|e| e.to_string())?;
+    // Segoe UI and Consolas (the markup defaults) are Windows fonts; macOS
+    // would fall back to a proportional face for the measured numbers.
+    #[cfg(target_os = "macos")]
+    {
+        app.set_body_font("Helvetica Neue".into());
+        app.set_mono_font("Menlo".into());
+        settings_app.set_body_font("Helvetica Neue".into());
+        settings_app.set_mono_font("Menlo".into());
+    }
     let view = Arc::new(Mutex::new(View::default()));
     let queued = Arc::new(AtomicBool::new(false));
     // Coalesce UI wake-ups; workers keep at most one pending JPEG and one decoded frame.

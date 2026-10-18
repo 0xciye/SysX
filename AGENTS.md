@@ -118,6 +118,10 @@ The user tested and confirmed Motion's per-frame Normal logic on branch `stable/
 - Use `public/receiver-mark.svg` as the canonical SysX mark; keep desktop bundle icons visually aligned with this SVG.
 - Only Medius is supported. Use official `medius 3.4.6` Rust SDK CH343 discovery (`find_medius`), `Device::open` protocol-9 handshake, health query, physical input stream and SDK-managed 6,000,000-baud transport. Keep output calls in `medius_device.rs`; do not add direct serial protocol code, Ferrum or MAKCU fallback. Physical movement and button telemetry require Windows/device validation.
 
+### macOS receiver
+
+- Keep the macOS-specific pieces small and behind `cfg(target_os = "macos")`: the latency-critical `NSProcessInfo` activity in `native-shared/timer_resolution.rs` (App Nap and timer coalescing otherwise slow a hidden SysX), the stepped UDP receive buffer in `receiver.rs`, `/dev/cu.*`-only Medius ports, Helvetica Neue/Menlo fonts, and the `atexit` cleanup for Quit in `native_app.rs`. `scripts/build-macos.sh` ad-hoc signs the backend before the host embeds and hashes it, then signs the bundle. `.github/workflows/macos-build.yml` is manual-only like the Windows workflows. As of 2026-10-18 macOS code only type-checks from Linux; it has not been built, linked or run on a Mac.
+
 ### Release hardening
 
 - Keep release hardening separate from vision, targeting, movement, and queue logic. The native release profiles retain full PDB debug information (`debug = 2`, `strip = "none"`) at the user's request and use LTO; Windows also enables Control Flow Guard; debug/test builds must remain debuggable.

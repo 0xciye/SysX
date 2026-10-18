@@ -129,6 +129,8 @@ pub fn run() {
             Some(&format!("could not start Medius discovery thread: {error}")),
         );
     }
+    #[cfg(target_os = "macos")]
+    terminate::hold(runtime);
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::sync_channel(8);
     start_host_client(
@@ -161,7 +163,49 @@ pub fn run() {
             ));
         }
     }
+    #[cfg(target_os = "macos")]
+    drop(terminate::release());
+    #[cfg(not(target_os = "macos"))]
     drop(runtime);
+}
+
+/// Quit (Cmd+Q, the Dock menu, logout) makes AppKit call `exit()` from inside
+/// the event loop, so the code after it in `run` never runs; `atexit` still
+/// does. It stops the owned backend and removes its runtime there instead.
+#[cfg(target_os = "macos")]
+mod terminate {
+    use super::BackendRuntime;
+    use std::sync::Mutex;
+
+    static RUNTIME: Mutex<Option<BackendRuntime>> = Mutex::new(None);
+
+    extern "C" {
+        fn atexit(callback: extern "C" fn()) -> i32;
+    }
+
+    extern "C" fn on_exit() {
+        let _ = std::panic::catch_unwind(|| {
+            if let Some(runtime) = release() {
+                drop(runtime);
+                crate::diagnostics::finish_session("macOS terminated the application (Quit)");
+            }
+        });
+    }
+
+    pub(super) fn hold(runtime: BackendRuntime) {
+        *RUNTIME.lock().unwrap_or_else(|error| error.into_inner()) = Some(runtime);
+        // SAFETY: registers a plain function; it only runs at process exit.
+        unsafe {
+            atexit(on_exit);
+        }
+    }
+
+    pub(super) fn release() -> Option<BackendRuntime> {
+        RUNTIME
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 /// Decides when the native monitor client is gone, tolerating its short
@@ -546,7 +590,9 @@ fn find_medius_ports() -> Result<Vec<medius::PortInfo>, String> {
                 .into_iter()
                 .filter_map(|port| match port.port_type {
                     serialport::SerialPortType::UsbPort(usb)
-                        if usb.vid == 0x1A86 && usb.pid == 0x55D3 =>
+                        if usb.vid == 0x1A86
+                            && usb.pid == 0x55D3
+                            && is_control_port(&port.port_name) =>
                     {
                         Some(medius::PortInfo {
                             path: port.port_name,
@@ -560,6 +606,13 @@ fn find_medius_ports() -> Result<Vec<medius::PortInfo>, String> {
                 .collect()
         })
         .map_err(|error| format!("serial-port scan failed: {error}"))
+}
+
+/// macOS lists each USB serial device twice, as `/dev/cu.*` (call-out) and
+/// `/dev/tty.*` (dial-in, which waits for carrier). Open only the call-out
+/// node so one box is not tried twice.
+fn is_control_port(path: &str) -> bool {
+    !cfg!(target_os = "macos") || !path.starts_with("/dev/tty.")
 }
 
 fn inspect_devices(
@@ -938,6 +991,16 @@ fn make_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_opens_only_the_call_out_node_of_a_serial_device() {
+        assert!(is_control_port("/dev/cu.usbmodem1101"));
+        assert!(is_control_port("COM3"));
+        assert_eq!(
+            is_control_port("/dev/tty.usbmodem1101"),
+            !cfg!(target_os = "macos")
+        );
+    }
 
     #[test]
     fn medius_health_requires_link_mouse_and_clone_configuration() {

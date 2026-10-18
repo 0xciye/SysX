@@ -163,7 +163,17 @@ impl UdpDecodedFrameSource {
             // Over a LAN a whole frame (~100 datagrams) arrives in a burst
             // while this thread may still be decoding the previous JPEG; the
             // small default Windows buffer would drop chunks and whole frames.
-            let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES);
+            // macOS refuses more than kern.ipc.maxsockbuf allows (8 MiB
+            // including overhead, about 7 MiB of data by default), so step
+            // down to the largest size accepted instead of its small default.
+            for mib in [8, 7, 6, 4, 2, 1] {
+                if socket
+                    .set_recv_buffer_size(RECEIVE_BUFFER_BYTES / 8 * mib)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
             socket.bind(&address.into())?;
             let socket: UdpSocket = socket.into();
             socket.set_read_timeout(Some(Duration::from_millis(50)))?;

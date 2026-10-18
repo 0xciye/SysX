@@ -1,0 +1,72 @@
+name: Build SysX macOS app (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Apple Silicon runner; the script builds the runner's architecture only.
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORT_SKIP_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          cmake --version
+      - name: Backend tests
+        run: cargo test --manifest-path rust-backend/Cargo.toml --features ort/load-dynamic
+      - name: Host tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Shared UI helper tests
+        run: cargo test --manifest-path rust-ui/Cargo.toml
+      - name: Build SysX.app
+        run: bash scripts/build-macos.sh
+      - name: Check the bundle
+        run: |
+          set -euo pipefail
+          app=dist/SysX.app
+          codesign --verify --strict --verbose=2 "$app"
+          file "$app/Contents/MacOS/SysX"
+          plutil -lint "$app/Contents/Info.plist"
+          test -s "$app/Contents/Resources/SysX.icns"
+          backend=src-tauri/binaries/receiver-backend-aarch64-apple-darwin
+          codesign --verify --verbose=2 "$backend"
+          "$backend" --help >/dev/null
+      - name: Backend UDP fixture smoke
+        run: |
+          set -euo pipefail
+          backend=src-tauri/binaries/receiver-backend-aarch64-apple-darwin
+          "$backend" udp-listen --host 127.0.0.1 --port 4200 --count 1 > listen.log 2>&1 &
+          listener=$!
+          sleep 1
+          "$backend" udp-send-image src/assets/red-cube-192.jpg --host 127.0.0.1 --port 4200
+          wait "$listener"
+          cat listen.log
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist-package
+          {
+            echo "SysX macOS (Apple Silicon) build, ad-hoc signed, not notarized."
+            echo "Only Pixel Seek is usable; Object Detection is unavailable. Only Medius is supported."
+            echo "Unit tests and a backend UDP smoke ran on a hosted runner; the app window,"
+            echo "physical Medius, OBS and game behavior have not been tested by this build."
+            echo "Build commit: $GITHUB_SHA"
+          } > dist-package/BUILD-INFO.txt
+          ditto -c -k --keepParent dist/SysX.app dist-package/SysX-macos-arm64.zip
+          (cd dist-package && shasum -a 256 SysX-macos-arm64.zip > SysX-macos-arm64.zip.sha256)
+          ls -l dist-package >> "$GITHUB_STEP_SUMMARY"
+      - name: Save the ZIP as a draft release (no Actions artifact storage)
+        run: |
+          tag="macos-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          gh release create "$tag" dist-package/SysX-macos-arm64.zip dist-package/SysX-macos-arm64.zip.sha256 \
+            --draft --prerelease --target "$GITHUB_SHA" \
+            --title 'SysX macOS arm64' --notes-file dist-package/BUILD-INFO.txt
