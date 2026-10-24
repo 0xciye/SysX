@@ -593,9 +593,36 @@ slint::slint! {
                                     border-width: 1px; border-color: Palette.border;
                                     HorizontalLayout {
                                         padding: 2px; spacing: 2px;
-                                        SettingsSegment { width: (parent.width - 6px) / 2; caption: "Pixel Seek"; selected: true; font: root.body-font; }
-                                        SettingsSegment { width: (parent.width - 6px) / 2; caption: "Object Detection · Unavailable"; unavailable: true; font: root.body-font; }
+                                        SettingsSegment {
+                                            width: (parent.width - 6px) / 2; caption: "Pixel Seek";
+                                            selected: field.value == "pixel_seek"; font: root.body-font;
+                                            picked => { root.field-selected("strategy", "pixel_seek"); }
+                                        }
+                                        SettingsSegment {
+                                            width: (parent.width - 6px) / 2; caption: "Object Detection";
+                                            selected: field.value == "object_detection"; font: root.body-font;
+                                            picked => { root.field-selected("strategy", "object_detection"); }
+                                        }
                                     }
+                                }
+                                if field.kind == "model-import": HorizontalLayout {
+                                    x: row.control-x; y: (parent.height - 30px) / 2;
+                                    width: content.control-width; height: 30px; spacing: 8px;
+                                    SettingsInput {
+                                        text: field.value; mono: false; label: field.label;
+                                        font: root.body-font; mono-font: root.mono-font;
+                                        edited(text) => { root.field-edited(field.key, text); }
+                                    }
+                                    SettingsButton {
+                                        width: 76px; caption: "Import"; font: root.body-font;
+                                        activated => { root.field-activated(field.key2); }
+                                    }
+                                }
+                                if field.kind == "info": Text {
+                                    x: row.control-x; width: content.control-width; height: parent.height;
+                                    text: field.value; color: Palette.text-secondary; font-size: 13px;
+                                    font-family: root.mono-font;
+                                    vertical-alignment: center; overflow: elide;
                                 }
                                 if field.kind == "rename": HorizontalLayout {
                                     x: row.control-x; y: (parent.height - 30px) / 2;
@@ -750,6 +777,8 @@ impl SettingsPage {
             "triggerButton" | "auto.triggerButton" => {
                 &[("Right", "right"), ("M4", "m4"), ("M5", "m5")]
             }
+            "modelBackend" => MODEL_BACKENDS,
+            "computeTarget" => &[("CPU", "cpu"), ("GPU", "gpu"), ("NPU", "npu")],
             _ => &[],
         };
         let mut row = field(key, label, kind);
@@ -813,7 +842,7 @@ impl SettingsPage {
     }
 }
 
-fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
+fn settings_page(settings: &serde_json::Value, model_path: &str) -> Vec<SettingsPageLayout> {
     let mut page = SettingsPage::default();
     page.section("Profiles");
     let profiles = settings
@@ -847,8 +876,34 @@ fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
     page.row(actions);
 
     page.section("Detection");
-    page.row(field("engine", "Engine", "engine"));
-    page.setting(settings, "pixelColor", "Target color", "choice", "");
+    let mut engine = field("engine", "Engine", "engine");
+    engine.value = setting_text(settings, "strategy").into();
+    page.row(engine);
+    if engine_is_object_detection(settings) {
+        let mut import = field("model.path", "Model file", "model-import");
+        import.value = model_path.into();
+        import.key2 = "model.import".into();
+        page.row(import);
+        let mut active = field("model.active", "Active model", "info");
+        active.value = settings
+            .get("activeModelId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("None")
+            .into();
+        page.row(active);
+        page.setting(settings, "modelConfidence", "Min confidence", "number", "");
+        page.setting(settings, "modelBackend", "Runtime", "choice", "");
+        // Only OpenVINO picks its device; the GPU runtimes imply theirs.
+        if settings
+            .get("modelBackend")
+            .and_then(serde_json::Value::as_str)
+            == Some("openvino")
+        {
+            page.setting(settings, "computeTarget", "Device", "choice", "");
+        }
+    } else {
+        page.setting(settings, "pixelColor", "Target color", "choice", "");
+    }
     page.setting(settings, "fovDegrees", "FOV", "number", "°");
     page.setting(settings, "colorFilter", "Color filter", "toggle", "");
     page.setting(
@@ -940,6 +995,31 @@ fn settings_page(settings: &serde_json::Value) -> Vec<SettingsPageLayout> {
     page.layout()
 }
 
+/// Object Detection runtimes: ONNX Runtime on CPU or a GPU execution
+/// provider, and OpenVINO (CPU/GPU/NPU).
+#[cfg(not(target_os = "macos"))]
+const MODEL_BACKENDS: &[(&str, &str)] = &[
+    ("CPU", "onnxruntime"),
+    ("DirectML", "directml"),
+    ("CUDA", "cuda"),
+    ("TensorRT", "tensorrt"),
+    ("OpenVINO", "openvino"),
+];
+#[cfg(target_os = "macos")]
+const MODEL_BACKENDS: &[(&str, &str)] = &[
+    ("CPU", "onnxruntime"),
+    ("CoreML", "coreml"),
+    ("OpenVINO", "openvino"),
+];
+#[cfg(not(target_os = "macos"))]
+const MODEL_BACKEND_VALUES: [&str; 5] = ["onnxruntime", "directml", "cuda", "tensorrt", "openvino"];
+#[cfg(target_os = "macos")]
+const MODEL_BACKEND_VALUES: [&str; 3] = ["onnxruntime", "coreml", "openvino"];
+
+fn engine_is_object_detection(settings: &serde_json::Value) -> bool {
+    settings.get("strategy").and_then(serde_json::Value::as_str) == Some("object_detection")
+}
+
 fn profile_name_of(settings: &serde_json::Value) -> String {
     settings
         .get("profiles")
@@ -958,7 +1038,7 @@ fn profile_name_of(settings: &serde_json::Value) -> String {
 
 #[cfg(test)]
 fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
-    settings_page(settings)
+    settings_page(settings, "")
         .into_iter()
         .flat_map(|page| page.fields)
         .collect()
@@ -967,7 +1047,8 @@ fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
 /// Shows `settings` in the window: the rail, the current page's rows and
 /// the profile being edited.
 fn show_settings(app: &SettingsWindow, settings: &serde_json::Value) {
-    let mut pages = settings_page(settings);
+    let model_path = MODEL_PATH.with(|path| path.borrow().clone());
+    let mut pages = settings_page(settings, &model_path);
     let current = usize::try_from(app.get_current_page())
         .unwrap_or(0)
         .min(pages.len().saturating_sub(1));
@@ -986,9 +1067,15 @@ fn show_settings(app: &SettingsWindow, settings: &serde_json::Value) {
     app.set_profile_name(profile_name_of(settings).into());
 }
 
+thread_local! {
+    /// Folder typed into Settings for the next model import; not a setting.
+    static MODEL_PATH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 /// Field labels for messages, instead of storage keys.
 fn setting_label(key: &str) -> &str {
     match key {
+        "modelConfidence" => "Min confidence",
         "fovDegrees" => "FOV",
         "cropResolution" => "Crop resolution",
         "motionSpeedX" => "Speed X",
@@ -1089,6 +1176,9 @@ fn activate_setting(settings: &mut serde_json::Value, key: &str) -> Result<(), S
         "pixelColor" => &["yellow", "red", "purple"],
         "scale" => &["Smooth", "Pixel perfect"],
         "triggerButton" | "auto.triggerButton" => &["right", "m4", "m5"],
+        "strategy" => &["pixel_seek", "object_detection"],
+        "modelBackend" => &MODEL_BACKEND_VALUES,
+        "computeTarget" => &["cpu", "gpu", "npu"],
         "colorFilter"
         | "motionEnabled"
         | "motionAlwaysOn"
@@ -1307,8 +1397,6 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
     app.set_has_target(layer.is_some());
 }
 
-static REFRESH_PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
-
 fn catch_refresh(run: impl FnOnce()) -> Option<String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
         .err()
@@ -1323,25 +1411,15 @@ fn catch_refresh(run: impl FnOnce()) -> Option<String> {
 }
 
 fn refresh_guarded(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
-    if let Some(message) = catch_refresh(|| refresh(app, view, last)) {
-        if !REFRESH_PANIC_REPORTED.swap(true, Ordering::AcqRel) {
-            crate::diagnostics::record(&format!(
-                "Native receiver UI recovered from refresh panic: {message}"
-            ));
-        }
-    }
+    // A panic in one refresh must not close the window; the next refresh
+    // draws again.
+    let _ = catch_refresh(|| refresh(app, view, last));
 }
 
-/// The ring marks the pixel being targeted; Object Detection keeps its
-/// smoothed point.
+/// The ring marks the point Motion aims at in both engines: the targeted
+/// pixel for Pixel Seek, the box center for Object Detection (user request).
 fn target_point(meta: &sysx_ui::protocol::LiveFrame) -> Option<[f32; 2]> {
-    if meta.mode == "object_detection" {
-        meta.detection
-            .smoothed_target_xy
-            .or(meta.detection.target_xy)
-    } else {
-        meta.detection.target_xy
-    }
+    meta.detection.target_xy
 }
 
 fn color_name(state: Option<&sysx_ui::protocol::BackendState>) -> &str {
@@ -1658,6 +1736,9 @@ pub fn run(
             let result = if key == "profile.rename" {
                 *profile_name.borrow_mut() = value.to_string();
                 Ok(())
+            } else if key == "model.path" {
+                MODEL_PATH.with(|path| *path.borrow_mut() = value.to_string());
+                Ok(())
             } else {
                 let result = draft
                     .borrow_mut()
@@ -1749,6 +1830,28 @@ pub fn run(
         let commands = commands.clone();
         let weak = settings_app.as_weak();
         move |key| {
+            if key == "model.import" {
+                let path = MODEL_PATH.with(|path| path.borrow().trim().to_owned());
+                let result = if path.is_empty() {
+                    Err("Enter the .onnx model file or its folder.".to_owned())
+                } else {
+                    commands
+                        .try_send(serde_json::json!({
+                            "version":1,"type":"import_model_bundle","path":path
+                        }))
+                        .map_err(|_| "Backend command queue is unavailable.".to_owned())
+                };
+                if let Some(app) = weak.upgrade() {
+                    set_status(
+                        &app,
+                        result
+                            .map(|_| "Importing model…".to_owned())
+                            .unwrap_or_else(|error| error)
+                            .into(),
+                    );
+                }
+                return;
+            }
             if key.starts_with("profile.") {
                 let result = if dirty.get() {
                     Err("Apply current settings before changing profiles.".to_owned())
@@ -1974,6 +2077,34 @@ pub fn run(
                             let _ = settings_commands_events.try_send(serde_json::json!({
                                 "version":1,"type":"get_app_settings"
                             }));
+                        } else if command_type == Some("import_model_bundle") {
+                            if let Some(app) = settings_weak_events.upgrade() {
+                                let id = value.get("active_model_id").cloned();
+                                let message = if event == Some("ack") {
+                                    if let (Some(settings), Some(id)) =
+                                        (settings_draft_events.borrow_mut().as_mut(), id)
+                                    {
+                                        settings["activeModelId"] = id;
+                                        // Object Detection crops to the model's input size.
+                                        if let Some(side) = value.get("input_width").cloned() {
+                                            settings["cropResolution"] = side;
+                                        }
+                                    }
+                                    settings_dirty_events.set(true);
+                                    sync_flags(&app, true, &invalid_settings_events.borrow());
+                                    if let Some(settings) = settings_draft_events.borrow().as_ref()
+                                    {
+                                        show_settings(&app, settings);
+                                    }
+                                    "Model imported. Apply Changes to use it."
+                                } else {
+                                    value
+                                        .get("message")
+                                        .and_then(|message| message.as_str())
+                                        .unwrap_or("Model import failed.")
+                                };
+                                set_status(&app, message.into());
+                            }
                         } else if event == Some("error")
                             && command_type.is_some_and(|kind| kind.ends_with("profile"))
                         {
@@ -1988,13 +2119,6 @@ pub fn run(
                                 );
                             }
                         } else if event == Some("error") {
-                            crate::diagnostics::record(&format!(
-                                "Native command failed: {}",
-                                value
-                                    .get("message")
-                                    .and_then(|message| message.as_str())
-                                    .unwrap_or("unknown error")
-                            ));
                         }
                     }
                     Ok(crate::native_app::HostEvent::Disconnected)
@@ -2040,12 +2164,10 @@ pub fn run(
             if signal.requested() {
                 if let Some(app) = weak.upgrade() {
                     if hidden.replace(false) {
-                        match Workers::start(port, token.clone(), Arc::clone(&view), notify.clone())
+                        if let Ok(next) =
+                            Workers::start(port, token.clone(), Arc::clone(&view), notify.clone())
                         {
-                            Ok(next) => *workers.borrow_mut() = Some(next),
-                            Err(error) => crate::diagnostics::record(&format!(
-                                "Native receiver reconnect failed: {error}"
-                            )),
+                            *workers.borrow_mut() = Some(next);
                         }
                     }
                     *lifecycle.borrow_mut() = None;
@@ -2129,10 +2251,39 @@ mod overlay_routing_tests {
     }
 
     #[test]
-    fn native_settings_marks_only_pixel_seek_as_available() {
-        let fields = super::settings_fields(&serde_json::json!({}));
+    fn object_detection_shows_model_controls_instead_of_target_color() {
+        let fields = super::settings_fields(&serde_json::json!({"strategy":"pixel_seek"}));
         let engine = fields.iter().find(|field| field.key == "engine").unwrap();
         assert_eq!(engine.kind, "engine");
+        assert_eq!(engine.value.as_str(), "pixel_seek");
+        assert!(fields.iter().any(|field| field.key == "pixelColor"));
+        assert!(!fields.iter().any(|field| field.key == "model.path"));
+        let fields = super::settings_fields(&serde_json::json!({
+            "strategy":"object_detection","activeModelId":"yolo",
+            "modelConfidence":"0.5","modelBackend":"onnxruntime","computeTarget":"cpu"
+        }));
+        let field = |key| fields.iter().find(|field| field.key == key);
+        assert!(field("pixelColor").is_none());
+        assert_eq!(field("model.path").unwrap().key2.as_str(), "model.import");
+        assert_eq!(field("model.active").unwrap().value.as_str(), "yolo");
+        assert_eq!(field("modelConfidence").unwrap().value.as_str(), "0.5");
+        assert_eq!(
+            field("modelBackend").unwrap().choices.row_count(),
+            super::MODEL_BACKENDS.len()
+        );
+        assert!(
+            field("computeTarget").is_none(),
+            "only OpenVINO picks a device"
+        );
+        let fields = super::settings_fields(&serde_json::json!({
+            "strategy":"object_detection","modelBackend":"openvino","computeTarget":"gpu"
+        }));
+        let device = fields
+            .iter()
+            .find(|field| field.key == "computeTarget")
+            .unwrap();
+        assert_eq!(device.choices.row_count(), 3);
+        let fields = super::settings_fields(&serde_json::json!({}));
         let sections = fields
             .iter()
             .filter(|field| field.kind == "section")
@@ -2184,10 +2335,13 @@ mod overlay_routing_tests {
 
     #[test]
     fn each_settings_section_is_its_own_page_laid_out_from_the_top() {
-        let pages = super::settings_page(&serde_json::json!({
-            "profiles":[{"name":"Default"}],"activeProfile":0,
-            "auto":{}
-        }));
+        let pages = super::settings_page(
+            &serde_json::json!({
+                "profiles":[{"name":"Default"}],"activeProfile":0,
+                "auto":{}
+            }),
+            "",
+        );
         assert_eq!(pages.len(), 6);
         for page in &pages {
             let (heading, rows) = page.fields.split_first().unwrap();
@@ -2279,6 +2433,9 @@ mod overlay_routing_tests {
         );
         meta.mode = "object_detection".into();
         assert!(super::overlay_svg(&meta, rect, 640., "red").contains("<rect"));
+        // Object Detection rings the same Motion target, not the smoothed point.
+        let layer = super::target_layer(&meta, rect, "red").unwrap();
+        assert!(layer.svg.contains("cx=\"480\" cy=\"280\""), "{}", layer.svg);
     }
 }
 
@@ -2422,6 +2579,30 @@ mod render_tests {
                     .save(std::path::Path::new(&dir).join(format!("settings-page-{page}.png")))
                     .unwrap();
             }
+        }
+        // Detection page with the Object Detection model and runtime rows.
+        let mut json = settings_json.clone();
+        json["strategy"] = "object_detection".into();
+        json["activeModelId"] = "v11_256".into();
+        json["modelConfidence"] = "0.5".into();
+        json["modelBackend"] = "openvino".into();
+        json["computeTarget"] = "gpu".into();
+        settings.set_current_page(1);
+        show_settings(&settings, &json);
+        let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
+        window.request_redraw();
+        window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, 760);
+        });
+        if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
+            let raw = pixels
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b])
+                .collect::<Vec<_>>();
+            image::RgbImage::from_raw(760, 720, raw)
+                .unwrap()
+                .save(std::path::Path::new(&dir).join("settings-object-detection.png"))
+                .unwrap();
         }
         settings.hide().unwrap();
     }

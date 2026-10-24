@@ -1,10 +1,9 @@
-//! Native SysX host: embedded backend, Medius I/O, movement and a Slint monitor.
+﻿//! Native SysX host: embedded backend, Medius I/O, movement and a Slint monitor.
 //! Settings and Preview run in the native Slint application.
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -31,7 +30,6 @@ pub(crate) enum HostEvent {
 
 struct BackendRuntime {
     child: Arc<Mutex<Child>>,
-    shutdown_requested: Arc<AtomicBool>,
     runtime_dir: Option<PathBuf>,
 }
 
@@ -69,8 +67,6 @@ impl DeviceStatus {
 
 impl Drop for BackendRuntime {
     fn drop(&mut self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        crate::diagnostics::record("requesting backend shutdown because the host is exiting");
         // Child::kill uses the owned OS process handle on Windows, avoiding a
         // PATH lookup and the possibility of targeting a recycled PID.
         let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
@@ -94,16 +90,12 @@ impl Drop for BackendRuntime {
 /// the supervisor should start it again.
 pub fn run() -> bool {
     let Some(_instance) = crate::single_instance::acquire() else {
-        crate::diagnostics::record(
-            "shutdown reason: another SysX instance already owns the receiver",
-        );
         // Another SysX owns the backend and UDP port: show its monitor, exit.
         if !crate::single_instance::focus_monitor_window() {
             crate::single_instance::request_monitor();
         }
         return false;
     };
-    crate::diagnostics::begin_session();
     let movement_state = Arc::new(crate::movement::MovementState::default());
     let auto_target = Arc::new(Mutex::new(AutoTargetEvent::default()));
     let device_state = Arc::new(Mutex::new(DeviceStatus::missing()));
@@ -112,22 +104,19 @@ pub fn run() -> bool {
         match start_backend(Arc::clone(&movement_state), Arc::clone(&auto_target)) {
             Ok(value) => value,
             Err(error) => {
-                crate::diagnostics::record(&format!("SysX could not start: {error}"));
                 eprintln!("SysX could not start: {error}");
                 return true;
             }
         };
-    if let Err(error) = start_device_monitor(
+    if start_device_monitor(
         Arc::clone(&movement_state),
         Arc::clone(&auto_target),
         Arc::clone(&device_state),
         Arc::clone(&capture),
-    ) {
-        set_device_status_with_reason(
-            &device_state,
-            DeviceStatus::error(),
-            Some(&format!("could not start Medius discovery thread: {error}")),
-        );
+    )
+    .is_err()
+    {
+        set_device_status(&device_state, DeviceStatus::error());
     }
     #[cfg(target_os = "macos")]
     terminate::hold(runtime);
@@ -146,24 +135,6 @@ pub fn run() -> bool {
         crate::monitor_window::run(port, token, event_rx, command_tx)
     }));
     let restart = !matches!(monitor_result, Ok(Ok(())));
-    match monitor_result {
-        Ok(Ok(())) => crate::diagnostics::record(
-            "shutdown reason: native receiver closed normally after its client lifecycle ended",
-        ),
-        Ok(Err(error)) => crate::diagnostics::record(&format!(
-            "shutdown reason: native receiver returned an error: {error}"
-        )),
-        Err(panic) => {
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            crate::diagnostics::record(&format!(
-                "shutdown reason: native receiver recovered from UI panic: {message}"
-            ));
-        }
-    }
     #[cfg(target_os = "macos")]
     drop(terminate::release());
     #[cfg(not(target_os = "macos"))]
@@ -189,7 +160,6 @@ mod terminate {
         let _ = std::panic::catch_unwind(|| {
             if let Some(runtime) = release() {
                 drop(runtime);
-                crate::diagnostics::finish_session("macOS terminated the application (Quit)");
             }
         });
     }
@@ -269,21 +239,7 @@ fn start_backend(
         .env("RECEIVER_IPC_TOKEN", &token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    if let Some(path) = crate::diagnostics::log_path() {
-        command.env("SYSX_PARENT_LOG", path);
-    }
-    if let Some(path) = crate::diagnostics::backend_stderr_path() {
-        command.env("SYSX_PARENT_BACKEND_STDERR", path);
-    }
-    match crate::diagnostics::backend_stderr() {
-        Ok(file) => {
-            command.stderr(file);
-        }
-        Err(error) => {
-            crate::diagnostics::record(&format!("could not capture backend stderr: {error}"))
-        }
-    }
+        .stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -299,13 +255,8 @@ fn start_backend(
     // Any subsequent startup error now runs the ordinary owned-child cleanup.
     let runtime = BackendRuntime {
         child: Arc::new(Mutex::new(child)),
-        shutdown_requested: Arc::new(AtomicBool::new(false)),
         runtime_dir,
     };
-    monitor_backend_exit(
-        Arc::clone(&runtime.child),
-        Arc::clone(&runtime.shutdown_requested),
-    );
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::Builder::new()
         .name("sysx-backend-status".into())
@@ -339,41 +290,6 @@ fn start_backend(
         .recv_timeout(Duration::from_secs(12))
         .map_err(|_| "Backend did not become ready within 12 seconds".to_string())?;
     Ok((runtime, port, token))
-}
-
-fn monitor_backend_exit(child: Arc<Mutex<Child>>, shutdown_requested: Arc<AtomicBool>) {
-    let result = thread::Builder::new()
-        .name("sysx-backend-watch".into())
-        .spawn(move || loop {
-            if shutdown_requested.load(Ordering::Acquire) {
-                return;
-            }
-            let result = child
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .try_wait();
-            match result {
-                Ok(Some(status)) => {
-                    if !shutdown_requested.load(Ordering::Acquire) {
-                        crate::diagnostics::record(&format!(
-                            "backend exited unexpectedly: status={status}, code={:?}; inspect backend-*.log and backend-stderr-*.log for details",
-                            status.code()
-                        ));
-                    }
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(250)),
-                Err(error) => {
-                    crate::diagnostics::record(&format!(
-                        "could not monitor backend process exit: {error}"
-                    ));
-                    return;
-                }
-            }
-        });
-    if let Err(error) = result {
-        crate::diagnostics::record(&format!("could not start backend exit monitor: {error}"));
-    }
 }
 
 /// Backend connection with `role=host`: no preview frames, pushes device
@@ -463,21 +379,11 @@ fn start_host_client(
                     }
                 }
             }));
-            if let Err(panic) = result {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                crate::diagnostics::record(&format!(
-                    "host WebSocket worker recovered from panic: {message}"
-                ));
-            }
+            let _ = result;
             lock_recover(&capture).configure(None);
             let _ = events.send(HostEvent::Disconnected);
         });
-    if let Err(error) = spawn {
-        crate::diagnostics::record(&format!("could not start host WebSocket worker: {error}"));
+    if spawn.is_err() {
         lock_recover(&failure_capture).configure(None);
         let _ = failure_events.send(HostEvent::Disconnected);
     }
@@ -514,28 +420,7 @@ fn recoil_settings_from_message(
 }
 
 fn set_device_status(state: &Arc<Mutex<DeviceStatus>>, status: DeviceStatus) {
-    set_device_status_with_reason(state, status, None);
-}
-
-fn set_device_status_with_reason(
-    state: &Arc<Mutex<DeviceStatus>>,
-    status: DeviceStatus,
-    reason: Option<&str>,
-) {
-    let mut current = state.lock().unwrap_or_else(|error| error.into_inner());
-    let changed = current.state != status.state || current.name != status.name;
-    *current = status.clone();
-    drop(current);
-    if changed {
-        crate::diagnostics::record(&format!(
-            "Medius mouse status: {:?}, name={}{}",
-            status.state,
-            status.name.as_deref().unwrap_or("none"),
-            reason
-                .map(|reason| format!(", reason={reason}"))
-                .unwrap_or_default()
-        ));
-    }
+    *state.lock().unwrap_or_else(|error| error.into_inner()) = status;
 }
 
 fn auto_trigger_held(input: &AutoTargetEvent, held: impl FnOnce(u16) -> bool) -> bool {
@@ -554,15 +439,8 @@ fn start_device_monitor(
             let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 inspect_devices(&movement_state, &auto_target, &device_state, &capture)
             }))
-            .unwrap_or_else(|panic| {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                let reason = format!("Medius discovery recovered from panic: {message}");
-                crate::diagnostics::record(&reason);
-                set_device_status_with_reason(&device_state, DeviceStatus::error(), Some(&reason));
+            .unwrap_or_else(|_| {
+                set_device_status(&device_state, DeviceStatus::error());
                 true
             });
             if retry {
@@ -613,24 +491,18 @@ fn inspect_devices(
     device_state: &Arc<Mutex<DeviceStatus>>,
     capture: &Arc<Mutex<crate::mouse_capture::Bridge>>,
 ) -> bool {
-    static NO_PORT_LOGGED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
     // Scan errors must remain distinguishable from an empty port list.
     let ports = match find_medius_ports() {
         Ok(ports) => ports,
-        Err(error) => {
-            set_device_status_with_reason(device_state, DeviceStatus::error(), Some(&error));
+        Err(_) => {
+            set_device_status(device_state, DeviceStatus::error());
             return true;
         }
     };
     if ports.is_empty() {
-        if !NO_PORT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::diagnostics::record("Medius scan found no CH343 control ports");
-        }
         set_device_status(device_state, DeviceStatus::missing());
         return false;
     }
-    NO_PORT_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let mut failures = Vec::new();
     for port in ports {
@@ -644,11 +516,7 @@ fn inspect_devices(
             Err(error) => failures.push(format!("{}: open failed: {error}", port.path)),
         }
     }
-    set_device_status_with_reason(
-        device_state,
-        DeviceStatus::error(),
-        Some(&failures.join("; ")),
-    );
+    set_device_status(device_state, DeviceStatus::error());
     true
 }
 
@@ -720,11 +588,8 @@ fn monitor_medius(
     // Moves run on the queue's writer thread through a clone of the device handle
     // (the crate shares one link), so a slow move never delays button events.
     // Capture owns a different SDK queue and never reads/writes from this movement loop.
-    let _capture_worker = crate::mouse_capture::Worker::start(device.clone(), Arc::clone(capture))
-        .map_err(|error| {
-            crate::diagnostics::record(&format!("Physical capture worker failed: {error}"))
-        })
-        .ok();
+    let _capture_worker =
+        crate::mouse_capture::Worker::start(device.clone(), Arc::clone(capture)).ok();
     let move_device = device.clone();
     let writer = crate::serial_queue::ThreadedSerialWriter::spawn(move |bytes, _| {
         crate::medius_device::dispatch(&move_device, bytes)
@@ -815,7 +680,6 @@ fn monitor_medius(
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {
-                    crate::diagnostics::record("auto: left click sent");
                     move_completion = Some(completion);
                     serial.pump();
                     continue;
@@ -868,8 +732,8 @@ fn monitor_medius(
             }
         }
     }
-    if let Some(error) = movement_error {
-        set_device_status_with_reason(device_state, DeviceStatus::error(), Some(&error));
+    if movement_error.is_some() {
+        set_device_status(device_state, DeviceStatus::error());
     } else {
         set_device_status(device_state, DeviceStatus::missing());
     }
@@ -920,6 +784,11 @@ fn prepare_runtime(_data_dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
             "receiver-backend"
         });
         fs::write(&executable, EMBEDDED_BACKEND).map_err(|error| error.to_string())?;
+        // DirectML.dll and other ONNX Runtime libraries load from beside the
+        // backend; Windows' own older DirectML.dll cannot create the device.
+        for (name, bytes) in EMBEDDED_LIBRARIES {
+            fs::write(runtime_dir.join(name), bytes).map_err(|error| error.to_string())?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -5,13 +5,16 @@ description = "SysX native host: backend, device I/O and receiver window launche
 authors = ["Receiver"]
 edition = "2021"
 
+[profile.dev]
+debug = 0
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "unwind"
-strip = "none"
-debug = 2
+strip = "symbols"
+debug = 0
 debug-assertions = false
 incremental = false
 

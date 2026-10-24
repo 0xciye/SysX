@@ -25,20 +25,14 @@ pub fn request_fine_timer() {
             StateMask: 0,
         };
         // SAFETY: plain Win32 calls with a valid, correctly sized struct.
-        let (opted_out, period) = unsafe {
-            let opted_out = SetProcessInformation(
+        unsafe {
+            SetProcessInformation(
                 GetCurrentProcess(),
                 ProcessPowerThrottling,
                 (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
                 std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
             );
-            (opted_out, timeBeginPeriod(1))
-        };
-        if opted_out == 0 || period != 0 {
-            crate::diagnostics::record(&format!(
-                "1 ms timer resolution not fully granted (throttling opt-out={}, timeBeginPeriod={period})",
-                opted_out != 0
-            ));
+            timeBeginPeriod(1);
         }
     }
     #[cfg(target_os = "macos")]
@@ -79,7 +73,6 @@ mod mac {
             let process_info = objc_getClass(c"NSProcessInfo".as_ptr());
             let string = objc_getClass(c"NSString".as_ptr());
             if process_info.is_null() || string.is_null() {
-                crate::diagnostics::record("NSProcessInfo is unavailable; App Nap stays on");
                 return;
             }
             let info = send0(process_info, sel_registerName(c"processInfo".as_ptr()));
@@ -95,7 +88,6 @@ mod mac {
                 reason,
             );
             if activity.is_null() {
-                crate::diagnostics::record("macOS refused the latency-critical activity");
                 return;
             }
             // Keep the activity (and so the assertion) for the process life;

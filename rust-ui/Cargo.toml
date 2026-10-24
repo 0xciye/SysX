@@ -3,6 +3,9 @@ name = "sysx-ui"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+debug = 0
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

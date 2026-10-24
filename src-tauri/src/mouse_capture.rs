@@ -123,10 +123,7 @@ impl Worker {
                                 medius::CatchFilter::watch_axis(medius::Axis::Y),
                             ]) {
                                 Ok(events) => stream = Some(events),
-                                Err(error) => {
-                                    crate::diagnostics::record(&format!(
-                                        "Physical profile subscription failed: {error}"
-                                    ));
+                                Err(_) => {
                                     if let Ok(mut state) = bridge.lock() {
                                         state.progress(&request.id, 0, "sdk_error");
                                     }

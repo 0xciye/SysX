@@ -1,8 +1,0 @@
-# Windows linker mitigations. Control Flow Guard is off: its violations end
-# the process by fast-fail, which leaves no crash dump.
-[target.x86_64-pc-windows-msvc]
-rustflags = [
-  "-C", "link-arg=/DYNAMICBASE",
-  "-C", "link-arg=/HIGHENTROPYVA",
-  "-C", "link-arg=/NXCOMPAT",
-]

@@ -370,11 +370,7 @@ fn processing_loop(
                         callback(&processed)
                     }))
                     .is_err()
-                    {
-                        crate::diagnostics::record(
-                            "frame callback panicked; processing worker recovered",
-                        );
-                    }
+                    {}
                 }
             }
             Err(error) => {
@@ -414,7 +410,6 @@ fn processing_supervisor(
             }
             state.stats.last_error = Some(message.clone());
         }
-        crate::diagnostics::record(&message);
         thread::sleep(Duration::from_millis(50));
     }
 }

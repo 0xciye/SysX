@@ -5,14 +5,13 @@ pub mod cli;
 pub mod config;
 pub mod crop;
 pub mod decode_pool;
-#[path = "../../native-shared/diagnostics.rs"]
-pub mod diagnostics;
 pub mod inference;
 #[path = "../../native-shared/jpeg.rs"]
 pub mod jpeg;
 #[path = "../../native-shared/motion_capture.rs"]
 pub mod motion_capture;
 pub mod movement;
+pub mod onnx_info;
 pub mod pipeline;
 pub mod pixel_seek;
 pub mod receiver;

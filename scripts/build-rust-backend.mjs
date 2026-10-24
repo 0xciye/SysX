@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, chmodSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, chmodSync, copyFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,12 +29,21 @@ const args = [
   target,
 ];
 if (profile === "release") args.push("--release");
+const features = [];
 if (
   (process.env.TENSORRT_PATH || process.env.TENSORRT_INCLUDE_DIR)
   && process.env.CUDA_PATH
 ) {
-  args.push("--features", "tensorrt-shim");
+  features.push("tensorrt-shim");
 }
+// Object Detection GPU execution providers. DirectML runs on any DirectX 12
+// GPU (AMD, Intel, NVIDIA); CoreML on macOS. CUDA and TensorRT through ONNX
+// Runtime are opt-in: their provider DLLs are several hundred MB and need the
+// NVIDIA CUDA/cuDNN/TensorRT runtimes on the user's machine.
+if (target.includes("windows")) features.push("directml");
+if (target.includes("apple")) features.push("coreml");
+if (process.env.SYSX_ORT_CUDA === "1") features.push("cuda", "ort-tensorrt");
+if (features.length > 0) args.push("--features", features.join(","));
 
 const build = spawnSync(cargo, args, { cwd: root, stdio: "inherit" });
 if (build.error) throw build.error;
@@ -47,6 +56,16 @@ const sidecar = path.join(sidecarDir, `receiver-backend-${target}${binaryExtensi
 if (!existsSync(binary)) throw new Error(`Rust backend build did not produce ${binary}`);
 mkdirSync(sidecarDir, { recursive: true });
 copyFileSync(binary, sidecar);
+// ONNX Runtime libraries the build copied next to the backend (DirectML.dll,
+// provider DLLs) travel with it: build.rs embeds them and SysX extracts them
+// beside the backend at launch.
+const libraryPattern = /\.(dll|dylib|so)$/i;
+for (const name of readdirSync(sidecarDir)) {
+  if (libraryPattern.test(name)) rmSync(path.join(sidecarDir, name));
+}
+for (const name of readdirSync(path.dirname(binary))) {
+  if (libraryPattern.test(name)) copyFileSync(path.join(path.dirname(binary), name), path.join(sidecarDir, name));
+}
 if (binaryExtension === "") chmodSync(sidecar, 0o755);
 if (binaryExtension === "") {
   const debugSidecar = path.join(sidecarDir, "receiver-backend");

@@ -27,6 +27,16 @@ pub struct PriorTarget {
 pub const FOV_REFERENCE_PX: f32 = 640.0;
 
 /// FOV circle radius in image pixels, limited to the image.
+/// Center of an `[left, top, right, bottom]` box, in the box's own coordinate
+/// space (original-frame pixels for model detections).
+pub fn bbox_center(bbox_xyxy: [f32; 4]) -> FrameCoordinate {
+    let [left, top, right, bottom] = bbox_xyxy;
+    FrameCoordinate {
+        x: (left + right) * 0.5,
+        y: (top + bottom) * 0.5,
+    }
+}
+
 pub fn fov_radius_px(width: u32, height: u32, degrees: u16) -> f32 {
     let limit = (width.min(height) as f32 - 1.0).max(0.0) / 2.0;
     ((FOV_REFERENCE_PX - 1.0) * f32::from(degrees) / 720.0).min(limit)
@@ -144,12 +154,8 @@ pub fn object_detection_candidates(
             if object.confidence.is_none_or(|score| score < minimum_score) {
                 return None;
             }
-            let [left, top, right, bottom] = object.bbox_xyxy;
             Some(TargetCandidate {
-                coordinate: FrameCoordinate {
-                    x: (left + right) * 0.5,
-                    y: (top + bottom) * 0.5,
-                },
+                coordinate: bbox_center(object.bbox_xyxy),
                 bbox_xyxy: object.bbox_xyxy,
                 class_id: Some(object.class_id),
                 score: object.confidence,
@@ -193,9 +199,20 @@ pub fn object_detection_target(
         })
         .cloned()
         .collect();
+    // Class priority (user request): rank 0 is the highest, so only the lowest
+    // class id in the FOV is targeted; nearest-box and prior-box lock then
+    // choose within that class.
+    let top_class = eligible
+        .iter()
+        .filter_map(|candidate| candidate.class_id)
+        .min()?;
+    let eligible: Vec<_> = eligible
+        .into_iter()
+        .filter(|candidate| candidate.class_id == Some(top_class))
+        .collect();
     let distance = |candidate: &TargetCandidate| {
-        let [l, t, r, b] = candidate.bbox_xyxy;
-        ((l + r) * 0.5 - crop_x as f32 - cx).powi(2) + ((t + b) * 0.5 - crop_y as f32 - cy).powi(2)
+        let center = bbox_center(candidate.bbox_xyxy);
+        (center.x - crop_x as f32 - cx).powi(2) + (center.y - crop_y as f32 - cy).powi(2)
     };
     let mut selected = eligible
         .iter()
@@ -222,19 +239,9 @@ pub fn object_detection_target(
             }
         }
     }
-    let [left, top, right, bottom] = selected.bbox_xyxy;
-    let anchor = FrameCoordinate {
-        x: (left + right) * 0.5,
-        y: top
-            + (bottom - top)
-                * if selected.class_id == Some(0) {
-                    0.5
-                } else {
-                    0.05
-                },
-    };
+    // Motion aims at the exact box center for every class (user request).
     Some(TargetCandidate {
-        coordinate: anchor,
+        coordinate: bbox_center(selected.bbox_xyxy),
         ..selected
     })
 }
@@ -383,10 +390,7 @@ mod tests {
 
     fn candidate(class_id: u32, bbox_xyxy: [f32; 4]) -> TargetCandidate {
         TargetCandidate {
-            coordinate: FrameCoordinate {
-                x: (bbox_xyxy[0] + bbox_xyxy[2]) * 0.5,
-                y: (bbox_xyxy[1] + bbox_xyxy[3]) * 0.5,
-            },
+            coordinate: bbox_center(bbox_xyxy),
             bbox_xyxy,
             class_id: Some(class_id),
             score: Some(0.9),
@@ -394,23 +398,138 @@ mod tests {
     }
 
     #[test]
-    fn object_detection_uses_nearest_fov_box_and_class_anchor() {
+    fn bbox_center_is_the_midpoint_of_both_axes() {
+        assert_eq!(
+            bbox_center([10.0, 20.0, 30.0, 60.0]),
+            FrameCoordinate { x: 20.0, y: 40.0 }
+        );
+        assert_eq!(
+            bbox_center([5.0, 5.0, 6.0, 8.0]),
+            FrameCoordinate { x: 5.5, y: 6.5 }
+        );
+        assert_eq!(
+            bbox_center([7.0, 7.0, 7.0, 7.0]),
+            FrameCoordinate { x: 7.0, y: 7.0 }
+        );
+    }
+
+    #[test]
+    fn object_detection_candidates_use_the_box_center() {
+        let result = DetectionResult {
+            frame_id: 1,
+            timestamp_ns: 0,
+            mode: DetectionMode::ObjectDetection,
+            model_id: None,
+            source_width: 100,
+            source_height: 100,
+            processed_width: 100,
+            processed_height: 100,
+            objects: vec![crate::results::DetectionObject {
+                class_id: 3,
+                class_name: "3".into(),
+                bbox_xyxy: [40.0, 10.0, 60.0, 50.0],
+                confidence: Some(0.8),
+                pixel_count: None,
+            }],
+            preprocess_ms: 0.0,
+            detection_ms: 0.0,
+            postprocess_ms: 0.0,
+            total_processing_ms: 0.0,
+            inference_device: None,
+            target_xy: None,
+            smoothed_target_xy: None,
+            auto_target_valid: false,
+            auto_active: false,
+            fov_degrees: 0,
+        };
+
+        let candidates = object_detection_candidates(&result, 0.5);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].coordinate,
+            FrameCoordinate { x: 50.0, y: 30.0 }
+        );
+        assert_eq!(candidates[0].class_id, Some(3));
+    }
+
+    #[test]
+    fn object_detection_aims_at_the_box_center_of_the_nearest_fov_box() {
         let candidates = [
             candidate(1, [45.0, 40.0, 55.0, 60.0]),
-            candidate(0, [72.0, 45.0, 82.0, 55.0]),
+            candidate(1, [72.0, 45.0, 82.0, 55.0]),
         ];
 
         let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
             .expect("center box is in the FOV");
 
-        assert_eq!(selected.class_id, Some(1));
-        assert_eq!(selected.coordinate, FrameCoordinate { x: 50.0, y: 41.0 });
+        assert_eq!(selected.bbox_xyxy, [45.0, 40.0, 55.0, 60.0]);
+        assert_eq!(selected.coordinate, FrameCoordinate { x: 50.0, y: 50.0 });
     }
 
     #[test]
-    fn object_detection_keeps_a_fresh_overlapping_prior_class() {
+    fn object_detection_prefers_rank_zero_over_a_nearer_box() {
         let candidates = [
-            candidate(1, [55.0, 45.0, 65.0, 55.0]),
+            candidate(7, [45.0, 45.0, 55.0, 55.0]),
+            candidate(0, [70.0, 20.0, 80.0, 40.0]),
+            candidate(3, [48.0, 30.0, 52.0, 40.0]),
+        ];
+
+        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
+            .expect("all boxes are in the FOV");
+
+        assert_eq!(selected.class_id, Some(0));
+        assert_eq!(selected.coordinate, FrameCoordinate { x: 75.0, y: 30.0 });
+    }
+
+    #[test]
+    fn object_detection_prefers_the_lower_rank_when_rank_zero_is_absent() {
+        let candidates = [
+            candidate(5, [45.0, 45.0, 55.0, 55.0]),
+            candidate(2, [70.0, 45.0, 80.0, 55.0]),
+        ];
+
+        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
+            .expect("both boxes are in the FOV");
+
+        assert_eq!(selected.class_id, Some(2));
+    }
+
+    #[test]
+    fn object_detection_ignores_a_better_rank_outside_the_fov() {
+        let candidates = [
+            candidate(2, [45.0, 45.0, 55.0, 55.0]),
+            candidate(0, [0.0, 0.0, 6.0, 6.0]),
+        ];
+
+        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 36, None, false)
+            .expect("the class 2 box is in the FOV");
+
+        assert_eq!(selected.class_id, Some(2));
+    }
+
+    #[test]
+    fn object_detection_switches_to_a_better_rank_despite_the_prior_lock() {
+        let candidates = [
+            candidate(4, [45.0, 45.0, 55.0, 55.0]),
+            candidate(1, [65.0, 45.0, 75.0, 55.0]),
+        ];
+        let previous = PriorTarget {
+            bbox_xyxy: Some([45.0, 45.0, 55.0, 55.0]),
+            class_id: Some(4),
+        };
+
+        let selected =
+            object_detection_target(&candidates, 100, 100, 0, 0, 360, Some(&previous), true)
+                .expect("both boxes are in the FOV");
+
+        assert_eq!(selected.class_id, Some(1));
+    }
+
+    #[test]
+    fn object_detection_keeps_a_fresh_overlapping_prior_box_within_its_class() {
+        let candidates = [
+            candidate(0, [55.0, 45.0, 65.0, 55.0]),
             candidate(0, [60.0, 45.0, 70.0, 55.0]),
         ];
         let previous = PriorTarget {
@@ -422,7 +541,7 @@ mod tests {
             object_detection_target(&candidates, 100, 100, 0, 0, 360, Some(&previous), true)
                 .expect("both boxes are in the FOV");
 
-        assert_eq!(selected.class_id, Some(0));
+        assert_eq!(selected.bbox_xyxy, [60.0, 45.0, 70.0, 55.0]);
         assert_eq!(selected.coordinate, FrameCoordinate { x: 65.0, y: 50.0 });
     }
 

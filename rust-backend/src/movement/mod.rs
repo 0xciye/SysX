@@ -51,7 +51,7 @@ pub struct MovementController {
     sens: f64,
     last_frame_id: Option<u64>,
     motion: NormalMotion,
-    /// Last frame's error, for the diagnostics summary.
+    /// Last frame's error, for the dead-zone check.
     frame_error: (f64, f64),
 }
 
@@ -199,66 +199,6 @@ pub struct MovementTicker {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Held-trigger Motion summary for the diagnostics log, at most one line
-/// every two seconds.
-#[derive(Default)]
-struct MotionSummary {
-    started: Option<Instant>,
-    ticks: u32,
-    frames: u32,
-    last_frame: Option<u64>,
-    error_px: f64,
-    counts: i64,
-}
-
-impl MotionSummary {
-    const PERIOD: Duration = Duration::from_secs(2);
-
-    fn add(
-        &mut self,
-        controller: &MovementController,
-        frame_id: u64,
-        step: (i64, i64),
-    ) -> Option<String> {
-        let started = *self.started.get_or_insert_with(Instant::now);
-        self.ticks += 1;
-        if self.last_frame != Some(frame_id) {
-            self.last_frame = Some(frame_id);
-            self.frames += 1;
-            self.error_px += controller.frame_error.0.hypot(controller.frame_error.1);
-        }
-        self.counts += step.0.abs() + step.1.abs();
-        (started.elapsed() >= Self::PERIOD).then(|| self.take())
-    }
-
-    /// Trigger released: report what was gathered, if it is worth a line.
-    fn finish(&mut self) -> Option<String> {
-        let started = self.started?;
-        if started.elapsed() < Duration::from_millis(250) {
-            *self = Self::default();
-            return None;
-        }
-        Some(self.take())
-    }
-
-    fn take(&mut self) -> String {
-        let seconds = self
-            .started
-            .map_or(0.0, |at| at.elapsed().as_secs_f64())
-            .max(1e-3);
-        let line = format!(
-            "motion held {seconds:.1} s: {} frames ({:.0}/s), {} ticks, mean target error {:.1} px, {:.0} counts/s",
-            self.frames,
-            f64::from(self.frames) / seconds,
-            self.ticks,
-            self.error_px / f64::from(self.frames.max(1)),
-            self.counts as f64 / seconds,
-        );
-        *self = Self::default();
-        line
-    }
-}
-
 impl MovementTicker {
     pub fn new(
         initial_sens: f64,
@@ -280,7 +220,6 @@ impl MovementTicker {
                 let mut controller = MovementController::new(initial_sens);
                 let mut sens = initial_sens;
                 let mut sent_invalid = false;
-                let mut summary = MotionSummary::default();
                 loop {
                     let (sample, updated_at) = {
                         let (lock, wake) = &*worker_shared;
@@ -390,25 +329,12 @@ impl MovementTicker {
                             } else {
                                 rendered
                                     .filter(Some(profile), (dx, dy), Instant::now())
-                                    .unwrap_or_else(|status| {
-                                        crate::diagnostics::record(&format!(
-                                            "ABCurves renderer stopped: status {status}"
-                                        ));
-                                        (0, 0)
-                                    })
+                                    .unwrap_or((0, 0))
                             }
                         } else {
                             // Default Normal bypasses ABCurves completely.
                             (dx, dy)
                         };
-                        if output_active {
-                            if let Some(line) = summary.add(&controller, sample.frame_id, (dx, dy))
-                            {
-                                crate::diagnostics::record(&line);
-                            }
-                        } else if let Some(line) = summary.finish() {
-                            crate::diagnostics::record(&line);
-                        }
                         on_event(MovementEvent {
                             config_revision: runtime.config_revision,
                             event: "movement_target".into(),

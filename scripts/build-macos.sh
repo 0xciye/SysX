@@ -29,7 +29,7 @@ if [[ "${target}" == x86_64-apple-darwin ]]; then
 fi
 
 cargo build --manifest-path "${root}/rust-backend/Cargo.toml" \
-  --features ort/load-dynamic --bin receiver-backend --target "${target}" --release
+  --features ort/load-dynamic,coreml --bin receiver-backend --target "${target}" --release
 mkdir -p "$(dirname "${sidecar}")"
 cp "${backend}" "${sidecar}"
 chmod 755 "${sidecar}"

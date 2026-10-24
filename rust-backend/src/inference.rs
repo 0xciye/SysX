@@ -1,7 +1,7 @@
-//! Unavailable Object Detection adapters retained for development.
-//! ONNX Runtime, OpenVINO and TensorRT are not ready for use; Pixel Seek is
-//! the only currently available detection engine. Unit tests do not establish
-//! real-model or target-runtime readiness.
+//! Object Detection runtimes: ONNX Runtime on CPU or with the DirectML,
+//! CUDA, TensorRT or CoreML execution provider (each compiled in by its
+//! crate feature), OpenVINO, and the native TensorRT engine adapter. Unit
+//! tests do not establish real-model or target-runtime readiness.
 
 use crate::config::ModelDefinition;
 use crate::results::DetectionObject;
@@ -58,22 +58,19 @@ impl DetectionRuntime {
             )));
         }
         match backend {
-            "onnxruntime" => {
-                if compute != "cpu" {
-                    return Err(InferenceError::Runtime(
-                        "this ONNX Runtime build supports CPU compute only".into(),
-                    ));
-                }
-                OnnxRuntime::load(path).map(Self::Onnx)
+            "onnxruntime" | "directml" | "cuda" | "coreml" => {
+                OnnxRuntime::load(path, backend).map(Self::Onnx)
             }
-            "openvino" => OpenVinoRuntime::load(path, &model.artifacts.openvino_bin, compute)
-                .map(Self::OpenVino),
-            "tensorrt" => {
-                if compute != "gpu" {
-                    return Err(InferenceError::Runtime(
-                        "TensorRT requires the GPU compute target".into(),
-                    ));
-                }
+            "openvino" => {
+                // OpenVINO reads ONNX directly; its weights are then inside the file.
+                let weights = if model.artifacts.openvino_xml.is_empty() {
+                    ""
+                } else {
+                    model.artifacts.openvino_bin.as_str()
+                };
+                OpenVinoRuntime::load(path, weights, compute).map(Self::OpenVino)
+            }
+            "tensorrt" if !model.artifacts.tensorrt.is_empty() => {
                 #[cfg(feature = "tensorrt")]
                 {
                     TensorRtRuntime::load(path).map(Self::TensorRt)
@@ -81,10 +78,13 @@ impl DetectionRuntime {
                 #[cfg(not(feature = "tensorrt"))]
                 {
                     Err(InferenceError::Runtime(
-                        "SysX was built without the TensorRT adapter".into(),
+                        "SysX was built without the TensorRT engine adapter; remove the \
+                         .engine file to run the ONNX model through TensorRT"
+                            .into(),
                     ))
                 }
             }
+            "tensorrt" => OnnxRuntime::load(path, backend).map(Self::Onnx),
             _ => Err(InferenceError::Runtime(
                 "unsupported inference backend".into(),
             )),
@@ -126,21 +126,123 @@ fn rgb_chw(image: &RgbImage) -> Vec<f32> {
 
 pub(crate) struct OnnxRuntime {
     session: ort::session::Session,
+    device: &'static str,
+}
+
+#[allow(dead_code)]
+fn missing(
+    name: &str,
+    feature: &str,
+) -> Result<Option<(ort::ep::ExecutionProviderDispatch, &'static str)>, InferenceError> {
+    Err(InferenceError::Runtime(format!(
+        "SysX was built without the {name} execution provider (feature `{feature}`)"
+    )))
+}
+
+/// The execution provider for a `modelBackend` value, registered so that
+/// a provider that fails to start is an error instead of a silent fallback
+/// to CPU.
+fn execution_provider(
+    backend: &str,
+) -> Result<Option<(ort::ep::ExecutionProviderDispatch, &'static str)>, InferenceError> {
+    match backend {
+        "onnxruntime" => Ok(None),
+        "directml" => {
+            #[cfg(feature = "directml")]
+            {
+                Ok(Some((
+                    ort::ep::DirectML::default()
+                        .with_performance_preference(
+                            ort::ep::directml::PerformancePreference::HighPerformance,
+                        )
+                        .build()
+                        .error_on_failure(),
+                    "DirectML GPU",
+                )))
+            }
+            #[cfg(not(feature = "directml"))]
+            {
+                missing("DirectML", "directml")
+            }
+        }
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                Ok(Some((
+                    ort::ep::CUDA::default().build().error_on_failure(),
+                    "CUDA GPU",
+                )))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                missing("CUDA", "cuda")
+            }
+        }
+        "tensorrt" => {
+            #[cfg(feature = "ort-tensorrt")]
+            {
+                // Building an engine takes a while; keep it for the next launch.
+                let cache = std::env::var_os("LOCALAPPDATA")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("SysX")
+                    .join("tensorrt-cache");
+                let _ = std::fs::create_dir_all(&cache);
+                let cache = cache.to_string_lossy().into_owned();
+                Ok(Some((
+                    ort::ep::TensorRT::default()
+                        .with_fp16(true)
+                        .with_engine_cache(true)
+                        .with_engine_cache_path(&cache)
+                        .with_timing_cache(true)
+                        .with_timing_cache_path(&cache)
+                        .build()
+                        .error_on_failure(),
+                    "TensorRT GPU",
+                )))
+            }
+            #[cfg(not(feature = "ort-tensorrt"))]
+            {
+                missing("TensorRT", "ort-tensorrt")
+            }
+        }
+        "coreml" => {
+            #[cfg(feature = "coreml")]
+            {
+                Ok(Some((
+                    ort::ep::CoreML::default().build().error_on_failure(),
+                    "CoreML",
+                )))
+            }
+            #[cfg(not(feature = "coreml"))]
+            {
+                missing("CoreML", "coreml")
+            }
+        }
+        _ => Err(InferenceError::Runtime(
+            "unsupported inference backend".into(),
+        )),
+    }
 }
 
 impl OnnxRuntime {
-    fn load(path: &str) -> Result<Self, InferenceError> {
+    fn load(path: &str, backend: &str) -> Result<Self, InferenceError> {
         let environment = onnx_environment()?;
-        let session = ort::session::Session::builder(&environment)
-            .map_err(runtime_error)?
-            .commit_from_file(path)
-            .map_err(runtime_error)?;
+        let mut builder = ort::session::Session::builder(&environment).map_err(runtime_error)?;
+        let mut device = "CPU";
+        if let Some((provider, name)) = execution_provider(backend)? {
+            builder = builder
+                .with_execution_providers([provider])
+                .map_err(|error| InferenceError::Runtime(format!("{name}: {error}")))?;
+            device = name;
+        }
+        let session = builder.commit_from_file(path).map_err(runtime_error)?;
         if session.inputs().len() != 1 || session.outputs().is_empty() {
             return Err(InferenceError::Runtime(
                 "YOLO ONNX models must have one input and at least one output".into(),
             ));
         }
-        Ok(Self { session })
+        Ok(Self { session, device })
     }
 
     fn infer(
@@ -165,7 +267,7 @@ impl OnnxRuntime {
                 .map(|dimension| usize::try_from(*dimension).unwrap_or(0))
                 .collect(),
             values: tensor.1.to_vec(),
-            device: "CPU".into(),
+            device: self.device.into(),
             preprocess_ms: 0.0,
             inference_ms: 0.0,
         })

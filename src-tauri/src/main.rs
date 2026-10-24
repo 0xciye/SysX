@@ -4,8 +4,6 @@
 )]
 
 mod auto;
-#[path = "../../native-shared/diagnostics.rs"]
-mod diagnostics;
 #[path = "../../native-shared/jpeg.rs"]
 mod jpeg;
 mod medius_device;
@@ -27,22 +25,9 @@ fn main() -> std::process::ExitCode {
     if !supervisor::is_child() && supervisor::run() {
         return std::process::ExitCode::SUCCESS;
     }
-    if let Err(error) = diagnostics::install("host") {
-        eprintln!("SysX diagnostics unavailable: {error}");
-    }
     timer_resolution::request_fine_timer();
-    let restart = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(native_app::run)) {
-        Ok(restart) => {
-            diagnostics::finish_session("native application returned normally");
-            restart
-        }
-        Err(_) => {
-            diagnostics::finish_session(
-                "native host caught an unwinding panic; see the crash report for details",
-            );
-            true
-        }
-    };
+    let restart =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(native_app::run)).unwrap_or(true);
     std::process::ExitCode::from(if restart {
         supervisor::EXIT_RESTART
     } else {

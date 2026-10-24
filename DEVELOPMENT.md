@@ -83,7 +83,7 @@ The Rust sidecar receives the centered crop supplied by the OBS sender, runs Pix
 
 ### Target selection and mouse output
 
-- Rust `targeting.rs` and `pipeline.rs` preserve full-crop detection and FOV-gated Pixel Seek/Object Detection selection, including nearest box, prior-box overlap, and the existing class anchor rule. Preview retains detections outside FOV.
+- Rust `targeting.rs` and `pipeline.rs` preserve full-crop detection and FOV-gated Pixel Seek/Object Detection selection, including class-rank priority (class 0 first, then 1 … 7), nearest box within that class, prior-box overlap, and an exact box-center aim point for every class. Preview retains detections outside FOV.
 - Rust `movement.rs` stores the newest filtered crop target and runs a dedicated 4 ms ticker that recomputes deltas independently of detection cadence. `src-tauri/src/movement.rs` sums fresh pending deltas and applies the Motion held-trigger gate and 100 ms freshness limit. Recoil is gated by both a fresh valid Motion target and physical Left-button hold (not the configured Motion trigger), then applies the configured start delay and per-level duration; commands remain capped to ±32 per axis. Medius calls remain in Tauri's device monitors.
 - `src-tauri/src/serial_queue.rs` retains type-0 asynchronous command ownership. The Medius loop submits internal movement/click records; `ThreadedSerialWriter` invokes `medius_device.rs` on a cloned SDK handle without blocking physical-button telemetry. The loop only takes a new target when idle; fresh deltas keep summing in `MovementState`. Library I/O timeouts apply; the forwarded `request_ms` hint cannot cancel SDK calls or establish USB/game execution time. No raw-port writer remains.
 
@@ -93,7 +93,7 @@ Desktop development/release launchers build the Rust backend sidecar and native 
 
 The native host runs the vision sidecar and a Medius device monitor on separate processes/threads. Fresh-delta merging, trigger mapping and the ±32 per-axis clamp stay in `src-tauri/src/movement.rs`. The official `medius 3.4.6` Rust SDK owns mouse-box discovery, connection, health validation, physical input telemetry and transport. `medius_device.rs` dispatches internal queue records to `move_rel` or `press/release(Button::LEFT)` on a cloned SDK handle. Ferrum and MAKCU are removed; no raw serial fallback is supported. Windows/device behavior remains unvalidated.
 
-Release protection: native host/backend release profiles retain full PDB information with LTO and disabled debug assertions. The Windows MSVC target links with ASLR, high-entropy ASLR and NX/DEP. There is no debugger guard, runtime integrity watchdog or Control Flow Guard (removed 2026-10-18 at the user's request: each could end SysX mid-use without a crash dump). The packaging build fails when the backend sidecar is missing. The build emits the release EXE directly and the package script has no VMProtect gate.
+Release protection: none (user request, 2026-10-24). Release, dev and test profiles build without debug information (`debug = 0`; `rustc` 1.99.1 crashed with `STATUS_ACCESS_VIOLATION` on the user's machine when emitting it), no PDBs, error logs, crash reports or minidumps are produced, and no linker hardening flags are set. There is no debugger guard, runtime integrity watchdog or Control Flow Guard (removed 2026-10-18). The per-launch IPC token remains. The packaging build fails when the backend sidecar is missing. The build emits the release EXE directly and the package script has no VMProtect gate.
 
 The manual Windows GitHub Actions workflow builds the Rust sidecar, runs backend/UI/host test suites, emits one `SysX.exe` without an installer, and verifies UDP `4200` and 192×192 frame receipt. Its optional app lifecycle smoke runs only on the hosted runner. `scripts/build-windows.ps1` no longer requires Node or Trunk for the desktop build. The PowerShell build script explicitly checks each native command's `$LASTEXITCODE`; `$ErrorActionPreference` alone does not make every native nonzero exit terminating.
 
@@ -330,6 +330,7 @@ The OBS sender lives in `obs-plugin/sysx-canvas-sender` (C++ OBS module, compile
 158. [x] Automatic restart (2026-10-18, user request, Windows): the launched `SysX.exe` supervises a child `SysX.exe --supervised` and restarts it 2 s after any exit but a user close (code 0), up to 5 times per minute; losing the backend now ends the app with a restart code instead of a normal exit. Linux host tests pass; not run on Windows.
 159. [x] OBS sender receiver discovery (2026-10-18, user request): the DLL defaults to `auto` and finds SysX by a `SYSXFIND 1` broadcast (limited, loopback and per-adapter subnet broadcast) answered with `SYSCFG`, so one build serves every machine; a fixed IPv4 build still works. Fixed a pre-existing duplicate `crop` declaration that kept the self-test from compiling. Receiver probe test passes on Linux; the plugin passes a MinGW `-fsyntax-only -Wall -Wextra` check against stub libobs headers, not an MSVC build; `check-obs-sender.py` gained a loopback discovery run for the manual DLL workflow. Not run on Windows or across two computers.
 160. [x] Auto four-sides gate (2026-10-18, user report with a sketch: two red strips left and right of the center fired with the center empty): left/right pixels must lie within 4 px (or crosshair radius + 3 px) of the center row and above/below pixels within that of the center column; the center-crossing check keeps the any-row/column sides. Backend tests pass; the `auto_ads` simulation is unchanged (solid 100 %, 2 px outline 100/80/40/30 % at 2/2.5/3.5/5×). Not tested in game.
+161. [x] Object Detection targeting and no-diagnostics build (2026-10-24, user request): `targeting::bbox_center` is the shared box-center helper; Motion aims at the exact box center for every class, and only the best-ranked class in the FOV is targeted (class 0 first, then 1 … 7; a better class takes over from a locked box). Preview rings `target_xy` in both engines. Debug info (all profiles), PDB/symbol archives, `native-shared/diagnostics.rs` (logs, crash reports, minidumps, Motion/Auto summary lines) and the linker hardening flags were removed; the IPC token stays. Local Windows run: backend 167 unit (2 ignored) + 50 integration, host 82, UI 18 tests passed. Not exercised: Object Detection with a real model, game, Medius, OBS, release packaging.
 
 
 ### Pixel Seek Motion / Auto contract correction (2026-10-16)
@@ -397,16 +398,7 @@ passed with test-only DejaVu fontconfig, upstream C tests 2 passed. No Windows w
 were exercised. Tests and synthetic feedback checks do not establish in-game
 quality for the optional mode.
 
-### Crash reports and held-trigger soak (2026-10-17)
-
-Native host/backend release profiles use panic unwinding so diagnostics hooks can
-write the panic cause/backtrace, all current-session logs, and a best-effort
-Windows minidump. The host marker is created only after singleton ownership and
-removed on orderly return. A marker left on the next launch produces an
-unclean-exit report that explicitly says the exact cause is unknown and bundles
-the previous session logs. The host also records unexpected backend process
-exit status. Forced termination/power loss cannot reveal a precise cause when
-the OS provided no exception or exit context.
+### Held-trigger soak (2026-10-17)
 
 Run the headless optimized soak with:
 `$env:SYSX_SOAK_SECONDS='600'; $env:SYSX_SOAK_INPUT_FPS='60'; cargo test --manifest-path rust-backend/Cargo.toml --release --features ort/load-dynamic --lib sustained_held_trigger_tracks_a_continuously_moving_pixel_target -- --ignored --nocapture`.

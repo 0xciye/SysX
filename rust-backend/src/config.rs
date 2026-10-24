@@ -372,8 +372,15 @@ impl AppSettings {
         if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
             return Err(SettingsError::Invalid("invalid trigger button"));
         }
-        if self.strategy != "pixel_seek" {
-            return Err(SettingsError::Invalid("Object Detection is not available"));
+        if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
+            return Err(SettingsError::Invalid("invalid detection strategy"));
+        }
+        if self
+            .model_confidence
+            .parse::<f32>()
+            .map_or(true, |value| !(0.0..=1.0).contains(&value))
+        {
+            return Err(SettingsError::Invalid("Min confidence must be from 0 to 1"));
         }
         if !(1..=360).contains(&self.fov_degrees) {
             return Err(SettingsError::Invalid("FOV must be 1..360"));
@@ -414,7 +421,7 @@ impl AppSettings {
         if !["yellow", "red", "purple"].contains(&self.pixel_color.as_str()) {
             return Err(SettingsError::Invalid("invalid Pixel Seek color"));
         }
-        if !["onnxruntime", "tensorrt", "openvino"].contains(&self.model_backend.as_str()) {
+        if !INFERENCE_BACKENDS.contains(&self.model_backend.as_str()) {
             return Err(SettingsError::Invalid("invalid inference backend"));
         }
         if !["fp16", "int8"].contains(&self.model_precision.as_str()) {
@@ -471,7 +478,6 @@ pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
     };
     migrate_smoothing(&mut json);
     migrate_trigger_buttons(&mut json);
-    migrate_unavailable_detection(&mut json);
     migrate_crop_resolution(&mut json);
     let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
         return default_settings_with_profiles();
@@ -504,26 +510,6 @@ fn migrate_trigger_buttons(json: &mut serde_json::Value) {
         }
         if settings.get("auto").is_some_and(middle) {
             settings["auto"]["triggerButton"] = serde_json::json!("right");
-        }
-    }
-    migrate(json);
-    if let Some(profiles) = json
-        .get_mut("profiles")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for profile in profiles {
-            if let Some(settings) = profile.get_mut("settings") {
-                migrate(settings);
-            }
-        }
-    }
-}
-
-fn migrate_unavailable_detection(json: &mut serde_json::Value) {
-    fn migrate(settings: &mut serde_json::Value) {
-        if settings.get("strategy").and_then(serde_json::Value::as_str) == Some("object_detection")
-        {
-            settings["strategy"] = serde_json::json!("pixel_seek");
         }
     }
     migrate(json);
@@ -643,6 +629,17 @@ fn save_settings_unlocked(
     Ok(())
 }
 
+/// Saved `modelBackend` values: ONNX Runtime on CPU, ONNX Runtime with the
+/// DirectML, CUDA, TensorRT or CoreML execution provider, and OpenVINO.
+pub const INFERENCE_BACKENDS: [&str; 6] = [
+    "onnxruntime",
+    "directml",
+    "cuda",
+    "tensorrt",
+    "openvino",
+    "coreml",
+];
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ModelArtifacts {
@@ -653,24 +650,35 @@ pub struct ModelArtifacts {
 }
 
 impl ModelArtifacts {
+    /// ONNX is required; the TensorRT engine and the OpenVINO XML/BIN pair
+    /// are optional, but must carry their own extensions when present.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !has_extension(&self.onnx, &["onnx"])
-            || !has_extension(&self.tensorrt, &["engine", "plan"])
-            || !has_extension(&self.openvino_xml, &["xml"])
-            || !has_extension(&self.openvino_bin, &["bin"])
+        if !has_extension(&self.onnx, &["onnx"]) {
+            return Err("model bundle requires an ONNX .onnx file");
+        }
+        if !self.tensorrt.is_empty() && !has_extension(&self.tensorrt, &["engine", "plan"]) {
+            return Err("TensorRT artifact must be an .engine or .plan file");
+        }
+        if self.openvino_xml.is_empty() != self.openvino_bin.is_empty()
+            || (!self.openvino_xml.is_empty()
+                && (!has_extension(&self.openvino_xml, &["xml"])
+                    || !has_extension(&self.openvino_bin, &["bin"])))
         {
-            return Err(
-                "model bundle requires ONNX, TensorRT engine, and OpenVINO XML/BIN artifacts",
-            );
+            return Err("OpenVINO artifacts need both an .xml and a .bin file");
         }
         Ok(())
     }
 
+    /// The file a runtime loads. Every runtime can start from the ONNX file;
+    /// TensorRT and OpenVINO prefer their own artifacts when the bundle has
+    /// them.
     pub fn for_backend(&self, backend: &str) -> Result<&str, &'static str> {
         self.validate()?;
         match backend {
-            "onnxruntime" => Ok(&self.onnx),
+            "onnxruntime" | "directml" | "cuda" | "coreml" => Ok(&self.onnx),
+            "tensorrt" if self.tensorrt.is_empty() => Ok(&self.onnx),
             "tensorrt" => Ok(&self.tensorrt),
+            "openvino" if self.openvino_xml.is_empty() => Ok(&self.onnx),
             "openvino" => Ok(&self.openvino_xml),
             _ => Err("invalid inference backend"),
         }
@@ -1023,9 +1031,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_object_detection_migrates_without_resetting_profiles() {
+    fn object_detection_strategy_loads_in_every_profile() {
         let directory = std::env::temp_dir().join(format!(
-            "sysx-settings-unavailable-engine-{}-{}",
+            "sysx-settings-object-detection-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1050,13 +1058,13 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
 
         let mut loaded = load_settings(&path);
-        assert_eq!(loaded.strategy, "pixel_seek");
+        assert_eq!(loaded.strategy, "object_detection");
         assert_eq!(loaded.profiles.len(), 2);
-        assert_eq!(loaded.profiles[0].settings["strategy"], "pixel_seek");
-        assert_eq!(loaded.profiles[1].settings["strategy"], "pixel_seek");
+        assert_eq!(loaded.profiles[0].settings["strategy"], "object_detection");
+        assert_eq!(loaded.profiles[1].settings["strategy"], "object_detection");
         loaded.activate_profile(1).unwrap();
         assert_eq!(loaded.motion_speed_x, 0.12);
-        assert_eq!(loaded.strategy, "pixel_seek");
+        assert_eq!(loaded.strategy, "object_detection");
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -1207,6 +1215,25 @@ mod tests {
         artifacts = valid_artifacts();
         artifacts.tensorrt = "/models/model.onnx".into();
         assert!(artifacts.validate().is_err());
+        artifacts = valid_artifacts();
+        artifacts.onnx.clear();
+        assert!(artifacts.validate().is_err());
+    }
+
+    #[test]
+    fn an_onnx_only_model_runs_on_every_runtime() {
+        let artifacts = ModelArtifacts {
+            onnx: "/models/v11_256.onnx".into(),
+            ..ModelArtifacts::default()
+        };
+        assert!(artifacts.validate().is_ok());
+        for backend in INFERENCE_BACKENDS {
+            assert_eq!(
+                artifacts.for_backend(backend),
+                Ok("/models/v11_256.onnx"),
+                "{backend}"
+            );
+        }
     }
 
     #[test]

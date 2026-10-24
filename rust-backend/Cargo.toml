@@ -3,13 +3,16 @@ name = "sysx-backend"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+debug = 0
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "unwind"
-strip = "none"
-debug = 2
+strip = "symbols"
+debug = 0
 debug-assertions = false
 incremental = false
 
@@ -21,6 +24,12 @@ path = "src/lib.rs"
 default = []
 tensorrt = ["dep:baracuda-driver", "dep:baracuda-tensorrt"]
 tensorrt-shim = ["tensorrt", "baracuda-tensorrt/shim"]
+# ONNX Runtime execution providers. Each needs an ONNX Runtime build that
+# contains it (with `ort/load-dynamic`, the onnxruntime.dll next to SysX).
+directml = ["ort/directml"]
+cuda = ["ort/cuda"]
+ort-tensorrt = ["ort/tensorrt"]
+coreml = ["ort/coreml"]
 
 [[bin]]
 name = "receiver-backend"

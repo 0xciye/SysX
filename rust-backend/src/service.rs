@@ -1,6 +1,6 @@
 use crate::config::{
-    load_settings, save_settings, AppSettings, AutoSettings, ModelDefinition, ModelRegistry,
-    RecoilSettings,
+    load_settings, save_settings, AppSettings, AutoSettings, ModelArtifacts, ModelDefinition,
+    ModelRegistry, RecoilSettings,
 };
 use crate::decode_pool::DecodePool;
 use crate::movement::{
@@ -93,47 +93,6 @@ impl AutoEvents {
         if revision == self.revision {
             (self.emit)(self.event("auto_target", valid, unix_ms()));
         }
-    }
-}
-
-/// Held-Auto-trigger summary for the diagnostics log, at most one line every
-/// two seconds: whether frames arrive and how often center validity is observed.
-#[derive(Default)]
-struct AutoSummary {
-    started: Option<Instant>,
-    frames: u32,
-    center_valid_frames: u32,
-}
-
-impl AutoSummary {
-    fn add(&mut self, active: bool, center_valid: bool, fov_degrees: u16) -> Option<String> {
-        if !active {
-            // Trigger released: report what was gathered, if worth a line.
-            let line = self
-                .started
-                .filter(|started| started.elapsed() >= Duration::from_millis(250))
-                .and_then(|_| self.take(fov_degrees));
-            *self = Self::default();
-            return line;
-        }
-        let started = *self.started.get_or_insert_with(Instant::now);
-        self.frames += 1;
-        self.center_valid_frames += u32::from(center_valid);
-        (started.elapsed() >= Duration::from_secs(2))
-            .then(|| self.take(fov_degrees))
-            .flatten()
-    }
-
-    fn take(&mut self, fov_degrees: u16) -> Option<String> {
-        let seconds = self.started?.elapsed().as_secs_f64().max(1e-3);
-        let line = format!(
-            "auto held {seconds:.1} s: {} frames ({:.0}/s), center-valid frames {} (Auto FOV {fov_degrees}°)",
-            self.frames,
-            f64::from(self.frames) / seconds,
-            self.center_valid_frames,
-        );
-        *self = Self::default();
-        Some(line)
     }
 }
 
@@ -261,10 +220,7 @@ impl ReceiverService {
             .spawn(crate::pixel_seek::warm_profile_luts)
         {
             Ok(worker) => Some(worker),
-            Err(error) => {
-                crate::diagnostics::record(&format!(
-                    "Pixel Seek warmup thread unavailable; warming inline: {error}"
-                ));
+            Err(_) => {
                 crate::pixel_seek::warm_profile_luts();
                 None
             }
@@ -387,7 +343,6 @@ impl ReceiverService {
         let callback_settings = Arc::clone(&settings);
         let callback_device = Arc::clone(&device);
         let callback_auto = Arc::clone(&auto_events);
-        let auto_summary = Mutex::new(AutoSummary::default());
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(0_u64);
         let callback: Arc<dyn Fn(&ProcessedFrame) + Send + Sync> = Arc::new(move |processed| {
             // Wake every preview socket for this frame (no timer polling:
@@ -425,13 +380,6 @@ impl ReceiverService {
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     let target_valid = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, target_valid);
-                    if let Ok(mut summary) = auto_summary.lock() {
-                        if let Some(line) =
-                            summary.add(auto_active, target_valid, settings.auto.fov_degrees)
-                        {
-                            crate::diagnostics::record(&line);
-                        }
-                    }
                 }
             }
         });
@@ -920,6 +868,7 @@ impl ReceiverService {
                         .map_err(|error| error.to_string())?;
                 }
                 settings.validate().map_err(|error| error.to_string())?;
+                self.apply_model_selection(&mut settings)?;
                 let port = settings
                     .port
                     .parse::<u16>()
@@ -1318,9 +1267,16 @@ impl ReceiverService {
                     .and_then(Value::as_str)
                     .ok_or("detection strategy is required")?;
                 if mode == "object_detection" {
-                    return Err("Object Detection is not available".into());
-                }
-                if mode != "pixel_seek" {
+                    let registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
+                    if registry
+                        .active_model_id
+                        .as_ref()
+                        .and_then(|id| registry.models.get(id))
+                        .is_none()
+                    {
+                        return Err("Import a model before selecting Object Detection".into());
+                    }
+                } else if mode != "pixel_seek" {
                     return Err("invalid detection strategy".into());
                 }
                 self.settings
@@ -1353,6 +1309,7 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "list_models" => Ok(self.models_event()),
+            "import_model_bundle" => self.import_model_bundle(&command),
             "add_model" => {
                 let model: ModelDefinition =
                     serde_json::from_value(command.clone()).map_err(|error| error.to_string())?;
@@ -1513,6 +1470,177 @@ impl ReceiverService {
         Ok(self.models_event())
     }
 
+    /// Makes the draft's model the active one, applies its Min confidence
+    /// and, in Object Detection, sets Crop Resolution to the model's input
+    /// size so the sender delivers frames the model accepts.
+    fn apply_model_selection(&self, settings: &mut AppSettings) -> Result<(), String> {
+        let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
+        let selected = settings
+            .active_model_id
+            .as_deref()
+            .filter(|id| registry.models.contains_key(*id))
+            .map(str::to_owned);
+        if settings.strategy == "object_detection" && selected.is_none() {
+            return Err("Import a model before selecting Object Detection".into());
+        }
+        let Some(id) = selected else {
+            return Ok(());
+        };
+        if registry.active_model_id.as_deref() != Some(id.as_str()) {
+            registry
+                .activate(Some(&id))
+                .map_err(|error| error.to_string())?;
+        }
+        let confidence = settings
+            .model_confidence
+            .parse::<f32>()
+            .map_err(|_| "Min confidence must be from 0 to 1")?;
+        let mut model = registry.models[&id].clone();
+        if settings.strategy == "object_detection" {
+            if model.input_width != model.input_height {
+                return Err(format!(
+                    "Model input {}x{} is not square; the sender only crops squares",
+                    model.input_width, model.input_height
+                ));
+            }
+            settings.crop_resolution = model.input_width;
+        }
+        if model.confidence != confidence {
+            model.confidence = confidence;
+            registry.update(model).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Registers a model and makes it active. `path` is an `.onnx` file
+    /// (TensorRT/OpenVINO files with the same name next to it are picked up)
+    /// or a folder holding one. The input size and class names come from the
+    /// ONNX file; a model with a dynamic input uses the current Crop
+    /// Resolution.
+    fn import_model_bundle(&self, command: &Value) -> Result<Value, String> {
+        let path = command
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| path.trim().trim_start_matches('@').trim_matches('"'))
+            .filter(|path| !path.is_empty())
+            .ok_or("Enter the model file or folder")?;
+        let path = std::path::Path::new(path);
+        let (folder, stem) = if path.is_dir() {
+            (path, None)
+        } else if path.is_file() {
+            (
+                path.parent().ok_or("Invalid model path")?,
+                path.file_stem().and_then(|stem| stem.to_str()),
+            )
+        } else {
+            return Err(format!("Model path not found: {}", path.display()));
+        };
+        let mut files = std::fs::read_dir(folder)
+            .map_err(|error| format!("Cannot read model folder: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|file| file.is_file())
+            .filter(|file| stem.is_none() || file.file_stem().and_then(|s| s.to_str()) == stem)
+            .collect::<Vec<_>>();
+        files.sort();
+        let find = |extensions: &[&str]| {
+            files
+                .iter()
+                .find(|file| {
+                    file.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            extensions
+                                .iter()
+                                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+                        })
+                })
+                .map(|file| file.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let mut artifacts = ModelArtifacts {
+            onnx: find(&["onnx"]),
+            tensorrt: find(&["engine", "plan"]),
+            openvino_xml: find(&["xml"]),
+            openvino_bin: find(&["bin"]),
+        };
+        if artifacts.onnx.is_empty() {
+            return Err("No .onnx model found at that path".into());
+        }
+        if artifacts.openvino_xml.is_empty() != artifacts.openvino_bin.is_empty() {
+            artifacts.openvino_xml.clear();
+            artifacts.openvino_bin.clear();
+        }
+        let info = std::fs::read(&artifacts.onnx)
+            .map_err(|error| format!("Cannot read the ONNX model: {error}"))
+            .and_then(|bytes| crate::onnx_info::read(&bytes).map_err(str::to_owned))?;
+        let name = std::path::Path::new(&artifacts.onnx)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model")
+            .to_owned();
+        let crop = self
+            .settings
+            .lock()
+            .map_err(|_| "settings lock poisoned")?
+            .crop_resolution;
+        let (width, height) = info.input_size.unwrap_or((crop, crop));
+        let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
+        let existing = registry
+            .models
+            .values()
+            .find(|model| model.artifacts.onnx == artifacts.onnx)
+            .map(|model| model.id.clone());
+        let id = match existing {
+            Some(id) => {
+                let mut model = registry.models[&id].clone();
+                model.artifacts = artifacts;
+                model.input_width = width;
+                model.input_height = height;
+                model.class_names = info.class_names;
+                model.enabled = true;
+                registry.update(model).map_err(|error| error.to_string())?;
+                id
+            }
+            None => {
+                let mut id = name.clone();
+                let mut suffix = 2;
+                while registry.models.contains_key(&id) {
+                    id = format!("{name}-{suffix}");
+                    suffix += 1;
+                }
+                registry
+                    .add(ModelDefinition {
+                        id: id.clone(),
+                        name,
+                        artifacts,
+                        input_width: width,
+                        input_height: height,
+                        confidence: 0.5,
+                        iou: 0.45,
+                        device: "auto".into(),
+                        enabled: true,
+                        class_names: info.class_names,
+                    })
+                    .map_err(|error| error.to_string())?;
+                id
+            }
+        };
+        registry
+            .activate(Some(&id))
+            .map_err(|error| error.to_string())?;
+        drop(registry);
+        self.settings
+            .lock()
+            .map_err(|_| "settings lock poisoned")?
+            .active_model_id = Some(id.clone());
+        self.reconfigure()?;
+        Ok(json!({
+            "event":"ack","type":"import_model_bundle","active_model_id":id,
+            "input_width":width,"input_height":height
+        }))
+    }
+
     fn models_event(&self) -> Value {
         let Ok(registry) = self.registry.lock() else {
             return json!({"event":"models","models":[],"active_model_id":null});
@@ -1566,7 +1694,6 @@ fn receiver_supervisor(service: Weak<ReceiverService>) {
                 *view = SourceView::of(&source);
             }
         }
-        crate::diagnostics::record(&message);
         receiver.record_error(message);
         drop(receiver);
         thread::sleep(Duration::from_millis(250));
@@ -2537,8 +2664,81 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_object_detection_cannot_be_activated_at_runtime() {
-        let (service, data_dir) = test_service("unavailable-object-detection");
+    fn imported_onnx_model_sets_object_detection_and_crop_resolution() {
+        let (service, data_dir) = test_service("import-model-bundle");
+        let _guard = ServiceGuard(Arc::clone(&service));
+        // Graph input "images" [1, 3, 96, 96] and Ultralytics class names.
+        fn tag(field: u8, payload: &[u8]) -> Vec<u8> {
+            [
+                vec![(field << 3) | 2, payload.len() as u8],
+                payload.to_vec(),
+            ]
+            .concat()
+        }
+        let dims = [1u8, 3, 96, 96]
+            .iter()
+            .flat_map(|size| tag(1, &[1 << 3, *size]))
+            .collect::<Vec<_>>();
+        let tensor = tag(1, &[vec![1 << 3, 1], tag(2, &dims)].concat());
+        let input = tag(11, &[tag(1, b"images"), tag(2, &tensor)].concat());
+        let names = tag(14, &[tag(1, b"names"), tag(2, b"{0: 'Enemy'}")].concat());
+        let model = data_dir.join("v11_96.onnx");
+        std::fs::write(&model, [tag(7, &input), names].concat()).unwrap();
+        let error = service
+            .dispatch(
+                json!({"version":1,"type":"import_model_bundle","path":data_dir.join("none")}),
+            )
+            .expect_err("a missing path is rejected");
+        assert!(error.contains("not found"), "{error}");
+        let reply = service
+            .dispatch(json!({"version":1,"type":"import_model_bundle","path":model}))
+            .unwrap();
+        assert_eq!(reply["active_model_id"], "v11_96");
+        assert_eq!(reply["input_width"], 96);
+        // Importing the same file again reuses the model.
+        service
+            .dispatch(json!({"version":1,"type":"import_model_bundle","path":data_dir}))
+            .unwrap();
+        {
+            let registry = service.registry.lock().unwrap();
+            assert_eq!(registry.models.len(), 1);
+            let model = &registry.models["v11_96"];
+            assert_eq!((model.input_width, model.input_height), (96, 96));
+            assert!(model.artifacts.tensorrt.is_empty());
+            assert_eq!(model.class_names.as_ref().unwrap()[&0], "Enemy");
+        }
+
+        let mut requested = service.settings.lock().unwrap().clone();
+        requested.strategy = "object_detection".into();
+        requested.model_confidence = "0.7".into();
+        requested.crop_resolution = 256;
+        service
+            .dispatch(json!({
+                "version":1,
+                "type":"apply_app_settings",
+                "settings":requested
+            }))
+            .unwrap();
+        let applied = service.settings.lock().unwrap().clone();
+        assert_eq!(applied.strategy, "object_detection");
+        assert_eq!(
+            applied.crop_resolution, 96,
+            "Crop Resolution follows the model"
+        );
+        assert_eq!(
+            service.registry.lock().unwrap().models["v11_96"].confidence,
+            0.7
+        );
+        let saved = load_settings(&service.settings_path);
+        assert_eq!(saved.active_model_id.as_deref(), Some("v11_96"));
+        assert_eq!(saved.crop_resolution, 96);
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn object_detection_requires_an_imported_model() {
+        let (service, data_dir) = test_service("object-detection-without-model");
         let _guard = ServiceGuard(Arc::clone(&service));
         let original = service.settings.lock().unwrap().clone();
         let original_file = std::fs::read(&service.settings_path).unwrap();
@@ -2548,8 +2748,8 @@ mod tests {
                 "type":"set_strategy",
                 "mode":"object_detection"
             }))
-            .expect_err("the unavailable engine must not reconfigure the receiver");
-        assert!(error.contains("not available"), "{error}");
+            .expect_err("Object Detection without a model must not reconfigure the receiver");
+        assert!(error.contains("Import a model"), "{error}");
         let mut requested = original.clone();
         requested.strategy = "object_detection".into();
         let error = service
@@ -2558,8 +2758,8 @@ mod tests {
                 "type":"apply_app_settings",
                 "settings":requested
             }))
-            .expect_err("Apply Changes must reject the unavailable engine");
-        assert!(error.contains("not available"), "{error}");
+            .expect_err("Apply Changes must reject Object Detection without a model");
+        assert!(error.contains("Import a model"), "{error}");
         assert_eq!(*service.settings.lock().unwrap(), original);
         assert_eq!(
             std::fs::read(&service.settings_path).unwrap(),
@@ -2610,20 +2810,6 @@ mod tests {
         assert!(!data_dir.join("sessions").exists());
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
-    }
-
-    #[test]
-    fn auto_summary_reports_frames_and_center_validity() {
-        let mut summary = super::AutoSummary::default();
-        assert!(summary.add(false, false, 36).is_none(), "nothing gathered");
-        for frame in 0..10 {
-            assert!(summary.add(true, frame % 5 == 0, 36).is_none());
-        }
-        summary.started = Some(Instant::now() - Duration::from_secs(1));
-        let line = summary.add(false, false, 36).expect("released: summary");
-        assert!(line.contains("10 frames"), "{line}");
-        assert!(line.contains("center-valid frames 2"), "{line}");
-        assert!(line.contains("Auto FOV 36°"), "{line}");
     }
 
     #[test]

@@ -301,14 +301,11 @@ fn worker(shared: &Shared, deliver: &(dyn Fn(SourceFrame) + Send + Sync)) {
 
 fn worker_supervisor(shared: &Shared, deliver: &(dyn Fn(SourceFrame) + Send + Sync)) {
     loop {
-        if let Err(message) = recover_worker(|| worker(shared, deliver)) {
+        if recover_worker(|| worker(shared, deliver)).is_err() {
             if shared.stopping.load(Ordering::Acquire) {
                 return;
             }
             shared.failed.fetch_add(1, Ordering::Relaxed);
-            crate::diagnostics::record(&format!(
-                "JPEG decode worker recovered from panic: {message}"
-            ));
             thread::sleep(Duration::from_millis(50));
         } else {
             return;

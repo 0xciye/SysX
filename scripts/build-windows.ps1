@@ -15,7 +15,6 @@ if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64
 $root = Split-Path -Parent $PSScriptRoot
 $target = "x86_64-pc-windows-msvc"
 $sidecar = Join-Path $root "src-tauri\binaries\receiver-backend-$target.exe"
-$symbols = Join-Path $root 'dist-symbols'
 $env:Path = (Join-Path $env:USERPROFILE ".cargo\bin") + ";" + $env:Path
 function Invoke-CheckedNative {
     param(
@@ -35,25 +34,8 @@ function Invoke-CheckedNative {
     }
 }
 
-function Copy-NativePdb {
-    param([string] $Directory, [string[]] $Names, [string] $Component)
-    $pdb = $Names | ForEach-Object { Join-Path $Directory $_ } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if (-not $pdb) { throw "Release PDB missing for $Component in $Directory" }
-    $destination = Join-Path $symbols $Component
-    New-Item -ItemType Directory -Force $destination | Out-Null
-    Copy-Item -LiteralPath $pdb -Destination $destination -Force
-}
-
 Push-Location $root
 try {
-    # Keep PDBs separate from the portable runtime and avoid stale backend
-    # symbols when an externally processed backend is supplied.
-    foreach ($component in @('host', 'backend')) {
-        $componentSymbols = Join-Path $symbols $component
-        if (Test-Path -LiteralPath $componentSymbols) { Remove-Item -LiteralPath $componentSymbols -Recurse -Force }
-    }
-    New-Item -ItemType Directory -Force $symbols | Out-Null
     # 1. Backend sidecar, embedded into SysX.exe.
     if ($UseExistingBackend) {
         if ($BackendPath) {
@@ -70,10 +52,9 @@ try {
     } else {
         # Pixel Seek does not use ONNX Runtime. Keep the retained development
         # adapter dynamically loaded so the portable build needs no ORT SDK.
-        Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic", "--bin", "receiver-backend", "--target", $target, "--release")
+        Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic,directml", "--bin", "receiver-backend", "--target", $target, "--release")
         $backend = Join-Path $root "rust-backend\target\$target\release\receiver-backend.exe"
         Copy-Item -LiteralPath $backend -Destination $sidecar -Force
-        Copy-NativePdb -Directory (Split-Path -Parent $backend) -Names @('receiver_backend.pdb', 'receiver-backend.pdb') -Component 'backend'
     }
 
     # 2. Tests.
@@ -87,7 +68,6 @@ try {
     $sysxExe = Join-Path $root "src-tauri\target\release\SysX.exe"
     if (-not (Test-Path $builtExe)) { throw "The native host build did not produce $builtExe" }
     Copy-Item -LiteralPath $builtExe -Destination $sysxExe -Force
-    Copy-NativePdb -Directory (Split-Path -Parent $builtExe) -Names @('receiver.pdb') -Component 'host'
     Write-Host "Built $sysxExe"
 
     # 4. Headless protocol smoke; the app smoke opens windows, so it is opt-in.

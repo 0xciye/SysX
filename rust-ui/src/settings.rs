@@ -396,8 +396,11 @@ impl AppSettings {
         if !["right", "m4", "m5"].contains(&self.trigger_button.as_str()) {
             return Err("Choose Right, M4, or M5 for the trigger button.");
         }
-        if self.strategy != "pixel_seek" {
-            return Err("Choose Pixel Seek. Object Detection is not available yet.");
+        if !["pixel_seek", "object_detection"].contains(&self.strategy.as_str()) {
+            return Err("Choose Pixel Seek or Object Detection.");
+        }
+        if self.strategy == "object_detection" && self.active_model_id.is_none() {
+            return Err("Import a model bundle before selecting Object Detection.");
         }
         if !(1..=360).contains(&self.fov_degrees) {
             return Err("FOV must be from 1 to 360 degrees.");
@@ -459,10 +462,12 @@ mod tests {
     };
 
     #[test]
-    fn unavailable_object_detection_cannot_be_applied_from_the_ui() {
+    fn object_detection_needs_an_imported_model() {
         let mut settings = super::AppSettings::default();
         settings.strategy = "object_detection".into();
-        assert!(settings.validate().unwrap_err().contains("not available"));
+        assert!(settings.validate().unwrap_err().contains("model bundle"));
+        settings.active_model_id = Some("yolo".into());
+        assert!(settings.validate().is_ok());
         settings.strategy = "pixel_seek".into();
         assert!(settings.validate().is_ok());
     }

@@ -501,12 +501,10 @@ impl Workers {
                                                 }
                                             };
                                             if published {
-                                                if let Err(error) = catch_worker_panic(|| {
+                                                let _ = catch_worker_panic(|| {
                                                     notify_decode();
                                                     Ok(())
-                                                }) {
-                                                    crate::diagnostics::record(&error);
-                                                }
+                                                });
                                             }
                                         }
                                         Ok(_) => {}
@@ -515,12 +513,10 @@ impl Workers {
                                             current.error = error;
                                             current.revision += 1;
                                             drop(current);
-                                            if let Err(error) = catch_worker_panic(|| {
+                                            let _ = catch_worker_panic(|| {
                                                 notify_decode();
                                                 Ok(())
-                                            }) {
-                                                crate::diagnostics::record(&error);
-                                            }
+                                            });
                                         }
                                     }
                                 }
@@ -528,7 +524,6 @@ impl Workers {
                             Ok(())
                         });
                         if let Err(error) = iteration {
-                            crate::diagnostics::record(&error);
                             let mut current = lock_view(&view);
                             current.error = error;
                             current.revision += 1;
@@ -665,7 +660,6 @@ impl Workers {
                                 .or_else(|| panic.downcast_ref::<&str>().copied())
                                 .unwrap_or("unknown panic");
                             let error = format!("Preview worker recovered from panic: {message}");
-                            crate::diagnostics::record(&error);
                             let mut current = lock_view(&view);
                             current.connected = false;
                             current.frame = None;

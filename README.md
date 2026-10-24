@@ -96,7 +96,7 @@ The Rust sidecar has adapters for ONNX Runtime CPU, OpenVINO, and optional Tenso
 
 The receiver and Settings are native Slint windows. The desktop does not start the former config HTTP server or WASM bootstrap.
 
-Release hardening is documented in [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md). The normal build produces a portable `SysX.exe` with native PDB debug symbols stored separately, LTO, Windows CFG/ASLR/NX, loader mitigations, release-only debugger guards, and SHA-256 verification of the extracted backend. Windows read locks and paced background integrity sweeps remain enabled; debug/test enforcement stays disabled. Build and packaging neither run nor require VMProtect. No reusable authentication credential is stored in the client.
+Release security is documented in [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md). The normal build produces a portable `SysX.exe` with LTO and no debug symbols, error logs, crash dumps, linker hardening flags, debugger guards or integrity checks (removed at the user's request). Build and packaging neither run nor require VMProtect. No reusable authentication credential is stored in the client; the backend IPC still uses a per-launch token.
 
 The [continuity report](docs/SECURITY_CONTINUITY_REPORT.md) records a Linux synthetic release A/B test near 240 FPS with and without the file-integrity worker, including CPU/startup cost and the remaining Windows, physical-device and VMProtect limits. It is not a game/hardware benchmark or proof of zero overhead.
 
@@ -106,17 +106,17 @@ The LAN sender DLL is built separately from the receiver. By default it finds Sy
 
 ## Windows portable build validation (2026-10-16)
 
-These results describe the earlier build recorded below. The native PDB/crash-diagnostics changes have not been rebuilt at the user's request; run the manual workflows to validate that output.
+These results describe the earlier build recorded below. Later changes (including the removal of PDBs, logs and linker hardening) have not been built on a Windows runner; run the manual workflows to validate that output.
 
 [Windows run](https://github.com/0xciye/SysX/actions/runs/38888803711) built the release EXE and passed 89 backend tests (4 ignored simulation reports), 11 UI tests, 39 native-host tests, UDP reassembly on 4200, and application launch/monitor-close/backend-shutdown smoke. The x64 PE has CFG, ASLR/high-entropy ASLR and NX enabled. The separate OBS DLL targets `192.168.88.59:4200`, passed its three-frame loopback/crop-reply check, and imports only Windows system DLLs. [Hashes and validation](docs/validation/windows-portable-2026-10-16.json). VMProtect was not applied. Visible rendering, physical Medius, real OBS graphics and LAN throughput remain unvalidated by these checks.
 
-## Manual builds and crash diagnostics
+## Manual builds
 
 Open **Actions** and choose **Build SysX EXE (manual)** or **Build OBS DLL (manual, receiver IP or auto)**, then **Run workflow** on `main`. The DLL workflow has a `receiver_ip` field (default `auto`, or a fixed IPv4 address; UDP 4200). Neither workflow runs automatically on push/PR. Successful outputs are saved under **Releases → draft release** instead of Actions artifacts.
 
-Native host/backend release builds retain full PDB information (`debug = 2`, `strip = "none"`) with LTO and the release security guards still enabled. The EXE workflow creates separate app and symbols ZIPs; the DLL workflow produces only the image-sender DLL, without PDBs or custom diagnostics. Keep the matching PDB archive for each exact build. PDBs are not required on a computer that only runs the app. The manual workflow summary reports actual EXE/ZIP sizes; no new size is known until a build runs. The desktop build no longer embeds or strips WASM settings assets.
+Release builds have no debug information (`debug = 0`, `strip = "symbols"`). The EXE workflow creates one app ZIP; the DLL workflow produces only the image-sender DLL. The manual workflow summary reports actual EXE/ZIP sizes; no new size is known until a build runs.
 
-SysX writes diagnostic text to `%LOCALAPPDATA%\SysX\logs\` (`host-*.log`, `backend-*.log`, `backend-stderr-*.log`). Rust panic reports include a backtrace; unhandled Windows exceptions include a code/address. Each caught Rust panic or unhandled Windows exception also writes a crash report to `%LOCALAPPDATA%\SysX\crashes\*-crash.txt` containing the reason and every log created during that process session. Best-effort Windows minidumps are saved beside it as `*.dmp`. SysX records normal shutdown reasons and watches for an unexpected backend exit. If the host is terminated before it can record a reason, the next launch writes an `*-unclean-exit.txt` with all logs from the previous session and explicitly states that the exact cause is unknown. Logging is confined to startup, shutdown and error/crash paths, not per-frame or per-move loops. Open a dump with WinDbg and the PDBs from that exact build. Forced termination, power loss, severe corruption, or a replaced exception handler may prevent a report or dump.
+SysX writes no error logs, crash reports or minidumps.
 
 OBS owns crashes inside its process: check `%APPDATA%\obs-studio\crashes\` and `%APPDATA%\obs-studio\logs\`. The sender adds no log or crash handler.
 
