@@ -160,6 +160,8 @@ pub struct AppSettings {
     pub motion_enabled: bool,
     #[serde(default)]
     pub motion_always_on: bool,
+    #[serde(default)]
+    pub motion_toggle: bool,
     pub motion_renderer: MotionRendererSettings,
     #[serde(default)]
     pub color_filter: bool,
@@ -206,6 +208,7 @@ impl Default for AppSettings {
             active_profile: 0,
             motion_enabled: false,
             motion_always_on: false,
+            motion_toggle: false,
             motion_renderer: MotionRendererSettings::default(),
             color_filter: false,
             trigger_button: "right".into(),
@@ -303,7 +306,7 @@ pub fn apply_settings_fields(
         ),
         command(
             "set_movement_calibration",
-            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled,"motion_always_on":settings.motion_always_on}),
+            serde_json::json!({"sens":settings.sens,"motion_enabled":settings.motion_enabled,"motion_always_on":settings.motion_always_on,"motion_toggle":settings.motion_toggle}),
         ),
         command(
             "set_color_filter",

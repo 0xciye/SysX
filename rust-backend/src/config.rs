@@ -135,6 +135,9 @@ pub struct AppSettings {
     pub profiles: Vec<ProfileSlot>,
     pub motion_enabled: bool,
     pub motion_always_on: bool,
+    /// Each press of the trigger button turns Motion on or off instead of
+    /// Motion running only while the button is held.
+    pub motion_toggle: bool,
     pub motion_renderer: MotionRendererSettings,
     /// Preview shows only pixels of the selected target color; the rest is black.
     pub color_filter: bool,
@@ -183,6 +186,7 @@ impl Default for AppSettings {
             profiles: Vec::new(),
             motion_enabled: false,
             motion_always_on: false,
+            motion_toggle: false,
             motion_renderer: MotionRendererSettings::default(),
             color_filter: false,
             trigger_button: "right".into(),

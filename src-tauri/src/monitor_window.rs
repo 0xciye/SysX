@@ -918,6 +918,7 @@ fn settings_page(settings: &serde_json::Value, model_path: &str) -> Vec<Settings
     page.section("Motion");
     page.setting(settings, "motionEnabled", "Motion", "toggle", "");
     page.setting(settings, "motionAlwaysOn", "Always on", "toggle", "");
+    page.setting(settings, "motionToggle", "Toggle", "toggle", "");
     page.setting(settings, "motionNoDeadzone", "No deadzone", "toggle", "");
     page.setting(settings, "triggerButton", "Trigger button", "choice", "");
     page.pair(
@@ -1182,6 +1183,7 @@ fn activate_setting(settings: &mut serde_json::Value, key: &str) -> Result<(), S
         "colorFilter"
         | "motionEnabled"
         | "motionAlwaysOn"
+        | "motionToggle"
         | "motionNoDeadzone"
         | "motionRenderer.enabled"
         | "auto.enabled"
@@ -2527,7 +2529,7 @@ mod render_tests {
             "profiles":[{"name":"Default"},{"name":"Low recoil"}],"activeProfile":0,
             "pixelColor":"yellow","fovDegrees":90,"colorFilter":false,
             "cropResolution":256,"scale":"Smooth","motionEnabled":true,
-            "motionAlwaysOn":false,"motionNoDeadzone":true,"triggerButton":"right",
+            "motionAlwaysOn":false,"motionToggle":false,"motionNoDeadzone":true,"triggerButton":"right",
             "offsetX":0,"offsetY":0,"motionSpeedX":0.045,"motionSpeedY":0.045,
             "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
             "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,

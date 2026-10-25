@@ -31,6 +31,10 @@ pub struct MovementTarget {
     pub motion_enabled: bool,
     #[serde(alias = "motionAlwaysOn")]
     pub motion_always_on: bool,
+    /// Toggle mode: the backend reports the toggled state as Always-on and
+    /// the held trigger alone does not move.
+    #[serde(default, alias = "motionToggle")]
+    pub motion_toggle: bool,
     #[serde(alias = "triggerButton")]
     pub trigger_button: String,
     #[serde(alias = "timestampMs")]
@@ -145,7 +149,9 @@ pub fn trigger_button_index(button: &str) -> Option<u16> {
 }
 
 pub fn should_apply_target(target: &MovementTarget, trigger_held: bool) -> bool {
-    target.motion_enabled && (target.motion_always_on || trigger_held) && target.target_valid
+    target.motion_enabled
+        && (target.motion_always_on || (!target.motion_toggle && trigger_held))
+        && target.target_valid
 }
 
 pub fn recoil_move(recoil_y: i64) -> (i16, i16) {
@@ -290,6 +296,24 @@ mod tests {
                 ..target
             },
             true
+        ));
+    }
+
+    #[test]
+    fn toggle_mode_ignores_the_held_trigger() {
+        let target = MovementTarget {
+            target_valid: true,
+            motion_enabled: true,
+            motion_toggle: true,
+            ..MovementTarget::default()
+        };
+        assert!(!should_apply_target(&target, true));
+        assert!(should_apply_target(
+            &MovementTarget {
+                motion_always_on: true,
+                ..target
+            },
+            false
         ));
     }
 

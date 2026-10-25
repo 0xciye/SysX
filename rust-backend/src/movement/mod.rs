@@ -137,6 +137,10 @@ pub struct MovementEvent {
     pub motion_enabled: bool,
     #[serde(default)]
     pub motion_always_on: bool,
+    /// Toggle mode: the held trigger alone does not move; `motion_always_on`
+    /// carries the toggled state.
+    #[serde(default)]
+    pub motion_toggle: bool,
     pub trigger_button: String,
     pub timestamp_ms: u64,
     pub recoil: RecoilSettings,
@@ -147,7 +151,9 @@ pub struct MovementRuntimeSettings {
     pub renderer_profile: Option<Arc<abcurves::Profile>>,
     pub config_revision: u64,
     pub motion_enabled: bool,
+    /// Always-on, or toggled on in toggle mode.
     pub motion_always_on: bool,
+    pub motion_toggle: bool,
     pub sens: f64,
     pub offset_x: f64,
     pub offset_y: f64,
@@ -165,7 +171,7 @@ pub struct MovementRuntimeSettings {
 
 impl MovementRuntimeSettings {
     fn output_active(&self) -> bool {
-        self.motion_enabled && (self.motion_always_on || self.trigger_held)
+        self.motion_enabled && (self.motion_always_on || (!self.motion_toggle && self.trigger_held))
     }
 }
 
@@ -264,6 +270,7 @@ impl MovementTicker {
                                     dy: 0,
                                     motion_enabled: false,
                                     motion_always_on: false,
+                                    motion_toggle: false,
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
@@ -286,6 +293,7 @@ impl MovementTicker {
                                     dy: 0,
                                     motion_enabled: runtime.motion_enabled,
                                     motion_always_on: runtime.motion_always_on,
+                                    motion_toggle: runtime.motion_toggle,
                                     trigger_button: runtime.trigger_button,
                                     timestamp_ms: unix_ms(),
                                     recoil: runtime.recoil,
@@ -345,6 +353,7 @@ impl MovementTicker {
                             dy,
                             motion_enabled: runtime.motion_enabled,
                             motion_always_on: runtime.motion_always_on,
+                            motion_toggle: runtime.motion_toggle,
                             trigger_button: runtime.trigger_button,
                             timestamp_ms: unix_ms(),
                             recoil: runtime.recoil,
@@ -363,6 +372,7 @@ impl MovementTicker {
                                 dy: 0,
                                 motion_enabled: runtime.motion_enabled,
                                 motion_always_on: runtime.motion_always_on,
+                                motion_toggle: runtime.motion_toggle,
                                 trigger_button: runtime.trigger_button,
                                 timestamp_ms: unix_ms(),
                                 recoil: runtime.recoil,
@@ -598,6 +608,7 @@ mod tests {
             dy,
             motion_enabled: true,
             motion_always_on: false,
+            motion_toggle: false,
             trigger_button: trigger_button.into(),
             timestamp_ms,
             recoil: RecoilSettings::default(),
@@ -610,6 +621,7 @@ mod tests {
             config_revision: 2,
             motion_enabled: true,
             motion_always_on: always_on,
+            motion_toggle: false,
             sens: 0.25,
             offset_x: 0.0,
             offset_y: 0.0,

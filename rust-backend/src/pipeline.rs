@@ -942,6 +942,7 @@ mod tests {
             config_revision: 0,
             motion_enabled: true,
             motion_always_on: false,
+            motion_toggle: false,
             sens: 0.25,
             offset_x: 0.0,
             offset_y: 0.0,

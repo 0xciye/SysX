@@ -304,7 +304,7 @@ impl ReceiverService {
         );
         let device = Arc::new(Mutex::new(missing_device()));
         let auto_events = Arc::new(Mutex::new(AutoEvents {
-            settings: routed_auto_settings(&app),
+            settings: routed_auto_settings(&app, &missing_device()),
             revision: 0,
             emit: Arc::new(|event| {
                 if let Ok(line) = serde_json::to_string(&event) {
@@ -542,7 +542,7 @@ impl ReceiverService {
             "event":"state", "version":1, "status":if is_live { "streaming" } else { "waiting" }, "input":"udp", "source":source_name,
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
             "motion_capture":capture_request,"motion_capture_count":capture_count,"motion_capture_message":capture_message,
-            "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
+            "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "motion_toggle":settings.motion_toggle, "motion_toggled":motion_toggled(&settings, &device), "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
             "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
             "smooth_fov_degrees":settings.smooth_fov_degrees, "motion_no_deadzone":settings.motion_no_deadzone, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
@@ -727,11 +727,16 @@ impl ReceiverService {
         let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
         // Publish controls even if no frame arrives or pipeline configuration
         // fails. In particular, disabling Auto must never depend on video.
+        let device = self
+            .device
+            .lock()
+            .map_err(|_| "device lock poisoned")?
+            .clone();
         let mut events = self
             .auto_events
             .lock()
             .map_err(|_| "Auto event lock poisoned")?;
-        events.reconfigure(&routed_auto_settings(&settings));
+        events.reconfigure(&routed_auto_settings(&settings, &device));
         let revision = events.revision;
         drop(events);
         self.motion_capture
@@ -750,11 +755,16 @@ impl ReceiverService {
 
     fn reconfigure_pipeline(&self) -> Result<(), String> {
         let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
+        let device = self
+            .device
+            .lock()
+            .map_err(|_| "device lock poisoned")?
+            .clone();
         let mut events = self
             .auto_events
             .lock()
             .map_err(|_| "Auto event lock poisoned")?;
-        events.reconfigure(&routed_auto_settings(&settings));
+        events.reconfigure(&routed_auto_settings(&settings, &device));
         let revision = events.revision;
         drop(events);
         let mut config = self.pipeline_config(&settings)?;
@@ -911,7 +921,7 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "device_status" => {
-                let device = parse_device_status(&command)?;
+                let mut device = parse_device_status(&command)?;
                 let settings = self
                     .settings
                     .lock()
@@ -928,8 +938,13 @@ impl ReceiverService {
                         .map_err(|_| "Capture lock poisoned")?
                         .invalidate();
                 }
-                let previous_auto = auto_trigger_active(&settings.auto, &previous);
-                let next_auto = auto_trigger_active(&settings.auto, &device);
+                let previous_owner = trigger_owner(&settings, &previous);
+                let next_owner = next_trigger_owner(&settings, previous_owner, &device);
+                device[TriggerOwner::KEY] = json!(next_owner.name());
+                device[MOTION_TOGGLED_KEY] =
+                    json!(next_motion_toggled(&settings, &previous, &device));
+                let previous_auto = previous_owner == TriggerOwner::Auto;
+                let next_auto = next_owner == TriggerOwner::Auto;
                 let previous_motion = motion_target_active(&settings, &previous);
                 let next_motion = motion_target_active(&settings, &device);
                 let middle_pressed =
@@ -940,9 +955,10 @@ impl ReceiverService {
                 }
                 if previous_auto != next_auto {
                     self.reconfigure()?;
-                } else if previous_motion != next_motion && !next_auto {
+                } else if previous_owner != next_owner || previous_motion != next_motion {
                     // Advance the shared routing revision so queued Motion
-                    // deltas from before the physical trigger edge are dropped.
+                    // deltas from before the physical trigger edge are dropped,
+                    // and publish Auto disabled while a Motion hold owns routing.
                     self.reconfigure_pipeline()?;
                 }
                 Ok(json!({"event":"ack","type":kind}))
@@ -1139,6 +1155,9 @@ impl ReceiverService {
                 }
                 if let Some(enabled) = command.get("motion_always_on").and_then(Value::as_bool) {
                     settings.motion_always_on = enabled;
+                }
+                if let Some(enabled) = command.get("motion_toggle").and_then(Value::as_bool) {
+                    settings.motion_toggle = enabled;
                 }
                 drop(settings);
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
@@ -1989,20 +2008,21 @@ fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(published_ns) < 1_000_000_000
 }
 
-/// What the movement ticker runs with. A held Auto trigger owns routing
-/// and turns Motion off.
+/// What the movement ticker runs with. While Auto owns the triggers Motion
+/// is off, Always-on included.
 fn movement_runtime(
     settings: &AppSettings,
     device: &Value,
     renderer_profile: Option<Arc<crate::movement::abcurves::Profile>>,
     config_revision: u64,
 ) -> MovementRuntimeSettings {
-    let auto_active = effective_detection_settings(settings, device).2;
+    let auto_active = trigger_owner(settings, device) == TriggerOwner::Auto;
     MovementRuntimeSettings {
         renderer_profile,
         config_revision,
         motion_enabled: settings.motion_enabled && !auto_active,
-        motion_always_on: settings.motion_always_on,
+        motion_always_on: motion_latched(settings, device),
+        motion_toggle: settings.motion_toggle,
         trigger_held: trigger_held(device, &settings.trigger_button),
         sens: settings.sens,
         offset_x: settings.offset_x,
@@ -2016,26 +2036,103 @@ fn movement_runtime(
     }
 }
 
-fn auto_trigger_active(auto: &crate::config::AutoSettings, device: &Value) -> bool {
-    auto.enabled && trigger_held(device, &auto.trigger_button)
+/// Which feature's held trigger owns routing (user request, 2026-10-25):
+/// while the Motion trigger is held every Auto command is cut, and while the
+/// Auto trigger is held Motion (Always-on included) is cut. With both held the
+/// one pressed first keeps it; pressed together (or the same button), Auto.
+/// With neither held Motion runs only through Always-on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TriggerOwner {
+    #[default]
+    None,
+    Motion,
+    Auto,
+}
+
+impl TriggerOwner {
+    const KEY: &'static str = "trigger_owner";
+
+    /// The owner stored with the device status by the previous update.
+    fn stored(device: &Value) -> Self {
+        match device[Self::KEY].as_str() {
+            Some("motion") => Self::Motion,
+            Some("auto") => Self::Auto,
+            _ => Self::None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Motion => "motion",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+fn next_trigger_owner(
+    settings: &AppSettings,
+    previous: TriggerOwner,
+    device: &Value,
+) -> TriggerOwner {
+    // In toggle mode the Motion button is a switch, not a hold.
+    let motion = settings.motion_enabled
+        && !settings.motion_toggle
+        && trigger_held(device, &settings.trigger_button);
+    let auto = settings.auto.enabled && trigger_held(device, &settings.auto.trigger_button);
+    match (motion, auto) {
+        (true, true) if previous == TriggerOwner::Motion => TriggerOwner::Motion,
+        (_, true) => TriggerOwner::Auto,
+        (true, false) => TriggerOwner::Motion,
+        (false, false) => TriggerOwner::None,
+    }
+}
+
+/// Current owner; also correct after a settings change during a hold.
+fn trigger_owner(settings: &AppSettings, device: &Value) -> TriggerOwner {
+    next_trigger_owner(settings, TriggerOwner::stored(device), device)
 }
 
 fn motion_target_active(settings: &AppSettings, device: &Value) -> bool {
     settings.motion_enabled
-        && (settings.motion_always_on || trigger_held(device, &settings.trigger_button))
+        && match trigger_owner(settings, device) {
+            TriggerOwner::Motion => true,
+            TriggerOwner::Auto => false,
+            TriggerOwner::None => motion_latched(settings, device),
+        }
 }
 
-// Always-on owns routing and must also cancel a delayed Auto click without
-// waiting for another video frame. Target loss alone does not cancel that delay.
-fn routed_auto_settings(settings: &AppSettings) -> AutoSettings {
+/// Toggle mode (user request, 2026-10-25): each press of the Motion trigger
+/// button turns Motion on or off. The state is kept with the device status;
+/// it is off after a disconnect and while Motion or toggle mode is off.
+const MOTION_TOGGLED_KEY: &str = "motion_toggled";
+
+fn motion_toggled(settings: &AppSettings, device: &Value) -> bool {
+    settings.motion_enabled && settings.motion_toggle && device[MOTION_TOGGLED_KEY] == true
+}
+
+fn next_motion_toggled(settings: &AppSettings, previous: &Value, device: &Value) -> bool {
+    let pressed = !trigger_held(previous, &settings.trigger_button)
+        && trigger_held(device, &settings.trigger_button);
+    let flip = settings.motion_enabled && settings.motion_toggle && pressed;
+    device["state"] == "connected" && (motion_toggled(settings, previous) != flip)
+}
+
+/// Motion runs without a held trigger: Always-on, or toggled on.
+fn motion_latched(settings: &AppSettings, device: &Value) -> bool {
+    settings.motion_always_on || motion_toggled(settings, device)
+}
+
+// A held Motion trigger publishes Auto disabled so the host cancels a delayed
+// click and the cooldown at once, without waiting for another video frame.
+fn routed_auto_settings(settings: &AppSettings, device: &Value) -> AutoSettings {
     let mut auto = settings.auto.clone();
-    auto.enabled &= !settings.motion_always_on;
+    auto.enabled &= trigger_owner(settings, device) != TriggerOwner::Motion;
     auto
 }
 
 fn effective_detection_settings(settings: &AppSettings, device: &Value) -> (u16, String, bool) {
-    let auto_active = !settings.motion_always_on && auto_trigger_active(&settings.auto, device);
-    if auto_active {
+    if trigger_owner(settings, device) == TriggerOwner::Auto {
         (
             settings.auto.fov_degrees,
             settings.pixel_color.clone(),
@@ -2494,23 +2591,175 @@ mod tests {
     }
 
     #[test]
-    fn always_on_publishes_auto_disabled_without_waiting_for_video() {
+    fn a_held_motion_trigger_publishes_auto_disabled_without_waiting_for_video() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&output);
         let mut settings = AppSettings::default();
         settings.auto.enabled = true;
+        settings.auto.trigger_button = "m4".into();
+        settings.motion_enabled = true;
+        settings.motion_always_on = true;
         let mut events = AutoEvents {
             settings: settings.auto.clone(),
             revision: 0,
             emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
         };
-        settings.motion_always_on = true;
-        events.reconfigure(&routed_auto_settings(&settings));
+        let released = json!({"state":"connected","buttons":[false,false,false,false,false]});
+        assert!(
+            routed_auto_settings(&settings, &released).enabled,
+            "Always-on no longer disables Auto"
+        );
+        let motion_held = json!({"state":"connected","buttons":[false,true,false,false,false]});
+        events.reconfigure(&routed_auto_settings(&settings, &motion_held));
         let output = output.lock().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["event"], "auto_config");
         assert_eq!(output[0]["enabled"], false);
         assert_eq!(output[0]["timestamp_ms"], 0);
+    }
+
+    #[test]
+    fn the_trigger_pressed_first_owns_routing_until_released() {
+        use super::{next_trigger_owner, TriggerOwner};
+        let mut settings = AppSettings::default();
+        settings.motion_enabled = true;
+        settings.auto.enabled = true;
+        settings.auto.trigger_button = "m4".into();
+        let buttons = |motion: bool, auto: bool| json!({"state":"connected","buttons":[false,motion,false,auto,false]});
+        let mut owner = TriggerOwner::None;
+        for (motion, auto, expected) in [
+            (true, false, TriggerOwner::Motion),
+            (true, true, TriggerOwner::Motion), // Auto pressed while Motion held
+            (false, true, TriggerOwner::Auto),  // Motion released
+            (true, true, TriggerOwner::Auto),   // Motion pressed while Auto held
+            (true, false, TriggerOwner::Motion),
+            (false, false, TriggerOwner::None),
+            (true, true, TriggerOwner::Auto), // pressed together
+        ] {
+            owner = next_trigger_owner(&settings, owner, &buttons(motion, auto));
+            assert_eq!(owner, expected, "motion={motion} auto={auto}");
+        }
+        // The same button for both features: Auto owns it.
+        settings.auto.trigger_button = "right".into();
+        assert_eq!(
+            next_trigger_owner(&settings, TriggerOwner::None, &buttons(true, false)),
+            TriggerOwner::Auto
+        );
+        // A disabled feature never owns its held trigger.
+        settings.auto.enabled = false;
+        assert_eq!(
+            next_trigger_owner(&settings, TriggerOwner::None, &buttons(true, false)),
+            TriggerOwner::Motion
+        );
+    }
+
+    #[test]
+    fn toggle_mode_switches_motion_on_each_press_of_its_trigger() {
+        let (service, data_dir) = test_service("motion-toggle");
+        let guard = ServiceGuard(Arc::clone(&service));
+        {
+            let mut settings = service.settings.lock().unwrap();
+            settings.motion_enabled = true;
+            settings.motion_toggle = true;
+            settings.auto.enabled = true;
+            settings.auto.trigger_button = "m4".into();
+        }
+        let status = |state: &str, motion: bool, auto: bool| {
+            json!({"version":1,"type":"device_status","state":state,"name":"test",
+                "buttons":[false,motion,false,auto,false]})
+        };
+        let runtime = || {
+            let settings = service.settings.lock().unwrap().clone();
+            let device = service.device.lock().unwrap().clone();
+            let runtime = super::movement_runtime(&settings, &device, None, 0);
+            (
+                runtime.motion_enabled && runtime.motion_always_on,
+                runtime.motion_toggle,
+                super::effective_detection_settings(&settings, &device).2,
+            )
+        };
+
+        service.dispatch(status("connected", false, false)).unwrap();
+        assert_eq!(runtime(), (false, true, false));
+        service.dispatch(status("connected", true, false)).unwrap();
+        assert_eq!(runtime(), (true, true, false), "a press turns Motion on");
+        service.dispatch(status("connected", false, false)).unwrap();
+        assert_eq!(
+            runtime(),
+            (true, true, false),
+            "and it stays on after release"
+        );
+        service.dispatch(status("connected", false, true)).unwrap();
+        assert_eq!(
+            runtime(),
+            (false, true, true),
+            "an Auto hold still cuts Motion"
+        );
+        service.dispatch(status("connected", false, false)).unwrap();
+        assert_eq!(runtime(), (true, true, false), "toggled Motion resumes");
+        service.dispatch(status("connected", true, false)).unwrap();
+        service.dispatch(status("connected", false, false)).unwrap();
+        assert_eq!(
+            runtime(),
+            (false, true, false),
+            "a second press turns it off"
+        );
+        service.dispatch(status("connected", true, false)).unwrap();
+        service.dispatch(status("missing", false, false)).unwrap();
+        service.dispatch(status("connected", false, false)).unwrap();
+        assert_eq!(runtime(), (false, true, false), "a disconnect turns it off");
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn device_status_routes_auto_and_motion_by_the_held_trigger() {
+        let (service, data_dir) = test_service("trigger-owner-routing");
+        let guard = ServiceGuard(Arc::clone(&service));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        service.auto_events.lock().unwrap().emit = Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+        {
+            let mut settings = service.settings.lock().unwrap();
+            settings.motion_enabled = true;
+            settings.motion_always_on = true;
+            settings.auto.enabled = true;
+            settings.auto.trigger_button = "m4".into();
+        }
+        let status = |motion: bool, auto: bool| {
+            json!({"version":1,"type":"device_status","state":"connected","name":"test",
+                "buttons":[false,motion,false,auto,false]})
+        };
+        let last_enabled = || events.lock().unwrap().last().unwrap()["enabled"].clone();
+        let runtime = || {
+            let settings = service.settings.lock().unwrap().clone();
+            let device = service.device.lock().unwrap().clone();
+            (
+                super::movement_runtime(&settings, &device, None, 0).motion_enabled,
+                super::effective_detection_settings(&settings, &device).2,
+            )
+        };
+
+        service.dispatch(status(true, false)).unwrap();
+        assert_eq!(last_enabled(), false, "a Motion hold cuts Auto");
+        service.dispatch(status(true, true)).unwrap();
+        assert_eq!(runtime(), (true, false), "Motion keeps the hold it started");
+        service.dispatch(status(false, true)).unwrap();
+        assert_eq!(last_enabled(), true);
+        assert_eq!(
+            runtime(),
+            (false, true),
+            "an Auto hold cuts Always-on Motion"
+        );
+        service.dispatch(status(false, false)).unwrap();
+        assert_eq!(runtime(), (true, false), "Always-on resumes after the hold");
+        assert_eq!(last_enabled(), true);
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
@@ -2942,11 +3191,11 @@ mod tests {
             super::effective_detection_settings(&settings, &held),
             (88, "yellow".into(), true)
         );
-        // Preserve the established Always-on priority when triggers overlap.
+        // A held Auto trigger owns routing even with Motion Always-on.
         settings.motion_always_on = true;
         assert_eq!(
             super::effective_detection_settings(&settings, &held),
-            (42, "yellow".into(), false)
+            (88, "yellow".into(), true)
         );
     }
 
@@ -3212,8 +3461,8 @@ mod tests {
         settings.motion_always_on = true;
         let config = service.pipeline_config(&settings).unwrap();
         assert!(
-            !config.auto_target_active,
-            "Always-on retains routing priority"
+            config.auto_target_active,
+            "Always-on no longer blocks a held Auto trigger"
         );
         assert_eq!((config.fov_degrees, config.auto_fov_degrees), (36, 72));
 

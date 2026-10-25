@@ -174,8 +174,19 @@ camelCase aliases and rejects missing required movement fields. Recoil/config
 remain camelCase. The wire regression serializes the actual backend MovementEvent
 and feeds the actual host parser, pending queue and trigger/Always-on gates.
 
-Motion Always-on retains priority over Auto. Otherwise an enabled, held Auto
-trigger owns Pixel Seek processing: only the shared color mask feeds center
+Trigger ownership (user request, 2026-10-25, replacing the earlier Always-on
+priority): Always-on no longer disables Auto. While the Motion trigger is held
+every Auto command is cut (the backend publishes Auto disabled, cancelling a
+pending click and the cooldown); while the Auto trigger is held Motion, Always-on
+included, is cut. With both held the trigger pressed first keeps ownership;
+pressed together or the same button, Auto (`TriggerOwner` in `service.rs`). Motion
+Toggle (persisted `motionToggle`, per profile; user request, 2026-10-25): each
+press of the Motion trigger button turns Motion on or off instead of holding it;
+toggled on behaves like Always-on (an Auto hold still cuts it) and in this mode
+the Motion button does not own routing. The toggled state lives with the device
+status in the backend and is off after a disconnect or while Motion or Toggle is
+off; movement events carry `motion_toggle` so the host ignores the held button. An
+Auto-owned hold runs Pixel Seek processing: only the shared color mask feeds center
 validity; no Motion target, smoothed coordinates or reticle are published. The
 movement ticker independently gates Motion while Auto owns routing. Each frame
 carries Auto active intent and its selected FOV, so the native circle/reticle do
@@ -188,7 +199,7 @@ Follow-up source review also fixed the base commit's incomplete MovementEvent
 unit-test helper. A shared control revision now rejects callbacks, samples and
 queued deltas across routing changes; both batching stages avoid summing across
 revisions. The host checks the current control revision and physical Auto trigger
-before allowing Motion. Always-on publishes Auto disabled immediately, cancelling
+before allowing Motion. A Motion hold publishes Auto disabled immediately, cancelling
 pending delayed Auto clicks even without another frame.
 
 Local Linux x86_64 validation with Rust 1.99.1: backend 97 unit tests passed

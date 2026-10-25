@@ -25,7 +25,8 @@ pub(crate) struct AutoTargetEvent {
 impl AutoTargetEvent {
     pub(crate) fn blocks_motion(&self, trigger_held: bool) -> bool {
         // Routing follows the held feature, not a center hit or sample freshness.
-        // The backend publishes enabled=false while Motion Always-on has priority.
+        // The backend publishes enabled=false while a held Motion trigger owns
+        // routing, which also cancels a pending click and the cooldown.
         self.enabled && trigger_held
     }
 

@@ -80,7 +80,7 @@ This utility verifies the frame protocol; the production sender is the OBS plugi
 - The target of 180–360+ processing FPS is a requirement to benchmark, not a performance claim.
 - Device I/O uses the official `medius 3.4.6` Rust SDK for the handshake, health checks, input subscription, and output. SysX enumerates Windows serial ports with the same CH343 VID/PID as the SDK, preserving scan errors separately from an empty device list, then tries each matching control port until its health reports `link_up`, `mouse_attached`, and `clone_configured`. It retries discovery every 500 ms when no matching control port is listed and records connection failures and state changes in the host log. The adapter in `src-tauri/src/medius_device.rs` calls `move_rel` and `press/release(Button::LEFT)`; queue records are internal work items, not Native wire frames. Ferrum and MAKCU integrations are removed. Windows/device validation remains pending.
 - API implementation notes: [MediusAPI.md](MediusAPI.md). It summarizes SysX device connection, button telemetry, and relative-movement paths and index the broader vendor API families; consult the linked vendor pages for exact signatures and version support.
-- Device output uses the verified Medius SDK connection, fresh-delta aggregation, 100 ms stale-target cutoff and ±32 per-axis clamp. Motion uses the held-trigger gate unless Always on is enabled; Always on suppresses Auto without erasing its saved configuration. Auto Delay/Cooldown/Sleep remain configured milliseconds. See [MediusAPI.md](MediusAPI.md); library call completion does not acknowledge a USB/game event.
+- Device output uses the verified Medius SDK connection, fresh-delta aggregation, 100 ms stale-target cutoff and ±32 per-axis clamp. Motion uses the held-trigger gate unless Always on is enabled; with Toggle on, each press of the trigger turns Motion on or off. A held Motion trigger cuts every Auto command and a held Auto trigger cuts Motion (Always on included); with both held, the one pressed first keeps control. Auto Delay/Cooldown/Sleep remain configured milliseconds. See [MediusAPI.md](MediusAPI.md); library call completion does not acknowledge a USB/game event.
 - Movement settings persist the recoil profile. Recoil starts only while a fresh, valid Motion target exists and the physical left mouse button is held; it starts after its configured delay and advances by the configured time per level. It does not require the configured Motion trigger, but it never moves without a valid target. Reconstructed active-state and timed-click branches remain out of the product because their source producers are unavailable. Auto's separate target-valid state machine uses its persisted Delay, Cooldown, and Sleep values and sends a left-click through the verified device path when its trigger is held.
 - The historical synthetic benchmark figures above predate the Rust migration. There is no current Rust end-to-end benchmark result.
 
@@ -100,7 +100,7 @@ Release security is documented in [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECU
 
 The [continuity report](docs/SECURITY_CONTINUITY_REPORT.md) records a Linux synthetic release A/B test near 240 FPS with and without the file-integrity worker, including CPU/startup cost and the remaining Windows, physical-device and VMProtect limits. It is not a game/hardware benchmark or proof of zero overhead.
 
-The Rust backend keeps UDP packet reassembly in `rust-backend/src/udp.rs`, decoded input in `receiver.rs`, and crop geometry in `crop.rs`. Native Settings are read and applied through the authenticated host connection; the backend exposes no web-config HTTP endpoint. The movement ticker and native host aggregate fresh deltas and discard targets older than 100 ms. Motion normally requires the configured physical trigger; Motion's **Always on** option bypasses that held-button gate while retaining the fresh-target and enabled-motion checks. Auto is unavailable while Always on is enabled, but its saved settings are preserved. The native host adds sampled recoil and clamps each axis to ±32. Only Medius receives output: internal queue records are retained until a worker invokes `medius_device.rs` through the official Rust SDK on a cloned `Device`. SDK I/O timeouts apply, and library call completion does not acknowledge a game event. Windows/device validation remains pending.
+The Rust backend keeps UDP packet reassembly in `rust-backend/src/udp.rs`, decoded input in `receiver.rs`, and crop geometry in `crop.rs`. Native Settings are read and applied through the authenticated host connection; the backend exposes no web-config HTTP endpoint. The movement ticker and native host aggregate fresh deltas and discard targets older than 100 ms. Motion normally requires the configured physical trigger; Motion's **Always on** option bypasses that held-button gate while retaining the fresh-target and enabled-motion checks. Always on does not disable Auto: holding the Auto trigger pauses Motion, and holding the Motion trigger cancels Auto. The native host adds sampled recoil and clamps each axis to ±32. Only Medius receives output: internal queue records are retained until a worker invokes `medius_device.rs` through the official Rust SDK on a cloned `Device`. SDK I/O timeouts apply, and library call completion does not acknowledge a game event. Windows/device validation remains pending.
 
 The LAN sender DLL is built separately from the receiver. By default it finds SysX on the same subnet by itself (UDP broadcast discovery), so one DLL works on every machine; it can still be built for a fixed receiver address.
 
@@ -132,8 +132,19 @@ camelCase aliases and rejects missing required movement fields. Recoil/config
 remain camelCase. The wire regression serializes the actual backend MovementEvent
 and feeds the actual host parser, pending queue and trigger/Always-on gates.
 
-Motion Always-on retains priority over Auto. Otherwise an enabled, held Auto
-trigger owns Pixel Seek processing: only the shared color mask feeds center
+Trigger ownership (user request, 2026-10-25, replacing the earlier Always-on
+priority): Always-on no longer disables Auto. While the Motion trigger is held
+every Auto command is cut (the backend publishes Auto disabled, cancelling a
+pending click and the cooldown); while the Auto trigger is held Motion, Always-on
+included, is cut. With both held the trigger pressed first keeps ownership;
+pressed together or the same button, Auto (`TriggerOwner` in `service.rs`). Motion
+Toggle (persisted `motionToggle`, per profile; user request, 2026-10-25): each
+press of the Motion trigger button turns Motion on or off instead of holding it;
+toggled on behaves like Always-on (an Auto hold still cuts it) and in this mode
+the Motion button does not own routing. The toggled state lives with the device
+status in the backend and is off after a disconnect or while Motion or Toggle is
+off; movement events carry `motion_toggle` so the host ignores the held button. An
+Auto-owned hold runs Pixel Seek processing: only the shared color mask feeds center
 validity; no Motion target, smoothed coordinates or reticle are published. The
 movement ticker independently gates Motion while Auto owns routing. Each frame
 carries Auto active intent and its selected FOV, so the native circle/reticle do
@@ -146,7 +157,7 @@ Follow-up source review also fixed the base commit's incomplete MovementEvent
 unit-test helper. A shared control revision now rejects callbacks, samples and
 queued deltas across routing changes; both batching stages avoid summing across
 revisions. The host checks the current control revision and physical Auto trigger
-before allowing Motion. Always-on publishes Auto disabled immediately, cancelling
+before allowing Motion. A Motion hold publishes Auto disabled immediately, cancelling
 pending delayed Auto clicks even without another frame.
 
 Local Linux x86_64 validation with Rust 1.99.1: backend 97 unit tests passed

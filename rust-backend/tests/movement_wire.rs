@@ -25,6 +25,7 @@ fn backend_wire_reaches_the_host_for_held_trigger_and_always_on() {
             dy: -7,
             motion_enabled: true,
             motion_always_on: always_on,
+            motion_toggle: false,
             trigger_button: "right".into(),
             timestamp_ms,
             recoil: RecoilSettings {
@@ -94,6 +95,7 @@ fn host_pending_queue_keeps_only_the_current_revision() {
             dy: 0,
             motion_enabled: true,
             motion_always_on: false,
+            motion_toggle: false,
             trigger_button: "right".into(),
             timestamp_ms: now,
             recoil: RecoilSettings::default(),
