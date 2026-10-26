@@ -1479,14 +1479,19 @@ fn overlay_svg(
             color.to_owned()
         };
         let (x, y, w, h) = (b.x, b.y, b.width, b.height);
-        let c = (w.min(h) * 0.22).clamp(7., 16.);
-        let _ = write!(
-            svg,
-            r##"<g fill="none" stroke-linejoin="round"><rect x="{x}" y="{y}" width="{w}" height="{h}" stroke="#05090a" stroke-opacity=".88" stroke-width="4"/><rect x="{x}" y="{y}" width="{w}" height="{h}" stroke="{stroke}" stroke-width="1.5"/><path transform="translate({x},{y})" d="M0 {c}V0H{c} M{} 0H{w}V{c} M{w} {}V{h}H{} M{c} {h}H0V{}" stroke="{stroke}" stroke-width="3"/></g>"##,
+        // Corners only, no full outline (user request, 2026-10-26); a dark
+        // underlay keeps them readable on bright frames.
+        let c = (w.min(h) * 0.22).clamp(7., 16.).min(w / 2.).min(h / 2.);
+        let corners = format!(
+            "M0 {c}V0H{c} M{} 0H{w}V{c} M{w} {}V{h}H{} M{c} {h}H0V{}",
             w - c,
             h - c,
             w - c,
             h - c
+        );
+        let _ = write!(
+            svg,
+            r##"<g fill="none" stroke-linejoin="round" transform="translate({x},{y})"><path d="{corners}" stroke="#05090a" stroke-opacity=".88" stroke-width="5"/><path d="{corners}" stroke="{stroke}" stroke-width="3"/></g>"##
         );
     }
     svg.push_str("</svg>");
@@ -2418,7 +2423,7 @@ mod overlay_routing_tests {
             height: 640.,
         };
         let svg = super::overlay_svg(&meta, rect, 640., "red");
-        assert!(!svg.contains("<rect"), "no box: {svg}");
+        assert!(!svg.contains("<path"), "no box: {svg}");
         // The ring sits on the targeted pixel, not the smoothed point, in a
         // small layer covering only the line and ring.
         let layer = super::target_layer(&meta, rect, "red").unwrap();
@@ -2434,7 +2439,12 @@ mod overlay_routing_tests {
             layer.svg
         );
         meta.mode = "object_detection".into();
-        assert!(super::overlay_svg(&meta, rect, 640., "red").contains("<rect"));
+        let boxes = super::overlay_svg(&meta, rect, 640., "red");
+        assert!(boxes.contains("<path"), "{boxes}");
+        assert!(
+            !boxes.contains("<rect"),
+            "corners only, no outline: {boxes}"
+        );
         // Object Detection rings the same Motion target, not the smoothed point.
         let layer = super::target_layer(&meta, rect, "red").unwrap();
         assert!(layer.svg.contains("cx=\"480\" cy=\"280\""), "{}", layer.svg);
