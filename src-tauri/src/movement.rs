@@ -10,6 +10,8 @@ const TARGET_FRESHNESS_MS: u64 = 100;
 #[serde(default, rename_all = "camelCase")]
 pub struct RecoilSettings {
     pub recoil_enabled: bool,
+    /// "vandal", "phantom" or "custom" (`recoil_levels`).
+    pub recoil_pattern: String,
     pub recoil_levels: Vec<i32>,
     pub recoil_start_delay_ms: u32,
     pub recoil_level_duration_ms: u32,
@@ -89,15 +91,6 @@ pub fn set_target(state: &MovementState, value: &serde_json::Value) {
 pub fn take_target(state: &MovementState) -> Option<MovementTarget> {
     let target = state.pending.lock().ok()?.take()?;
     target.is_fresh().then_some(target)
-}
-
-pub fn has_fresh_target(state: &MovementState) -> bool {
-    state
-        .latest_target
-        .lock()
-        .ok()
-        .and_then(|target| target.clone())
-        .is_some_and(|target| target.target_valid && target.is_fresh())
 }
 
 pub fn recoil_settings(state: &MovementState) -> RecoilSettings {
@@ -216,49 +209,78 @@ impl MovementTarget {
     }
 }
 
+/// Vertical pull per bullet at 100 %, in device counts (user's `recoil.rs`).
+const VANDAL_PATTERN: [f64; 25] = [
+    0.0, 4.0, 7.5, 11.0, 14.2, 16.8, 18.5, 19.8, 20.5, 20.8, 21.0, 21.2, 21.2, 21.0, 20.8, 20.5,
+    20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5,
+];
+const PHANTOM_PATTERN: [f64; 25] = [
+    0.0, 3.2, 6.0, 8.8, 11.5, 13.6, 15.0, 16.2, 16.8, 17.2, 17.4, 17.5, 17.5, 17.4, 17.2, 17.0,
+    17.0, 17.0, 17.0, 17.0, 17.0, 17.0, 17.0, 17.0, 17.0,
+];
+
+impl RecoilSettings {
+    fn pattern_value(&self, bullet: usize) -> Option<f64> {
+        let at = |pattern: &[f64]| pattern.get(bullet).or(pattern.last()).copied();
+        match self.recoil_pattern.as_str() {
+            "custom" => {
+                let levels: Vec<f64> = self.recoil_levels.iter().map(|v| f64::from(*v)).collect();
+                at(&levels)
+            }
+            "phantom" => at(&PHANTOM_PATTERN),
+            _ => at(&VANDAL_PATTERN),
+        }
+    }
+}
+
+/// Recoil timeline (user's `recoil.rs`): a burst starts when firing starts;
+/// after the start delay, each bullet (one per time-per-bullet) adds its
+/// pattern pull once, scaled by the strength. Fractions carry over.
 #[derive(Default)]
 pub struct VerticalAdjustmentClock {
     started_at: Option<Instant>,
+    last_bullet: Option<u128>,
+    residual: f64,
 }
 
 impl VerticalAdjustmentClock {
     pub fn reset(&mut self) {
-        self.started_at = None;
+        *self = Self::default();
     }
 
-    pub fn sample(
-        &mut self,
-        left_button_held: bool,
-        settings: &RecoilSettings,
-        now: Instant,
-    ) -> i64 {
-        if !left_button_held || !settings.recoil_enabled || settings.recoil_levels.is_empty() {
+    /// Device counts to pull down now (0 between bullets).
+    pub fn sample(&mut self, firing: bool, settings: &RecoilSettings, now: Instant) -> i64 {
+        if !firing || !settings.recoil_enabled {
             self.reset();
             return 0;
         }
-
         let started_at = *self.started_at.get_or_insert(now);
         let elapsed_ms = now.saturating_duration_since(started_at).as_millis();
         let delay_ms = u128::from(settings.recoil_start_delay_ms);
         if elapsed_ms < delay_ms {
             return 0;
         }
-
-        let level_duration_ms = u128::from(settings.recoil_level_duration_ms.max(1));
-        let level_index = ((elapsed_ms - delay_ms) / level_duration_ms)
-            .min((settings.recoil_levels.len() - 1) as u128) as usize;
-        i64::from(settings.recoil_levels[level_index])
-            .saturating_mul(i64::from(settings.recoil_percentage))
-            / 100
+        let bullet = (elapsed_ms - delay_ms) / u128::from(settings.recoil_level_duration_ms.max(1));
+        if self.last_bullet == Some(bullet) {
+            return 0;
+        }
+        self.last_bullet = Some(bullet);
+        let Some(value) = settings.pattern_value(bullet.min(usize::MAX as u128) as usize) else {
+            return 0;
+        };
+        let wanted = value * f64::from(settings.recoil_percentage) / 100.0 + self.residual;
+        let out = wanted.round();
+        self.residual = wanted - out;
+        out as i64
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        has_fresh_target, recoil_move, recoil_settings, restore_remainder, set_target,
-        should_apply_target, trigger_button_index, MovementState, MovementTarget, RecoilSettings,
-        VerticalAdjustmentClock, TARGET_FRESHNESS_MS,
+        recoil_move, recoil_settings, restore_remainder, set_target, should_apply_target,
+        trigger_button_index, MovementState, MovementTarget, RecoilSettings,
+        VerticalAdjustmentClock,
     };
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -336,25 +358,25 @@ mod tests {
     }
 
     #[test]
-    fn recoil_is_sampled_by_elapsed_time_and_added_before_clamping() {
+    fn recoil_pulls_once_per_bullet_after_the_start_delay() {
         let start = Instant::now();
         let settings = RecoilSettings {
             recoil_enabled: true,
+            recoil_pattern: "custom".into(),
             recoil_levels: vec![10, 20],
             recoil_start_delay_ms: 100,
             recoil_level_duration_ms: 50,
             recoil_percentage: 50,
         };
         let mut clock = VerticalAdjustmentClock::default();
-        assert_eq!(clock.sample(true, &settings, start), 0);
-        assert_eq!(
-            clock.sample(true, &settings, start + Duration::from_millis(100)),
-            5
-        );
-        assert_eq!(
-            clock.sample(true, &settings, start + Duration::from_millis(150)),
-            10
-        );
+        let at = |clock: &mut VerticalAdjustmentClock, ms| {
+            clock.sample(true, &settings, start + Duration::from_millis(ms))
+        };
+        assert_eq!(at(&mut clock, 0), 0, "start delay");
+        assert_eq!(at(&mut clock, 100), 5, "first bullet");
+        assert_eq!(at(&mut clock, 120), 0, "once per bullet");
+        assert_eq!(at(&mut clock, 150), 10);
+        assert_eq!(at(&mut clock, 200), 10, "the last value repeats");
 
         let target = MovementTarget {
             target_valid: true,
@@ -366,28 +388,34 @@ mod tests {
     }
 
     #[test]
-    fn recoil_clock_resets_when_the_left_button_is_released() {
+    fn recoil_presets_scale_by_strength_and_reset_on_release() {
         let start = Instant::now();
         let settings = RecoilSettings {
             recoil_enabled: true,
-            recoil_levels: vec![10, 20],
-            recoil_level_duration_ms: 50,
-            recoil_percentage: 100,
+            recoil_pattern: "vandal".into(),
+            recoil_level_duration_ms: 100,
+            recoil_percentage: 50,
             ..RecoilSettings::default()
         };
         let mut clock = VerticalAdjustmentClock::default();
-        assert_eq!(clock.sample(true, &settings, start), 10);
+        let total: i64 = (0..=4)
+            .map(|bullet| {
+                clock.sample(true, &settings, start + Duration::from_millis(bullet * 100))
+            })
+            .sum();
+        // (0 + 4 + 7.5 + 11 + 14.2) / 2 = 18.35
+        assert_eq!(total, 18);
         assert_eq!(
-            clock.sample(true, &settings, start + Duration::from_millis(60)),
-            20
-        );
-        assert_eq!(
-            clock.sample(false, &settings, start + Duration::from_millis(61)),
+            clock.sample(false, &settings, start + Duration::from_millis(450)),
             0
         );
         assert_eq!(
-            clock.sample(true, &settings, start + Duration::from_millis(62)),
-            10
+            clock.sample(true, &settings, start + Duration::from_millis(460)),
+            0
+        );
+        assert_eq!(
+            clock.sample(true, &settings, start + Duration::from_millis(560)),
+            2
         );
     }
 
@@ -396,37 +424,6 @@ mod tests {
         assert_eq!(recoil_move(12), (0, 12));
         assert_eq!(recoil_move(100), (0, 32));
         assert_eq!(recoil_move(-100), (0, -32));
-    }
-
-    #[test]
-    fn recoil_requires_a_fresh_valid_motion_target() {
-        let state = MovementState::default();
-        assert!(!has_fresh_target(&state));
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let target = |timestamp_ms, target_valid| {
-            serde_json::json!({
-                "target_valid": target_valid,
-                "dx": 0,
-                "dy": 0,
-                "motion_enabled": true,
-                "motion_always_on": false,
-                "trigger_button": "right",
-                "timestamp_ms": timestamp_ms,
-                "recoil": {}
-            })
-        };
-        set_target(&state, &target(now_ms, true));
-        assert!(has_fresh_target(&state));
-        set_target(&state, &target(now_ms, false));
-        assert!(!has_fresh_target(&state));
-        set_target(
-            &state,
-            &target(now_ms.saturating_sub(TARGET_FRESHNESS_MS + 1), true),
-        );
-        assert!(!has_fresh_target(&state));
     }
 
     #[test]

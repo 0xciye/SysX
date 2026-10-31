@@ -1,6 +1,6 @@
 use crate::config::{
-    load_settings, save_settings, AppSettings, AutoSettings, ModelArtifacts, ModelDefinition,
-    ModelRegistry, RecoilSettings,
+    load_settings, save_settings, AppSettings, AutoSettings, ModelDefinition, ModelRegistry,
+    RecoilSettings,
 };
 use crate::decode_pool::DecodePool;
 use crate::movement::{
@@ -184,6 +184,8 @@ pub struct ReceiverService {
     settings: Arc<Mutex<AppSettings>>,
     settings_path: PathBuf,
     registry: Arc<Mutex<ModelRegistry>>,
+    /// Built-in models by name, with their FP16/INT8 variants.
+    builtin: Mutex<Vec<crate::builtin_models::BuiltinModel>>,
     pipeline: Arc<LatestFramePipeline>,
     movement_batcher: Arc<MovementBatcher>,
     movement_ticker: Arc<MovementTicker>,
@@ -207,6 +209,10 @@ pub struct ReceiverService {
     /// frame so each preview socket forwards every input frame.
     preview_rx: tokio::sync::watch::Receiver<u64>,
     source_view: Mutex<SourceView>,
+    /// The request last handed to the UDP source; compared before locking the
+    /// source, which the receiver thread holds during its blocking reads.
+    /// Crop last sent to the plugin with SYSCFG.
+    frame_request: Mutex<u32>,
 }
 
 impl ReceiverService {
@@ -237,11 +243,13 @@ impl ReceiverService {
         let registry = Arc::new(Mutex::new(
             ModelRegistry::load(data_dir.join("models.yaml")).map_err(|error| error.to_string())?,
         ));
-        {
+        let builtin = {
             let mut app = settings.lock().map_err(|_| "settings lock poisoned")?;
-            let models = registry
+            let mut models = registry
                 .lock()
                 .map_err(|_| "model registry lock poisoned")?;
+            let builtin =
+                crate::builtin_models::install_embedded(&data_dir, &mut models, &mut app)?;
             if app.strategy == "object_detection"
                 && models
                     .active_model_id
@@ -251,7 +259,8 @@ impl ReceiverService {
             {
                 app.strategy = "pixel_seek".into();
             }
-        }
+            builtin
+        };
         let session_id = format!("{}", unix_ms());
         // Per-frame detection logs were written here (about 290 MB per hour
         // at 240 FPS, never read back); reclaim what older versions left.
@@ -278,18 +287,19 @@ impl ReceiverService {
         };
         let pixel_color =
             PixelTargetColor::parse(&app.pixel_color).unwrap_or(PixelTargetColor::Yellow);
+        let model_size = model.as_ref().map(|model| model.input_width);
         let config = PipelineConfig {
             strategy: mode,
             pixel_color,
-            crop_resolution: Some(app.crop_resolution),
+            crop_resolution: Some(capture_size(&app, model_size)),
             fov_degrees: app.fov_degrees,
-            auto_fov_degrees: app.auto.fov_degrees,
+            auto_fov_degrees: app.magnet.fov_degrees,
             auto_target_active: false,
             target_lock_active: app.motion_enabled && app.motion_always_on,
             auto_config_revision: 0,
             color_filter: app.color_filter,
-            smoothing_x: app.smoothing_x(),
-            smoothing_y: app.smoothing_y(),
+            color_swap: app.color_swap(),
+            ability_confidence: app.ability_confidence as f32,
             model,
             model_backend: app.model_backend.clone(),
             compute_target: app.compute_target.clone(),
@@ -365,10 +375,7 @@ impl ReceiverService {
                         } else {
                             processed.result.target_xy.map(point)
                         },
-                        smoothing_alpha: (
-                            f64::from(processed.smoothing_alpha.0),
-                            f64::from(processed.smoothing_alpha.1),
-                        ),
+                        target_box: processed.target_box.map(|bbox| bbox.map(f64::from)),
                         crop_origin: (processed.crop_x, processed.crop_y),
                         processed_size: (
                             processed.result.processed_width,
@@ -380,6 +387,13 @@ impl ReceiverService {
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     let target_valid = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, target_valid);
+                    if settings.magnet.enabled && settings.magnet.mode != "auto" {
+                        (events.emit)(magnet_event(
+                            &settings,
+                            processed,
+                            processed.auto_config_revision,
+                        ));
+                    }
                 }
             }
         });
@@ -409,7 +423,7 @@ impl ReceiverService {
             app.port.parse::<u16>().unwrap_or(requested_udp_port),
         )
         .map_err(|error| error.to_string())?;
-        initial_source.set_crop_resolution(app.crop_resolution);
+        initial_source.set_crop_resolution(frame_request(&app, model_size));
         let mut source_state = SourceState {
             active: None,
             active_port: app.port.parse().unwrap_or(requested_udp_port),
@@ -429,12 +443,14 @@ impl ReceiverService {
             settings,
             settings_path: settings_path.clone(),
             registry,
+            builtin: Mutex::new(builtin),
             pipeline,
             movement_batcher,
             movement_ticker,
             motion_renderer,
             motion_capture: Mutex::new(CaptureState::default()),
             source_view: Mutex::new(SourceView::of(&source_state)),
+            frame_request: Mutex::new(frame_request(&app, model_size)),
             source: Arc::new(Mutex::new(source_state)),
             source_times,
             decoder,
@@ -494,7 +510,7 @@ impl ReceiverService {
         // frame interval. Fall back to the snapshot that thread keeps current.
         let view = self.source_view_now();
         source_port = view.port;
-        source_name = format!("UDP · 0.0.0.0:{}", view.port);
+        source_name = format!("UDP Â· 0.0.0.0:{}", view.port);
         transport = view.transport;
         source_error = view.error;
         let is_live = latest
@@ -506,8 +522,12 @@ impl ReceiverService {
             .and_then(|registry| registry.active_model_id.clone());
         // The OBS plugin crops before transmission.  This is the resolution
         // the receiver advertises to the sender and expects in each packet.
-        let expected_source_resolution =
-            Some(vec![settings.crop_resolution, settings.crop_resolution]);
+        let model_size = models.as_ref().and_then(|registry| {
+            let id = registry.active_model_id.as_ref()?;
+            registry.models.get(id).map(|model| model.input_width)
+        });
+        let capture = capture_size(&settings, model_size);
+        let expected_source_resolution = Some(vec![capture, capture]);
         // History remains available for diagnostics, but a recovered error
         // must not masquerade as a current operational failure.
         let renderer_error = self
@@ -543,10 +563,11 @@ impl ReceiverService {
             "mode":settings.strategy, "fov_degrees":settings.fov_degrees, "target_offset_x":settings.offset_x, "target_offset_y":settings.offset_y,
             "motion_capture":capture_request,"motion_capture_count":capture_count,"motion_capture_message":capture_message,
             "motion_renderer":settings.motion_renderer, "motion_enabled":settings.motion_enabled, "motion_always_on":settings.motion_always_on, "motion_toggle":settings.motion_toggle, "motion_toggled":motion_toggled(&settings, &device), "color_filter":settings.color_filter, "trigger_button":settings.trigger_button, "smoothing_x_min":settings.smoothing_x_min, "smoothing_x_max":settings.smoothing_x_max, "smoothing_y_min":settings.smoothing_y_min, "smoothing_y_max":settings.smoothing_y_max,
-            "sens":settings.sens, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y,
-            "smooth_fov_degrees":settings.smooth_fov_degrees, "motion_no_deadzone":settings.motion_no_deadzone, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
+            "sens":settings.sens, "speed_booster":settings.speed_booster, "speed_near":settings.speed_near, "speed_mid":settings.speed_mid, "speed_far":settings.speed_far,
+            "continue_inside_box":settings.continue_inside_box, "motion_speed_x":settings.motion_speed_x, "motion_speed_y":settings.motion_speed_y, "smooth_fov_degrees":settings.smooth_fov_degrees, "preview_scale":settings.scale, "crop_resolution":settings.crop_resolution,
             "recoil":settings.recoil,
             "auto":settings.auto,
+            "magnet":settings.magnet,
             "pixel_color":settings.pixel_color, "pixel_profile_configured":true,
             "effective_fov_degrees":effective_fov_degrees,
             "effective_pixel_color":effective_pixel_color,
@@ -630,12 +651,12 @@ impl ReceiverService {
         }
         let mut candidate =
             UdpDecodedFrameSource::new("0.0.0.0", port).map_err(|error| error.to_string())?;
-        let crop_resolution = self
-            .settings
-            .lock()
-            .map_err(|_| "settings lock poisoned")?
-            .crop_resolution;
-        candidate.set_crop_resolution(crop_resolution);
+        let model_size = self.active_model_size();
+        let request = frame_request(
+            &*self.settings.lock().map_err(|_| "settings lock poisoned")?,
+            model_size,
+        );
+        candidate.set_crop_resolution(request);
         if let Err(error) = candidate.open() {
             let message = error.to_string();
             if let Ok(mut source) = self.source.lock() {
@@ -665,7 +686,7 @@ impl ReceiverService {
     fn prepare_udp_source(
         &self,
         port: u16,
-        crop_resolution: u32,
+        request: u32,
     ) -> Result<Option<UdpDecodedFrameSource>, String> {
         let source = lock_source(&self.source);
         if source.active_port == port && source.active.is_some() {
@@ -674,7 +695,7 @@ impl ReceiverService {
         drop(source);
         let mut candidate =
             UdpDecodedFrameSource::new("0.0.0.0", port).map_err(|error| error.to_string())?;
-        candidate.set_crop_resolution(crop_resolution);
+        candidate.set_crop_resolution(request);
         candidate.open().map_err(|error| error.to_string())?;
         Ok(Some(candidate))
     }
@@ -692,7 +713,15 @@ impl ReceiverService {
             .clone();
         let (_, pixel_color_name, auto_target_active) =
             effective_detection_settings(settings, &device);
-        let target_lock_active = auto_target_active || motion_target_active(settings, &device);
+        // Auto uses `auto_fov_degrees`; Motion keeps its own FOV meanwhile.
+        let fov_degrees = if magnet_active(settings, &device) {
+            magnet_fov(settings, &device)
+        } else {
+            motion_fov(settings, &device)
+        };
+        let target_lock_active = auto_target_active
+            || motion_target_active(settings, &device)
+            || magnet_active(settings, &device);
         let pixel_color =
             PixelTargetColor::parse(&pixel_color_name).ok_or("invalid Pixel Seek color")?;
         let model = {
@@ -708,15 +737,18 @@ impl ReceiverService {
         Ok(PipelineConfig {
             strategy,
             pixel_color,
-            crop_resolution: Some(settings.crop_resolution),
-            fov_degrees: settings.fov_degrees,
-            auto_fov_degrees: settings.auto.fov_degrees,
+            crop_resolution: Some(capture_size(
+                settings,
+                model.as_ref().map(|model| model.input_width),
+            )),
+            fov_degrees,
+            auto_fov_degrees: magnet_fov(settings, &device),
             auto_target_active,
             target_lock_active,
             auto_config_revision: 0, // filled atomically by reconfigure()
             color_filter: settings.color_filter,
-            smoothing_x: settings.smoothing_x(),
-            smoothing_y: settings.smoothing_y(),
+            color_swap: settings.color_swap(),
+            ability_confidence: settings.ability_confidence as f32,
             model,
             model_backend: settings.model_backend.clone(),
             compute_target: settings.compute_target.clone(),
@@ -724,6 +756,23 @@ impl ReceiverService {
     }
 
     fn reconfigure(&self) -> Result<(), String> {
+        // Crop, engine, color and mask settings decide what the plugin sends.
+        // Settings and source are never locked together.
+        let model_size = self.active_model_size();
+        let request = frame_request(
+            &*self.settings.lock().map_err(|_| "settings lock poisoned")?,
+            model_size,
+        );
+        let changed = self
+            .frame_request
+            .lock()
+            .map(|mut last| std::mem::replace(&mut *last, request) != request)
+            .unwrap_or(true);
+        if changed {
+            if let Some(active) = lock_source(&self.source).active.as_mut() {
+                active.set_crop_resolution(request);
+            }
+        }
         let settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
         // Publish controls even if no frame arrives or pipeline configuration
         // fails. In particular, disabling Auto must never depend on video.
@@ -842,7 +891,8 @@ impl ReceiverService {
             "state" => Ok(self.state()),
             "get_app_settings" => Ok(json!({
                 "event":"app_settings",
-                "settings":*self.settings.lock().map_err(|_| "settings lock poisoned")?
+                "settings":*self.settings.lock().map_err(|_| "settings lock poisoned")?,
+                "builtin_models":*self.builtin.lock().map_err(|_| "model catalog lock poisoned")?
             })),
             "apply_app_settings" => {
                 let mut settings: AppSettings = serde_json::from_value(
@@ -883,7 +933,8 @@ impl ReceiverService {
                     .port
                     .parse::<u16>()
                     .map_err(|_| "UDP port must be 1..65535")?;
-                let candidate = self.prepare_udp_source(port, settings.crop_resolution)?;
+                let candidate =
+                    self.prepare_udp_source(port, frame_request(&settings, self.active_model_size()))?;
                 let renderer =
                     crate::movement::abcurves::ProfileCache::new(&settings.motion_renderer)?;
                 {
@@ -945,8 +996,14 @@ impl ReceiverService {
                     json!(next_motion_toggled(&settings, &previous, &device));
                 let previous_auto = previous_owner == TriggerOwner::Auto;
                 let next_auto = next_owner == TriggerOwner::Auto;
-                let previous_motion = motion_target_active(&settings, &previous);
-                let next_motion = motion_target_active(&settings, &device);
+                let previous_motion = motion_target_active(&settings, &previous)
+                    || magnet_active(&settings, &previous);
+                let next_motion =
+                    motion_target_active(&settings, &device) || magnet_active(&settings, &device);
+                // Dynamic FOV keys change the target FOV.
+                let fov_changed = effective_detection_settings(&settings, &previous).0
+                    != effective_detection_settings(&settings, &device).0
+                    || magnet_fov(&settings, &previous) != magnet_fov(&settings, &device);
                 let middle_pressed =
                     !trigger_held(&previous, "middle") && trigger_held(&device, "middle");
                 *self.device.lock().map_err(|_| "device lock poisoned")? = device;
@@ -955,7 +1012,10 @@ impl ReceiverService {
                 }
                 if previous_auto != next_auto {
                     self.reconfigure()?;
-                } else if previous_owner != next_owner || previous_motion != next_motion {
+                } else if previous_owner != next_owner
+                    || previous_motion != next_motion
+                    || fov_changed
+                {
                     // Advance the shared routing revision so queued Motion
                     // deltas from before the physical trigger edge are dropped,
                     // and publish Auto disabled while a Motion hold owns routing.
@@ -1135,10 +1195,24 @@ impl ReceiverService {
                 )
                 .map_err(|_| "invalid Auto settings")?;
                 auto.validate()?;
-                self.settings
-                    .lock()
-                    .map_err(|_| "settings lock poisoned")?
-                    .auto = auto;
+                {
+                    // Auto is the Magnet mode "auto".
+                    let mut settings =
+                        self.settings.lock().map_err(|_| "settings lock poisoned")?;
+                    let magnet = &mut settings.magnet;
+                    if auto.enabled {
+                        magnet.enabled = true;
+                        magnet.mode = "auto".into();
+                    } else if magnet.mode == "auto" {
+                        magnet.enabled = false;
+                    }
+                    magnet.trigger_button = auto.trigger_button;
+                    magnet.fov_degrees = auto.fov_degrees;
+                    magnet.delay_ms = auto.delay_ms;
+                    magnet.cooldown_ms = auto.cooldown_ms;
+                    magnet.sleep_ms = auto.sleep_ms;
+                    settings.auto = settings.magnet.auto();
+                }
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
@@ -1216,30 +1290,36 @@ impl ReceiverService {
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
-            "set_motion_speed" => {
-                const INVALID: &str = "motion speed must be 0.01..1 and Smooth FOV 1..360";
+            "set_motion_config" => {
+                const INVALID: &str = "booster speeds must be 0..10";
                 let speed = |key: &str| {
                     finite_number(command.get(key), INVALID).and_then(|v| {
-                        (0.01..=1.0)
+                        (0.0..=10.0)
                             .contains(&v)
                             .then_some(v)
                             .ok_or_else(|| INVALID.to_string())
                     })
                 };
-                let (x, y) = (speed("x")?, speed("y")?);
-                let fov = command
-                    .get("smooth_fov_degrees")
-                    .and_then(Value::as_u64)
-                    .filter(|fov| *fov <= 360)
-                    .ok_or(INVALID)? as u16;
+                let (near, mid, far) = (
+                    speed("speed_near")?,
+                    speed("speed_mid")?,
+                    speed("speed_far")?,
+                );
+                let flag = |key: &str| {
+                    command
+                        .get(key)
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| format!("{key} must be true or false"))
+                };
+                let (booster, inside) = (flag("speed_booster")?, flag("continue_inside_box")?);
                 let mut settings = self.settings.lock().map_err(|_| "settings lock poisoned")?;
-                settings.motion_speed_x = x;
-                settings.motion_speed_y = y;
-                settings.smooth_fov_degrees = fov;
-                if let Some(enabled) = command.get("no_deadzone").and_then(Value::as_bool) {
-                    settings.motion_no_deadzone = enabled;
-                }
+                settings.speed_booster = booster;
+                settings.speed_near = near;
+                settings.speed_mid = mid;
+                settings.speed_far = far;
+                settings.continue_inside_box = inside;
                 drop(settings);
+                self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "set_smoothing_config" => {
@@ -1272,11 +1352,6 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
                     .crop_resolution = resolution;
-                if let Ok(mut source) = self.source.lock() {
-                    if let Some(active) = source.active.as_mut() {
-                        active.set_crop_resolution(resolution);
-                    }
-                }
                 self.reconfigure()?;
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
@@ -1293,7 +1368,7 @@ impl ReceiverService {
                         .and_then(|id| registry.models.get(id))
                         .is_none()
                     {
-                        return Err("Import a model before selecting Object Detection".into());
+                        return Err("This build has no built-in Object Detection model".into());
                     }
                 } else if mode != "pixel_seek" {
                     return Err("invalid detection strategy".into());
@@ -1328,7 +1403,6 @@ impl ReceiverService {
                 Ok(json!({"event":"ack","type":kind,"state":self.state()}))
             }
             "list_models" => Ok(self.models_event()),
-            "import_model_bundle" => self.import_model_bundle(&command),
             "add_model" => {
                 let model: ModelDefinition =
                     serde_json::from_value(command.clone()).map_err(|error| error.to_string())?;
@@ -1357,26 +1431,6 @@ impl ReceiverService {
                     .lock()
                     .map_err(|_| "settings lock poisoned")?
                     .active_model_id = Some(id.into());
-                drop(registry);
-                self.reconfigure()?;
-                Ok(self.models_event())
-            }
-            "remove_model" => {
-                let id = command
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or("model ID is required")?;
-                let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
-                let active = registry.active_model_id.as_deref() == Some(id);
-                registry.remove(id).map_err(|error| error.to_string())?;
-                if active {
-                    let mut settings =
-                        self.settings.lock().map_err(|_| "settings lock poisoned")?;
-                    settings.active_model_id = None;
-                    if settings.strategy == "object_detection" {
-                        settings.strategy = "pixel_seek".into();
-                    }
-                }
                 drop(registry);
                 self.reconfigure()?;
                 Ok(self.models_event())
@@ -1493,18 +1547,37 @@ impl ReceiverService {
     /// and, in Object Detection, sets Crop Resolution to the model's input
     /// size so the sender delivers frames the model accepts.
     fn apply_model_selection(&self, settings: &mut AppSettings) -> Result<(), String> {
-        let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
-        let selected = settings
+        let builtin = self
+            .builtin
+            .lock()
+            .map_err(|_| "model catalog lock poisoned")?
+            .clone();
+        let model = settings
             .active_model_id
-            .as_deref()
-            .filter(|id| registry.models.contains_key(*id))
-            .map(str::to_owned);
-        if settings.strategy == "object_detection" && selected.is_none() {
-            return Err("Import a model before selecting Object Detection".into());
+            .clone()
+            .filter(|id| builtin.iter().any(|model| model.id == *id))
+            .or_else(|| builtin.first().map(|model| model.id.clone()));
+        if settings.strategy == "object_detection" && model.is_none() {
+            return Err("This build has no built-in Object Detection model".into());
         }
-        let Some(id) = selected else {
+        let Some(model) = model else {
             return Ok(());
         };
+        settings.active_model_id = Some(model.clone());
+        // Runtime + Compute pick the variant; in Object Detection a missing
+        // one is an error instead of a silent substitute.
+        let resolved = crate::builtin_models::resolve(
+            &builtin,
+            &model,
+            &settings.model_precision,
+            &settings.model_backend,
+        );
+        let id = match resolved {
+            Ok(id) => id,
+            Err(error) if settings.strategy == "object_detection" => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
         if registry.active_model_id.as_deref() != Some(id.as_str()) {
             registry
                 .activate(Some(&id))
@@ -1522,7 +1595,6 @@ impl ReceiverService {
                     model.input_width, model.input_height
                 ));
             }
-            settings.crop_resolution = model.input_width;
         }
         if model.confidence != confidence {
             model.confidence = confidence;
@@ -1531,133 +1603,11 @@ impl ReceiverService {
         Ok(())
     }
 
-    /// Registers a model and makes it active. `path` is an `.onnx` file
-    /// (TensorRT/OpenVINO files with the same name next to it are picked up)
-    /// or a folder holding one. The input size and class names come from the
-    /// ONNX file; a model with a dynamic input uses the current Crop
-    /// Resolution.
-    fn import_model_bundle(&self, command: &Value) -> Result<Value, String> {
-        let path = command
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| path.trim().trim_start_matches('@').trim_matches('"'))
-            .filter(|path| !path.is_empty())
-            .ok_or("Enter the model file or folder")?;
-        let path = std::path::Path::new(path);
-        let (folder, stem) = if path.is_dir() {
-            (path, None)
-        } else if path.is_file() {
-            (
-                path.parent().ok_or("Invalid model path")?,
-                path.file_stem().and_then(|stem| stem.to_str()),
-            )
-        } else {
-            return Err(format!("Model path not found: {}", path.display()));
-        };
-        let mut files = std::fs::read_dir(folder)
-            .map_err(|error| format!("Cannot read model folder: {error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|file| file.is_file())
-            .filter(|file| stem.is_none() || file.file_stem().and_then(|s| s.to_str()) == stem)
-            .collect::<Vec<_>>();
-        files.sort();
-        let find = |extensions: &[&str]| {
-            files
-                .iter()
-                .find(|file| {
-                    file.extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| {
-                            extensions
-                                .iter()
-                                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
-                        })
-                })
-                .map(|file| file.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        let mut artifacts = ModelArtifacts {
-            onnx: find(&["onnx"]),
-            tensorrt: find(&["engine", "plan"]),
-            openvino_xml: find(&["xml"]),
-            openvino_bin: find(&["bin"]),
-        };
-        if artifacts.onnx.is_empty() {
-            return Err("No .onnx model found at that path".into());
-        }
-        if artifacts.openvino_xml.is_empty() != artifacts.openvino_bin.is_empty() {
-            artifacts.openvino_xml.clear();
-            artifacts.openvino_bin.clear();
-        }
-        let info = std::fs::read(&artifacts.onnx)
-            .map_err(|error| format!("Cannot read the ONNX model: {error}"))
-            .and_then(|bytes| crate::onnx_info::read(&bytes).map_err(str::to_owned))?;
-        let name = std::path::Path::new(&artifacts.onnx)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("model")
-            .to_owned();
-        let crop = self
-            .settings
-            .lock()
-            .map_err(|_| "settings lock poisoned")?
-            .crop_resolution;
-        let (width, height) = info.input_size.unwrap_or((crop, crop));
-        let mut registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
-        let existing = registry
-            .models
-            .values()
-            .find(|model| model.artifacts.onnx == artifacts.onnx)
-            .map(|model| model.id.clone());
-        let id = match existing {
-            Some(id) => {
-                let mut model = registry.models[&id].clone();
-                model.artifacts = artifacts;
-                model.input_width = width;
-                model.input_height = height;
-                model.class_names = info.class_names;
-                model.enabled = true;
-                registry.update(model).map_err(|error| error.to_string())?;
-                id
-            }
-            None => {
-                let mut id = name.clone();
-                let mut suffix = 2;
-                while registry.models.contains_key(&id) {
-                    id = format!("{name}-{suffix}");
-                    suffix += 1;
-                }
-                registry
-                    .add(ModelDefinition {
-                        id: id.clone(),
-                        name,
-                        artifacts,
-                        input_width: width,
-                        input_height: height,
-                        confidence: 0.5,
-                        iou: 0.45,
-                        device: "auto".into(),
-                        enabled: true,
-                        class_names: info.class_names,
-                    })
-                    .map_err(|error| error.to_string())?;
-                id
-            }
-        };
-        registry
-            .activate(Some(&id))
-            .map_err(|error| error.to_string())?;
-        drop(registry);
-        self.settings
-            .lock()
-            .map_err(|_| "settings lock poisoned")?
-            .active_model_id = Some(id.clone());
-        self.reconfigure()?;
-        Ok(json!({
-            "event":"ack","type":"import_model_bundle","active_model_id":id,
-            "input_width":width,"input_height":height
-        }))
+    /// Input side of the active model (Object Detection's capture size).
+    fn active_model_size(&self) -> Option<u32> {
+        let registry = self.registry.lock().ok()?;
+        let id = registry.active_model_id.as_ref()?;
+        registry.models.get(id).map(|model| model.input_width)
     }
 
     fn models_event(&self) -> Value {
@@ -1752,14 +1702,15 @@ fn receiver_loop(service: Weak<ReceiverService>) {
                 .filter(|_| Instant::now() >= state.retry_at)
         };
         if let Some(port) = retry {
-            let crop_resolution = service
+            let model_size = service.active_model_size();
+            let request = service
                 .settings
                 .lock()
                 .ok()
-                .map(|settings| settings.crop_resolution)
-                .unwrap_or(640);
+                .map(|settings| frame_request(&settings, model_size))
+                .unwrap_or_default();
             let candidate = UdpDecodedFrameSource::new("0.0.0.0", port).and_then(|mut source| {
-                source.set_crop_resolution(crop_resolution);
+                source.set_crop_resolution(request);
                 source.open()?;
                 Ok(source)
             });
@@ -2003,6 +1954,23 @@ async fn socket_loop(mut socket: WebSocket, service: Arc<ReceiverService>, role:
     }
 }
 
+/// What the OBS plugin is asked for: the Crop Resolution as JPEG, or in
+/// Pixel Seek with Plugin mask on, the centered mask of the selected color.
+/// The square the OBS plugin crops: the model's input size in Object
+/// Detection, Crop Resolution in Pixel Seek (user request: Crop Resolution
+/// applies to Pixel Seek only).
+fn capture_size(settings: &AppSettings, model_size: Option<u32>) -> u32 {
+    match model_size {
+        Some(size) if settings.strategy == "object_detection" => size,
+        _ => settings.crop_resolution,
+    }
+}
+
+/// What SYSCFG asks the plugin to crop.
+fn frame_request(settings: &AppSettings, model_size: Option<u32>) -> u32 {
+    capture_size(settings, model_size)
+}
+
 /// Same one-second window that `state()` uses for `streaming` vs `waiting`.
 fn preview_is_fresh(published_ns: u64, now_ns: u64) -> bool {
     now_ns.saturating_sub(published_ns) < 1_000_000_000
@@ -2029,8 +1997,11 @@ fn movement_runtime(
         offset_y: settings.offset_y,
         speed_x: settings.motion_speed_x,
         speed_y: settings.motion_speed_y,
+        smoothing_x: settings.smoothing_x(),
+        smoothing_y: settings.smoothing_y(),
         smooth_fov_degrees: settings.smooth_fov_degrees,
-        no_deadzone: settings.motion_no_deadzone,
+        booster: settings.speed_booster(),
+        no_deadzone: settings.continue_inside_box,
         trigger_button: settings.trigger_button.clone(),
         recoil: settings.recoil.clone(),
     }
@@ -2093,6 +2064,44 @@ fn trigger_owner(settings: &AppSettings, device: &Value) -> TriggerOwner {
     next_trigger_owner(settings, TriggerOwner::stored(device), device)
 }
 
+/// Magnet runs while its own trigger is held.
+fn magnet_active(settings: &AppSettings, device: &Value) -> bool {
+    settings.magnet.enabled
+        && settings.magnet.mode != "auto"
+        && trigger_held(device, &settings.magnet.trigger_button)
+}
+
+/// One Magnet sample per processed frame for the host: the target error in
+/// crop px (offsets applied) and the px → count conversion. Sent only while
+/// Magnet is enabled; the host treats a sample older than 100 ms as no target.
+fn magnet_event(settings: &AppSettings, processed: &ProcessedFrame, revision: u64) -> Value {
+    let error = processed
+        .result
+        .target_xy
+        .filter(|_| !processed.result.auto_active)
+        .map(|target| {
+            let (x, y) = crate::movement::crop_target_error(
+                (f64::from(target[0]), f64::from(target[1])),
+                (processed.crop_x, processed.crop_y),
+                (
+                    processed.result.processed_width,
+                    processed.result.processed_height,
+                ),
+                (settings.magnet.offset_x, settings.magnet.offset_y),
+            );
+            [x, y]
+        });
+    json!({
+        "event": "magnet_target",
+        "config_revision": revision,
+        "frame_id": processed.frame.frame_id,
+        "error": error,
+        "counts_per_px": crate::movement::motion::counts_per_px(settings.sens),
+        "timestamp_ms": unix_ms(),
+        "settings": settings.magnet,
+    })
+}
+
 fn motion_target_active(settings: &AppSettings, device: &Value) -> bool {
     settings.motion_enabled
         && match trigger_owner(settings, device) {
@@ -2131,15 +2140,55 @@ fn routed_auto_settings(settings: &AppSettings, device: &Value) -> AutoSettings 
     auto
 }
 
+/// `base`, or `dynamic` while the Dynamic FOV key is held.
+fn dynamic_fov(base: u16, dynamic: u16, key: &str, device: &Value) -> u16 {
+    if key != "off" && trigger_held(device, key) {
+        dynamic
+    } else {
+        base
+    }
+}
+
+fn motion_fov(settings: &AppSettings, device: &Value) -> u16 {
+    dynamic_fov(
+        settings.fov_degrees,
+        settings.dynamic_fov_degrees,
+        &settings.dynamic_fov_key,
+        device,
+    )
+}
+
+fn magnet_fov(settings: &AppSettings, device: &Value) -> u16 {
+    let magnet = &settings.magnet;
+    dynamic_fov(
+        magnet.fov_degrees,
+        magnet.dynamic_fov_degrees,
+        &magnet.dynamic_fov_key,
+        device,
+    )
+}
+
+/// Target FOV, color and whether Auto owns this frame. A held Magnet
+/// trigger selects targets inside Magnet's FOV.
 fn effective_detection_settings(settings: &AppSettings, device: &Value) -> (u16, String, bool) {
     if trigger_owner(settings, device) == TriggerOwner::Auto {
         (
-            settings.auto.fov_degrees,
+            magnet_fov(settings, device),
             settings.pixel_color.clone(),
             true,
         )
+    } else if magnet_active(settings, device) {
+        (
+            magnet_fov(settings, device),
+            settings.pixel_color.clone(),
+            false,
+        )
     } else {
-        (settings.fov_degrees, settings.pixel_color.clone(), false)
+        (
+            motion_fov(settings, device),
+            settings.pixel_color.clone(),
+            false,
+        )
     }
 }
 
@@ -2913,10 +2962,10 @@ mod tests {
     }
 
     #[test]
-    fn imported_onnx_model_sets_object_detection_and_crop_resolution() {
-        let (service, data_dir) = test_service("import-model-bundle");
+    fn built_in_model_sets_object_detection_and_crop_resolution() {
+        let (service, data_dir) = test_service("builtin-model");
         let _guard = ServiceGuard(Arc::clone(&service));
-        // Graph input "images" [1, 3, 96, 96] and Ultralytics class names.
+        // Graph input "images" [1, 3, 96, 96].
         fn tag(field: u8, payload: &[u8]) -> Vec<u8> {
             [
                 vec![(field << 3) | 2, payload.len() as u8],
@@ -2929,58 +2978,76 @@ mod tests {
             .flat_map(|size| tag(1, &[1 << 3, *size]))
             .collect::<Vec<_>>();
         let tensor = tag(1, &[vec![1 << 3, 1], tag(2, &dims)].concat());
-        let input = tag(11, &[tag(1, b"images"), tag(2, &tensor)].concat());
-        let names = tag(14, &[tag(1, b"names"), tag(2, b"{0: 'Enemy'}")].concat());
-        let model = data_dir.join("v11_96.onnx");
-        std::fs::write(&model, [tag(7, &input), names].concat()).unwrap();
-        let error = service
-            .dispatch(
-                json!({"version":1,"type":"import_model_bundle","path":data_dir.join("none")}),
-            )
-            .expect_err("a missing path is rejected");
-        assert!(error.contains("not found"), "{error}");
-        let reply = service
-            .dispatch(json!({"version":1,"type":"import_model_bundle","path":model}))
+        let onnx: &'static [u8] =
+            tag(7, &tag(11, &[tag(1, b"images"), tag(2, &tensor)].concat())).leak();
+        let artifacts = [
+            crate::builtin_models::EmbeddedArtifact {
+                stem: "v11_96_fp16",
+                extension: "onnx",
+                bytes: onnx,
+            },
+            crate::builtin_models::EmbeddedArtifact {
+                stem: "v11_96_int8",
+                extension: "xml",
+                bytes: b"<xml/>",
+            },
+            crate::builtin_models::EmbeddedArtifact {
+                stem: "v11_96_int8",
+                extension: "bin",
+                bytes: b"weights",
+            },
+        ];
+        let catalog = crate::builtin_models::install(
+            &data_dir,
+            &mut service.registry.lock().unwrap(),
+            &mut service.settings.lock().unwrap(),
+            &artifacts,
+        )
+        .unwrap();
+        *service.builtin.lock().unwrap() = catalog;
+        let listed = service
+            .dispatch(json!({"version":1,"type":"get_app_settings"}))
             .unwrap();
-        assert_eq!(reply["active_model_id"], "v11_96");
-        assert_eq!(reply["input_width"], 96);
-        // Importing the same file again reuses the model.
-        service
-            .dispatch(json!({"version":1,"type":"import_model_bundle","path":data_dir}))
-            .unwrap();
-        {
-            let registry = service.registry.lock().unwrap();
-            assert_eq!(registry.models.len(), 1);
-            let model = &registry.models["v11_96"];
-            assert_eq!((model.input_width, model.input_height), (96, 96));
-            assert!(model.artifacts.tensorrt.is_empty());
-            assert_eq!(model.class_names.as_ref().unwrap()[&0], "Enemy");
-        }
-
+        assert_eq!(listed["builtin_models"][0]["id"], "v11_96");
+        assert_eq!(listed["builtin_models"][0]["label"], "V11 (96×96)");
         let mut requested = service.settings.lock().unwrap().clone();
         requested.strategy = "object_detection".into();
         requested.model_confidence = "0.7".into();
         requested.crop_resolution = 256;
         service
-            .dispatch(json!({
-                "version":1,
-                "type":"apply_app_settings",
-                "settings":requested
-            }))
+            .dispatch(json!({"version":1,"type":"apply_app_settings","settings":requested}))
             .unwrap();
         let applied = service.settings.lock().unwrap().clone();
-        assert_eq!(applied.strategy, "object_detection");
+        assert_eq!(applied.active_model_id.as_deref(), Some("v11_96"));
+        assert_eq!(applied.crop_resolution, 256, "Crop Resolution stays Pixel Seek's");
         assert_eq!(
-            applied.crop_resolution, 96,
-            "Crop Resolution follows the model"
+            service.state()["expected_source_resolution"],
+            json!([96, 96]),
+            "Object Detection captures the model's input size"
         );
+        assert_eq!(*service.frame_request.lock().unwrap(), 96);
         assert_eq!(
-            service.registry.lock().unwrap().models["v11_96"].confidence,
+            service.registry.lock().unwrap().models["v11_96@fp16"].confidence,
             0.7
         );
-        let saved = load_settings(&service.settings_path);
-        assert_eq!(saved.active_model_id.as_deref(), Some("v11_96"));
-        assert_eq!(saved.crop_resolution, 96);
+        // INT8 exists only for OpenVINO.
+        let mut int8 = applied.clone();
+        int8.model_precision = "int8".into();
+        let error = service
+            .dispatch(json!({"version":1,"type":"apply_app_settings","settings":int8}))
+            .unwrap_err();
+        assert!(error.contains("no INT8 model for ONNX Runtime"), "{error}");
+        int8.model_backend = "openvino".into();
+        service
+            .dispatch(json!({"version":1,"type":"apply_app_settings","settings":int8}))
+            .unwrap();
+        assert_eq!(
+            service.registry.lock().unwrap().active_model_id.as_deref(),
+            Some("v11_96@int8")
+        );
+        assert!(service
+            .dispatch(json!({"version":1,"type":"import_model_bundle","path":"x.onnx"}))
+            .is_err());
         drop(_guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -2998,7 +3065,7 @@ mod tests {
                 "mode":"object_detection"
             }))
             .expect_err("Object Detection without a model must not reconfigure the receiver");
-        assert!(error.contains("Import a model"), "{error}");
+        assert!(error.contains("built-in"), "{error}");
         let mut requested = original.clone();
         requested.strategy = "object_detection".into();
         let error = service
@@ -3008,7 +3075,7 @@ mod tests {
                 "settings":requested
             }))
             .expect_err("Apply Changes must reject Object Detection without a model");
-        assert!(error.contains("Import a model"), "{error}");
+        assert!(error.contains("built-in"), "{error}");
         assert_eq!(*service.settings.lock().unwrap(), original);
         assert_eq!(
             std::fs::read(&service.settings_path).unwrap(),
@@ -3172,13 +3239,48 @@ mod tests {
     }
 
     #[test]
+    fn the_plugin_crops_crop_resolution_in_pixel_seek_and_the_model_size_in_object_detection() {
+        let mut settings = AppSettings::default();
+        settings.crop_resolution = 256;
+        assert_eq!(super::frame_request(&settings, Some(640)), 256);
+        settings.strategy = "object_detection".into();
+        assert_eq!(super::frame_request(&settings, Some(640)), 640);
+        assert_eq!(super::frame_request(&settings, None), 256);
+    }
+
+    #[test]
+    fn dynamic_fov_keys_and_a_held_magnet_trigger_pick_the_target_fov() {
+        let mut settings = AppSettings::default();
+        settings.fov_degrees = 40;
+        settings.dynamic_fov_degrees = 90;
+        settings.dynamic_fov_key = "right".into();
+        settings.magnet.enabled = true;
+        settings.magnet.trigger_button = "m5".into();
+        settings.magnet.fov_degrees = 60;
+        settings.magnet.dynamic_fov_degrees = 120;
+        settings.magnet.dynamic_fov_key = "right".into();
+        let device = |right: bool, m5: bool| json!({"state":"connected","buttons":[false,right,false,false,m5]});
+        let fov = |device: &Value| super::effective_detection_settings(&settings, device).0;
+        assert_eq!(fov(&device(false, false)), 40);
+        assert_eq!(fov(&device(true, false)), 90, "Motion dynamic FOV");
+        assert_eq!(
+            fov(&device(false, true)),
+            60,
+            "Magnet FOV while its trigger is held"
+        );
+        assert_eq!(fov(&device(true, true)), 120, "Magnet dynamic FOV");
+    }
+
+    #[test]
     fn auto_trigger_switches_effective_fov_without_changing_shared_target_color() {
         let mut settings = AppSettings::default();
         settings.fov_degrees = 42;
         settings.pixel_color = "yellow".into();
-        settings.auto.enabled = true;
-        settings.auto.trigger_button = "m4".into();
-        settings.auto.fov_degrees = 88;
+        settings.magnet.enabled = true;
+        settings.magnet.mode = "auto".into();
+        settings.magnet.trigger_button = "m4".into();
+        settings.magnet.fov_degrees = 88;
+        settings.auto = settings.magnet.auto();
 
         let released = json!({"state":"connected","buttons":[false,false,false,false,false]});
         assert_eq!(
@@ -3284,7 +3386,7 @@ mod tests {
             let result = worker_service.dispatch(json!({"version":1,"type":"apply_settings",
                 "commands":[
                     {"version":1,"type":"set_movement_calibration","sens":0.23,"motion_enabled":true},
-                    {"version":1,"type":"set_motion_speed","x":0.12,"y":0.13,"smooth_fov_degrees":0,"no_deadzone":true}
+                    {"version":1,"type":"set_motion_config","speed_booster":true,"speed_near":0.12,"speed_mid":1.0,"speed_far":2.0,"continue_inside_box":true}
                 ]}));
             let _ = tx.send(result);
         });
@@ -3295,8 +3397,8 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(response["state"]["sens"], 0.23);
         assert_eq!(response["state"]["motion_enabled"], true);
-        assert_eq!(response["state"]["motion_no_deadzone"], true);
-        assert_eq!(response["state"]["motion_speed_x"], 0.12);
+        assert_eq!(response["state"]["continue_inside_box"], true);
+        assert_eq!(response["state"]["speed_near"], 0.12);
         drop(guard);
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -3309,9 +3411,9 @@ mod tests {
             .dispatch(json!({"version":1,"type":"get_app_settings"}))
             .expect("load native settings");
         assert_eq!(initial["event"], "app_settings");
-        assert_eq!(initial["settings"]["motionNoDeadzone"], false);
+        assert_eq!(initial["settings"]["continueInsideBox"], false);
         let mut settings = AppSettings::default();
-        settings.motion_no_deadzone = true;
+        settings.continue_inside_box = true;
         settings.color_filter = true;
         settings.pixel_color = "red".into();
         settings.port = service.state()["port"].as_u64().unwrap().to_string();
@@ -3324,13 +3426,13 @@ mod tests {
             }))
             .expect("persist and apply native settings");
         assert_eq!(response["event"], "ack");
-        assert_eq!(response["state"]["motion_no_deadzone"], true);
+        assert_eq!(response["state"]["continue_inside_box"], true);
         assert_eq!(response["state"]["color_filter"], true);
         let saved = load_settings(service.settings_path.clone());
-        assert!(saved.motion_no_deadzone);
+        assert!(saved.continue_inside_box);
         assert_eq!(saved.pixel_color, "red");
         assert_eq!(
-            saved.profiles[0].settings["motionNoDeadzone"], true,
+            saved.profiles[0].settings["continueInsideBox"], true,
             "active profile snapshot is synchronized before saving"
         );
 
@@ -3371,15 +3473,15 @@ mod tests {
         // The middle button cycles to the second profile while Settings edits.
         service.cycle_profile().expect("cycle profiles");
         let mut draft: AppSettings = serde_json::from_value(draft).unwrap();
-        draft.motion_no_deadzone = true;
+        draft.continue_inside_box = true;
         service
             .dispatch(json!({"version":1,"type":"apply_app_settings","settings":draft}))
             .expect("apply the stale draft");
 
         let saved = load_settings(service.settings_path.clone());
         assert_eq!(saved.active_profile, 1, "the cycled profile stays active");
-        assert!(!saved.motion_no_deadzone);
-        assert_eq!(saved.profiles[0].settings["motionNoDeadzone"], true);
+        assert!(!saved.continue_inside_box);
+        assert_eq!(saved.profiles[0].settings["continueInsideBox"], true);
         assert_eq!(service.state()["profile_index"], 1);
 
         drop(_guard);

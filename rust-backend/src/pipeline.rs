@@ -1,27 +1,23 @@
 use crate::auto_target::{center_sides, CenterCrossing, CrosshairTracker};
 use crate::config::ModelDefinition;
 use crate::crop::CropRect;
-use crate::inference::{decode_yolo_output, to_detection_objects, DetectionRuntime};
+use crate::inference::{
+    decode_end2end_output, decode_yolo_output, to_detection_objects, DetectionRuntime,
+};
 use crate::pixel_seek::{
-    color_mask, color_mask_into, process_pixel_seek_with_scratch, try_pack_mask, PixelSeekOutput,
-    PixelSeekScratch, PixelTargetColor,
+    color_mask, color_mask_into, head_point, process_pixel_seek_with_scratch, try_pack_mask,
+    PixelSeekOutput, PixelSeekScratch, PixelTargetColor,
 };
 use crate::receiver::SourceFrame;
-use crate::results::{DetectionMode, DetectionResult};
+use crate::results::{DetectionMode, DetectionObject, DetectionResult};
+use crate::target_manager::{Detection, TargetKind, TargetManager, TrackedEntity};
 use crate::targeting::{
-    object_detection_candidates, object_detection_target, ExponentialTargetSmoother,
-    FrameCoordinate, PriorTarget, SmoothingRange, TargetCandidate,
+    aim_point, box_has_outline, fov_radius_px, object_detection_candidates, FrameCoordinate,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-const PIXEL_LOCK_WINDOW: Duration = Duration::from_millis(100);
-
-fn target_is_fresh(received: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(received) <= PIXEL_LOCK_WINDOW
-}
 
 fn frame_size_changed(previous: Option<(u32, u32)>, current: (u32, u32)) -> bool {
     previous.is_some_and(|size| size != current)
@@ -45,8 +41,12 @@ pub struct PipelineConfig {
     /// Black out every pixel but the selected target color before Motion,
     /// Auto (and Object Detection) process the frame.
     pub color_filter: bool,
-    pub smoothing_x: SmoothingRange,
-    pub smoothing_y: SmoothingRange,
+    /// Object Detection aim point inside the target box.
+    /// Object Detection: only boxes holding this enemy outline color are
+    /// targets (Color swap).
+    pub color_swap: Option<PixelTargetColor>,
+    /// Min confidence of ability classes (`targeting::ClassRole::Ability`).
+    pub ability_confidence: f32,
     pub model: Option<ModelDefinition>,
     pub model_backend: String,
     pub compute_target: String,
@@ -64,8 +64,8 @@ impl Default for PipelineConfig {
             target_lock_active: true,
             auto_config_revision: 0,
             color_filter: false,
-            smoothing_x: SmoothingRange::NONE,
-            smoothing_y: SmoothingRange::NONE,
+            color_swap: None,
+            ability_confidence: 0.6,
             model: None,
             model_backend: "onnxruntime".into(),
             compute_target: "cpu".into(),
@@ -81,10 +81,9 @@ pub struct ProcessedFrame {
     pub published_ns: u64,
     pub crop_x: u32,
     pub crop_y: u32,
-    pub selected_target: Option<TargetCandidate>,
-    /// Smoothing factors drawn for this track; movement applies them to the
-    /// target's own motion (Preview uses `smoothed_target_xy`).
-    pub smoothing_alpha: (f32, f32),
+    /// The target's box in original-frame coordinates (Motion slows down
+    /// while the crosshair is inside it).
+    pub target_box: Option<[f32; 4]>,
     /// Color filter on: its applied mask, packed one bit per pixel, so Preview
     /// shows the same image Motion/Auto processed.
     pub mask: Option<Vec<u8>>,
@@ -255,10 +254,8 @@ fn processing_loop(
     shared: Arc<Shared>,
     on_processed: Option<Arc<dyn Fn(&ProcessedFrame) + Send + Sync>>,
 ) {
-    let mut smoother = None;
-    let mut smoother_generation = None;
-    let mut prior_target: Option<PriorTarget> = None;
-    let mut prior_target_at: Option<Instant> = None;
+    let mut targets = TargetManager::default();
+    let mut targets_generation = None;
     let mut pixel_seek_scratch = PixelSeekScratch::default();
     // Not reset on reconfiguration: the game's crosshair stays the same.
     let mut crosshair = CrosshairTracker::default();
@@ -284,31 +281,22 @@ fn processing_loop(
         };
         let frame_size = (pending.frame.image.width(), pending.frame.image.height());
         if frame_size_changed(previous_frame_size, frame_size) {
-            // Track coordinates and Auto crossings are expressed in source pixels.
-            smoother_generation = None;
+            // Tracks and Auto crossings are expressed in source pixels.
+            targets_generation = None;
         }
         previous_frame_size = Some(frame_size);
-        if smoother_generation != Some(pending.generation) {
-            smoother = ExponentialTargetSmoother::new(config.smoothing_x, config.smoothing_y);
-            smoother_generation = Some(pending.generation);
-            prior_target = None;
-            prior_target_at = None;
+        if targets_generation != Some(pending.generation) {
+            targets.reset();
+            targets_generation = Some(pending.generation);
             crossing.reset();
         }
-        let Some(smoother) = smoother.as_mut() else {
-            continue;
-        };
         let started = Instant::now();
-        let prior_is_fresh =
-            prior_target_at.is_some_and(|received| target_is_fresh(received, Instant::now()));
         let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_frame_with_scratch(
                 pending.frame,
                 &config,
-                smoother,
                 &mut runtime_cache,
-                prior_target.as_ref(),
-                prior_is_fresh,
+                &mut targets,
                 &mut pixel_seek_scratch,
                 &mut crosshair,
                 &mut crossing,
@@ -340,30 +328,6 @@ fn processing_loop(
                 // preview senders read `latest` at the input frame rate.
                 let processed = Arc::new(processed);
                 state.latest = Some(Arc::clone(&processed));
-                if processed.result.mode == DetectionMode::ObjectDetection {
-                    if let Some(target) = &processed.selected_target {
-                        prior_target = Some(PriorTarget {
-                            bbox_xyxy: Some(target.bbox_xyxy),
-                            class_id: target.class_id,
-                        });
-                        prior_target_at = Some(processed.frame.received);
-                    } else {
-                        prior_target = None;
-                        prior_target_at = None;
-                    }
-                } else if !config.target_lock_active && !config.auto_target_active {
-                    // Releasing every target-producing trigger cancels the
-                    // previous track; the next press acquires a fresh one.
-                    prior_target = None;
-                    prior_target_at = None;
-                } else {
-                    // Pixel Seek reports only its locked target's blob.
-                    prior_target = processed.result.objects.first().map(|object| PriorTarget {
-                        bbox_xyxy: Some(object.bbox_xyxy),
-                        class_id: None,
-                    });
-                    prior_target_at = prior_target.as_ref().map(|_| processed.frame.received);
-                }
                 drop(state);
                 if let Some(callback) = &on_processed {
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -377,15 +341,13 @@ fn processing_loop(
                 if matches!(&error, ProcessError::FramePanic(_)) {
                     runtime_cache = None;
                     crossing.reset();
-                    prior_target = None;
-                    prior_target_at = None;
+                    targets.reset();
                 }
                 state.stats.rejected_frames += 1;
                 if matches!(error, ProcessError::ModelResolutionMismatch { .. }) {
                     state.stats.resolution_mismatches += 1;
                 }
                 state.stats.last_error = Some(error.to_string());
-                smoother.update(None);
             }
         }
         let _ = started;
@@ -418,32 +380,50 @@ fn processing_supervisor(
 fn process_frame(
     frame: SourceFrame,
     config: &PipelineConfig,
-    smoother: &mut ExponentialTargetSmoother,
     runtime_cache: &mut Option<RuntimeCache>,
-    previous_target: Option<&PriorTarget>,
-    previous_is_fresh: bool,
+    targets: &mut TargetManager,
     crossing: &mut CenterCrossing,
 ) -> Result<ProcessedFrame, ProcessError> {
     process_frame_with_scratch(
         frame,
         config,
-        smoother,
         runtime_cache,
-        previous_target,
-        previous_is_fresh,
+        targets,
         &mut PixelSeekScratch::default(),
         &mut CrosshairTracker::default(),
         crossing,
     )
 }
 
+/// Feeds this frame's detections to the tracker and returns the selected
+/// entity inside the FOV. Outside a held Motion/Auto action nothing stays
+/// locked, so the next press acquires a fresh target.
+fn track_target<'a>(
+    targets: &'a mut TargetManager,
+    detections: &[Detection],
+    frame: &SourceFrame,
+    size: (u32, u32),
+    fov_degrees: u16,
+    lock_active: bool,
+    prefer_head: bool,
+) -> Option<&'a TrackedEntity> {
+    targets.update(detections, frame.received);
+    if !lock_active {
+        targets.release_lock();
+    }
+    let crosshair = (size.0 as f32 / 2.0, size.1 as f32 / 2.0);
+    targets.select_target(
+        crosshair,
+        fov_radius_px(size.0, size.1, fov_degrees),
+        prefer_head,
+    )
+}
+
 fn process_frame_with_scratch(
     frame: SourceFrame,
     config: &PipelineConfig,
-    smoother: &mut ExponentialTargetSmoother,
     runtime_cache: &mut Option<RuntimeCache>,
-    previous_target: Option<&PriorTarget>,
-    previous_is_fresh: bool,
+    targets: &mut TargetManager,
     pixel_seek_scratch: &mut PixelSeekScratch,
     crosshair: &mut CrosshairTracker,
     crossing: &mut CenterCrossing,
@@ -507,12 +487,18 @@ fn process_frame_with_scratch(
             .infer(processed)
             .map_err(|error| ProcessError::ObjectDetectionUnavailable(error.to_string()))?;
         let postprocess_started = Instant::now();
-        let boxes = decode_yolo_output(
-            &inference.shape,
-            &inference.values,
-            model.confidence,
-            model.iou,
-        )
+        // Abilities may have a lower Min confidence than the other classes.
+        let decode_threshold = model.confidence.min(config.ability_confidence);
+        let boxes = if model.end2end {
+            decode_end2end_output(&inference.shape, &inference.values, decode_threshold)
+        } else {
+            decode_yolo_output(
+                &inference.shape,
+                &inference.values,
+                decode_threshold,
+                model.iou,
+            )
+        }
         .map_err(|error| ProcessError::ObjectDetectionUnavailable(error.to_string()))?;
         let objects = to_detection_objects(boxes, model.class_names.as_ref(), rect.x, rect.y);
         let mut result = DetectionResult {
@@ -536,25 +522,36 @@ fn process_frame_with_scratch(
             auto_active: false,
             fov_degrees: config.fov_degrees,
         };
-        let candidates = object_detection_candidates(&result, model.confidence);
-        let selected_target = object_detection_target(
-            &candidates,
-            processed.width(),
-            processed.height(),
-            rect.x,
-            rect.y,
-            config.fov_degrees,
-            previous_target.filter(|_| target_lock_active),
-            previous_is_fresh && target_lock_active,
+        let mut candidates = object_detection_candidates(
+            &result,
+            model.confidence,
+            config.ability_confidence,
+            model.class_names.as_ref(),
         );
-        result.target_xy = selected_target
-            .as_ref()
-            .map(|target| [target.coordinate.x, target.coordinate.y]);
-        let filtered = smoother.update(result.target_xy.map(|point| FrameCoordinate {
-            x: point[0],
-            y: point[1],
-        }));
-        result.smoothed_target_xy = filtered.map(|point| [point.x, point.y]);
+        // Color swap: enemies carry the selected outline color, teammates do
+        // not. Checked on the original image, before any Color Filter.
+        if let Some(color) = config.color_swap {
+            let outline = color_mask(&frame.image, color);
+            let (width, height) = frame.image.dimensions();
+            candidates.retain(|detection| {
+                box_has_outline(&outline, width, height, detection.bbox_xyxy)
+            });
+        }
+        let selected = track_target(
+            targets,
+            &candidates,
+            &frame,
+            (processed.width(), processed.height()),
+            config.fov_degrees,
+            target_lock_active,
+            true,
+        );
+        let target_box = selected.map(TrackedEntity::bbox_xyxy);
+        result.target_xy = selected.map(|entity| {
+            let point = aim_point(entity.bbox_xyxy(), entity.kind);
+            [point.x, point.y]
+        });
+        result.smoothed_target_xy = result.target_xy;
         result.postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
         result.total_processing_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         let output_mask = match filter_mask.as_deref() {
@@ -568,15 +565,11 @@ fn process_frame_with_scratch(
             published_ns: monotonic_ns(),
             crop_x: rect.x,
             crop_y: rect.y,
-            selected_target,
-            smoothing_alpha: smoother.alphas(),
+            target_box,
             mask: output_mask,
         });
     }
     let started = Instant::now();
-    let locked = previous_target
-        .filter(|_| previous_is_fresh && target_lock_active)
-        .and_then(|previous| previous.bbox_xyxy);
     let mask = if let Some(mask) = filter_mask {
         mask
     } else {
@@ -589,10 +582,9 @@ fn process_frame_with_scratch(
     };
     // Auto owns this frame while active and only checks the mask around
     // the center.
-    let output = if config.auto_target_active {
+    let mut output = if config.auto_target_active {
         PixelSeekOutput {
             objects: Vec::new(),
-            target: None,
             mask,
         }
     } else {
@@ -600,17 +592,54 @@ fn process_frame_with_scratch(
             processed,
             rect,
             config.pixel_color,
-            config.fov_degrees,
-            locked,
             mask,
             pixel_seek_scratch,
         )
     };
+    let selected = if config.auto_target_active {
+        None
+    } else {
+        let clusters: Vec<Detection> = output
+            .objects
+            .iter()
+            .map(|object| Detection {
+                bbox_xyxy: object.bbox_xyxy,
+                class_id: None,
+                confidence: None,
+                kind: TargetKind::Body,
+            })
+            .collect();
+        track_target(
+            targets,
+            &clusters,
+            &frame,
+            (processed.width(), processed.height()),
+            config.fov_degrees,
+            target_lock_active,
+            false,
+        )
+        .map(TrackedEntity::bbox_xyxy)
+    };
+    // Only the targeted cluster is reported.
+    let (class_id, class_name) = config.pixel_color.class();
+    output.objects = selected
+        .map(|bbox_xyxy| DetectionObject {
+            class_id,
+            class_name: class_name.into(),
+            bbox_xyxy,
+            confidence: None,
+            pixel_count: None,
+        })
+        .into_iter()
+        .collect();
     // Measured on the original image: the filter blacks the crosshair out.
     crosshair.update(&frame.image);
     let crosshair_px = crosshair.radius_px();
     let detection_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let target_xy = output.target.map(|point| [point.x, point.y]);
+    let target_xy = selected.map(|bbox_xyxy| {
+        let point: FrameCoordinate = head_point(bbox_xyxy);
+        [point.x, point.y]
+    });
     let auto_target_valid = if config.auto_target_active {
         let sides = center_sides(
             &output.mask,
@@ -624,10 +653,6 @@ fn process_frame_with_scratch(
         crossing.reset();
         false
     };
-    let filtered = smoother.update(target_xy.map(|point| FrameCoordinate {
-        x: point[0],
-        y: point[1],
-    }));
     let output_mask = if config.color_filter {
         match try_pack_mask(&output.mask) {
             Some(mask) => Some(mask),
@@ -657,7 +682,7 @@ fn process_frame_with_scratch(
         total_processing_ms: total,
         inference_device: Some("cpu".into()),
         target_xy,
-        smoothed_target_xy: filtered.map(|point| [point.x, point.y]),
+        smoothed_target_xy: target_xy,
         auto_target_valid,
         auto_active: config.auto_target_active,
         fov_degrees: if config.auto_target_active {
@@ -673,8 +698,7 @@ fn process_frame_with_scratch(
         published_ns: monotonic_ns(),
         crop_x: rect.x,
         crop_y: rect.y,
-        selected_target: None,
-        smoothing_alpha: smoother.alphas(),
+        target_box: selected,
         mask: output_mask,
     })
 }
@@ -747,9 +771,6 @@ fn validate_config(config: &PipelineConfig) -> Result<(), &'static str> {
     if !(1..=360).contains(&config.fov_degrees) || !(1..=360).contains(&config.auto_fov_degrees) {
         return Err("FOV must be 1..360");
     }
-    if !config.smoothing_x.is_valid() || !config.smoothing_y.is_valid() {
-        return Err("smoothing must be 1..50 with min <= max");
-    }
     if config.crop_resolution == Some(0) {
         return Err("crop resolution must be positive");
     }
@@ -788,19 +809,6 @@ mod tests {
     use crate::config::ModelArtifacts;
     use crate::movement::{MovementRuntimeSettings, MovementTargetSample, MovementTicker};
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[test]
-    fn target_freshness_includes_time_spent_waiting_for_processing() {
-        let received = Instant::now();
-        assert!(target_is_fresh(
-            received,
-            received + Duration::from_millis(100)
-        ));
-        assert!(!target_is_fresh(
-            received,
-            received + Duration::from_millis(101)
-        ));
-    }
 
     #[test]
     fn frame_size_changes_invalidate_source_pixel_tracks() {
@@ -946,9 +954,12 @@ mod tests {
             sens: 0.25,
             offset_x: 0.0,
             offset_y: 0.0,
-            speed_x: 0.06,
-            speed_y: 0.06,
+            speed_x: crate::movement::motion::DEFAULT_SPEED,
+            speed_y: crate::movement::motion::DEFAULT_SPEED,
+            smoothing_x: crate::targeting::SmoothingRange::NONE,
+            smoothing_y: crate::targeting::SmoothingRange::NONE,
             smooth_fov_degrees: 20,
+            booster: None,
             no_deadzone: false,
             trigger_button: "right".into(),
             trigger_held: true,
@@ -988,10 +999,7 @@ mod tests {
                         config_revision: processed.auto_config_revision,
                         frame_id: processed.frame.frame_id,
                         target: Some((f64::from(target[0]), f64::from(target[1]))),
-                        smoothing_alpha: (
-                            f64::from(processed.smoothing_alpha.0),
-                            f64::from(processed.smoothing_alpha.1),
-                        ),
+                        target_box: processed.target_box.map(|b| b.map(f64::from)),
                         crop_origin: (processed.crop_x, processed.crop_y),
                         processed_size: (
                             processed.result.processed_width,
@@ -1110,8 +1118,7 @@ mod tests {
             auto_fov_degrees: 1,
             ..PipelineConfig::default()
         };
-        let mut smoother =
-            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut targets = TargetManager::default();
         let mut cache = None;
         // Motion first, then Auto off-center, center crossing, target loss,
         // and Motion again. Auto intent must survive target loss/delayed clicks.
@@ -1124,7 +1131,11 @@ mod tests {
         ] {
             config.auto_target_active = auto;
             let mut image = image::RgbImage::new(64, 64);
-            image.put_pixel(40, 32, image::Rgb([255, 0, 0]));
+            for y in 30..34 {
+                for x in 38..42 {
+                    image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+                }
+            }
             if center {
                 image.put_pixel(32, 32, image::Rgb([255, 0, 0]));
             }
@@ -1139,10 +1150,8 @@ mod tests {
             let result = process_frame(
                 frame,
                 &config,
-                &mut smoother,
                 &mut cache,
-                None,
-                false,
+                &mut targets,
                 &mut Default::default(),
             )
             .unwrap()
@@ -1169,17 +1178,14 @@ mod tests {
             received: std::time::Instant::now(),
         };
         let config = PipelineConfig::default();
-        let mut smoother =
-            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut targets = TargetManager::default();
         let mut runtime_cache = None;
         let mut crossing = CenterCrossing::default();
         let processed = process_frame(
             frame,
             &config,
-            &mut smoother,
             &mut runtime_cache,
-            None,
-            false,
+            &mut targets,
             &mut crossing,
         )
         .expect("the already-cropped frame should be processed as-is");
@@ -1209,49 +1215,67 @@ mod tests {
     }
 
     #[test]
-    fn pixel_seek_keeps_climbing_to_each_newly_visible_higher_pixel() {
-        // A target is first seen at row 4; as rows 3, 2, 1 and 0 appear, every
-        // frame must retarget to the new topmost pixel (no stickiness).
+    fn pixel_seek_aims_at_the_head_of_the_tracked_cluster_and_bridges_a_lost_frame() {
         let config = PipelineConfig {
             pixel_color: PixelTargetColor::Red,
             fov_degrees: 360,
             ..PipelineConfig::default()
         };
-        let mut smoother =
-            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut targets = TargetManager::default();
         let mut runtime_cache = None;
         let mut crossing = CenterCrossing::default();
         let mut image = image::RgbImage::new(64, 64);
-        for row in (0..=4u32).rev() {
-            image.put_pixel(32, row + 20, image::Rgb([255, 0, 0]));
-            let processed = process_frame(
+        for y in 20..40 {
+            for x in 27..37 {
+                image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        let start = Instant::now();
+        let mut run = |frame_id, image: &image::RgbImage, received| {
+            process_frame(
                 SourceFrame {
-                    frame_id: u64::from(row),
+                    frame_id,
                     timestamp_ns: 0,
                     image: image.clone(),
                     source: "test".into(),
                     jpeg: Default::default(),
-                    received: std::time::Instant::now(),
+                    received,
                 },
                 &config,
-                &mut smoother,
                 &mut runtime_cache,
-                None,
-                false,
+                &mut targets,
                 &mut crossing,
             )
-            .unwrap();
-            let target = processed.result.smoothed_target_xy.expect("target");
-            assert_eq!(target[1], (row + 20) as f32 + 0.5, "frame for row {row}");
-            assert_eq!(processed.result.objects.len(), 1);
-        }
+            .unwrap()
+        };
+        let seen = run(1, &image, start);
+        assert_eq!(seen.result.objects.len(), 1);
+        assert_eq!(seen.target_box, Some([27.0, 20.0, 37.0, 40.0]));
+        let target = seen.result.target_xy.expect("target");
+        assert_eq!(target[0], 32.0);
+        assert!((target[1] - 22.8).abs() < 1e-4, "14 % below the top");
+        // A frame without the target inside the grace period keeps it.
+        let lost = run(
+            2,
+            &image::RgbImage::new(64, 64),
+            start + Duration::from_millis(50),
+        );
+        assert_eq!(lost.result.target_xy, seen.result.target_xy);
+        let gone = run(
+            3,
+            &image::RgbImage::new(64, 64),
+            start + Duration::from_millis(200),
+        );
+        assert!(gone.result.target_xy.is_none() && gone.target_box.is_none());
     }
 
     #[test]
     fn color_filter_runs_before_detection_and_hands_its_mask_to_preview() {
         let mut image = image::RgbImage::from_pixel(64, 64, image::Rgb([40, 90, 200]));
-        for (x, y) in [(30, 20), (31, 20), (30, 21), (31, 21)] {
-            image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+        for y in 20..24 {
+            for x in 30..34 {
+                image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
         }
         image.put_pixel(5, 5, image::Rgb([250, 250, 250]));
         let run = |color_filter: bool| {
@@ -1261,8 +1285,7 @@ mod tests {
                 color_filter,
                 ..PipelineConfig::default()
             };
-            let mut smoother =
-                ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+            let mut targets = TargetManager::default();
             let mut crossing = CenterCrossing::default();
             process_frame(
                 SourceFrame {
@@ -1274,10 +1297,8 @@ mod tests {
                     received: std::time::Instant::now(),
                 },
                 &config,
-                &mut smoother,
                 &mut None,
-                None,
-                false,
+                &mut targets,
                 &mut crossing,
             )
             .unwrap()
@@ -1288,10 +1309,11 @@ mod tests {
         let mask = filtered.mask.as_ref().expect("filter mask");
         assert_eq!(mask.len(), (64 * 64 + 7) / 8);
         let bit_is_set = |index: usize| mask[index / 8] & (1 << (index % 8)) != 0;
-        assert_eq!(mask.iter().map(|byte| byte.count_ones()).sum::<u32>(), 4);
+        assert_eq!(mask.iter().map(|byte| byte.count_ones()).sum::<u32>(), 16);
         assert!(bit_is_set(20 * 64 + 30));
         assert!(!bit_is_set(5 * 64 + 5));
         // Only selected-color pixels remain, so the target is the same.
+        assert!(plain.result.target_xy.is_some());
         assert_eq!(filtered.result.target_xy, plain.result.target_xy);
         assert_eq!(filtered.result.objects.len(), 1);
     }
@@ -1322,24 +1344,22 @@ mod tests {
             device: "auto".into(),
             enabled: true,
             class_names: None,
+            end2end: false,
         };
         let config = PipelineConfig {
             strategy: DetectionMode::ObjectDetection,
             model: Some(model),
             ..PipelineConfig::default()
         };
-        let mut smoother =
-            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
+        let mut targets = TargetManager::default();
         let mut runtime_cache = None;
         let mut crossing = CenterCrossing::default();
 
         let error = process_frame(
             frame,
             &config,
-            &mut smoother,
             &mut runtime_cache,
-            None,
-            false,
+            &mut targets,
             &mut crossing,
         )
         .unwrap_err();

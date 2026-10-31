@@ -55,6 +55,12 @@ try {
         Invoke-CheckedNative -Command "cargo" -CommandArguments @("build", "--manifest-path", "rust-backend\Cargo.toml", "--features", "ort/load-dynamic,directml", "--bin", "receiver-backend", "--target", $target, "--release")
         $backend = Join-Path $root "rust-backend\target\$target\release\receiver-backend.exe"
         Copy-Item -LiteralPath $backend -Destination $sidecar -Force
+        # onnxruntime.dll, DirectML.dll and other runtime libraries ship next
+        # to SysX.exe; take them from SYSX_ORT_DIR when given.
+        if ($env:SYSX_ORT_DIR) {
+            Get-ChildItem -LiteralPath $env:SYSX_ORT_DIR -Filter *.dll -File |
+                Copy-Item -Destination (Join-Path $root "src-tauri\binaries") -Force
+        }
     }
 
     # 2. Tests.
@@ -68,6 +74,8 @@ try {
     $sysxExe = Join-Path $root "src-tauri\target\release\SysX.exe"
     if (-not (Test-Path $builtExe)) { throw "The native host build did not produce $builtExe" }
     Copy-Item -LiteralPath $builtExe -Destination $sysxExe -Force
+    Get-ChildItem -LiteralPath (Join-Path $root "src-tauri\binaries") -Filter *.dll -File |
+        Copy-Item -Destination (Split-Path -Parent $sysxExe) -Force
     Write-Host "Built $sysxExe"
 
     # 4. Headless protocol smoke; the app smoke opens windows, so it is opt-in.

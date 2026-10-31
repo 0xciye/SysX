@@ -11,32 +11,42 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Recoil patterns (user's `recoil.rs`): one vertical pull per bullet,
+/// in device counts at 100 %.
+pub const RECOIL_PATTERNS: [&str; 3] = ["vandal", "phantom", "custom"];
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RecoilSettings {
     pub recoil_enabled: bool,
+    /// "vandal", "phantom" or "custom" (`recoil_levels`).
+    pub recoil_pattern: String,
+    /// Custom pattern: the pull for each bullet; the last repeats.
     pub recoil_levels: Vec<i32>,
     pub recoil_start_delay_ms: u32,
+    /// Time per bullet.
     pub recoil_level_duration_ms: u32,
     pub recoil_percentage: u8,
-    pub recoil_allow_early_resample: bool,
 }
 
 impl Default for RecoilSettings {
     fn default() -> Self {
         Self {
             recoil_enabled: false,
+            recoil_pattern: "vandal".into(),
             recoil_levels: Vec::new(),
-            recoil_start_delay_ms: 0,
-            recoil_level_duration_ms: 0,
-            recoil_percentage: 0,
-            recoil_allow_early_resample: false,
+            recoil_start_delay_ms: 120,
+            recoil_level_duration_ms: 100,
+            recoil_percentage: 60,
         }
     }
 }
 
 impl RecoilSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !RECOIL_PATTERNS.contains(&self.recoil_pattern.as_str()) {
+            return Err("invalid recoil pattern");
+        }
         if self.recoil_levels.len() > 64
             || self
                 .recoil_levels
@@ -46,18 +56,161 @@ impl RecoilSettings {
             return Err("recoil levels must contain at most 64 values from -10000 to 10000");
         }
         if self.recoil_start_delay_ms > 60_000 || self.recoil_level_duration_ms > 5_000 {
-            return Err("recoil delay must be 0..60000 ms and level duration 0..5000 ms");
+            return Err("recoil delay must be 0..60000 ms and time per bullet 0..5000 ms");
         }
-        if self.recoil_enabled
-            && !self.recoil_levels.is_empty()
-            && self.recoil_level_duration_ms == 0
-        {
-            return Err("recoil level duration must be greater than 0 ms");
+        if self.recoil_enabled && self.recoil_level_duration_ms == 0 {
+            return Err("recoil time per bullet must be greater than 0 ms");
         }
-        if self.recoil_percentage > 100 {
-            return Err("recoil percentage must be 0..100");
+        if self.recoil_percentage > 200 {
+            return Err("recoil strength must be 0..200 %");
         }
         Ok(())
+    }
+}
+
+/// Magnet modes (user's `magnet.rs`, plus Auto's center-crossing click).
+pub const MAGNET_MODES: [&str; 5] = [
+    "spray",
+    "tap",
+    "silent_proximity",
+    "silent_immediate",
+    "auto",
+];
+
+/// Dynamic FOV keys: "off" or a trigger button held to widen the FOV.
+pub const DYNAMIC_FOV_KEYS: [&str; 4] = ["off", "right", "m4", "m5"];
+
+/// Magnet: while its trigger is held, pulls toward the target and fires.
+/// Every mode shares Delay, Cooldown and Sleep; Auto has no pull.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MagnetSettings {
+    pub enabled: bool,
+    pub mode: String,
+    pub trigger_button: String,
+    pub fov_degrees: u16,
+    /// FOV while `dynamic_fov_key` is held ("off": never).
+    pub dynamic_fov_degrees: u16,
+    pub dynamic_fov_key: String,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    /// Wait after a target appears before firing.
+    pub delay_ms: u32,
+    /// Spray: wait after a forced release before the next burst.
+    pub cooldown_ms: u32,
+    /// Evaluate Magnet at most this often (0: every device tick).
+    pub sleep_ms: u32,
+    /// Tap and silent modes: how long the button stays pressed.
+    pub fire_hold_ms: u32,
+    /// Spray: the longest burst.
+    pub forced_release_ms: u32,
+    /// Tap: wait after a release before the next tap (source `reset_timeout_ms`).
+    pub reset_timeout_ms: u32,
+    pub flick_proximity_px: f64,
+    /// Pull divisor drawn in [min, max] per move (1 = the whole error).
+    pub smooth_x_min: f64,
+    pub smooth_x_max: f64,
+    pub smooth_y_min: f64,
+    pub smooth_y_max: f64,
+    pub speed_booster: bool,
+    pub speed_near: f64,
+    pub speed_mid: f64,
+    pub speed_far: f64,
+}
+
+impl Default for MagnetSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "spray".into(),
+            trigger_button: "m5".into(),
+            fov_degrees: 36,
+            dynamic_fov_degrees: 160,
+            dynamic_fov_key: "off".into(),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            delay_ms: 0,
+            cooldown_ms: 90,
+            sleep_ms: 0,
+            fire_hold_ms: 30,
+            forced_release_ms: 250,
+            reset_timeout_ms: 250,
+            flick_proximity_px: 26.0,
+            smooth_x_min: 4.0,
+            smooth_x_max: 4.0,
+            smooth_y_min: 5.0,
+            smooth_y_max: 5.0,
+            speed_booster: false,
+            speed_near: 1.0,
+            speed_mid: 1.0,
+            speed_far: 1.0,
+        }
+    }
+}
+
+impl MagnetSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !MAGNET_MODES.contains(&self.mode.as_str()) {
+            return Err("invalid Magnet mode");
+        }
+        if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
+            return Err("invalid Magnet trigger button");
+        }
+        if !DYNAMIC_FOV_KEYS.contains(&self.dynamic_fov_key.as_str()) {
+            return Err("invalid Magnet dynamic FOV key");
+        }
+        if !(1..=360).contains(&self.fov_degrees) || !(1..=360).contains(&self.dynamic_fov_degrees)
+        {
+            return Err("Magnet FOV must be 1..360");
+        }
+        if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
+            return Err("Magnet offsets must be finite");
+        }
+        if [
+            self.delay_ms,
+            self.cooldown_ms,
+            self.sleep_ms,
+            self.fire_hold_ms,
+            self.forced_release_ms,
+            self.reset_timeout_ms,
+        ]
+        .iter()
+        .any(|ms| *ms > 10_000)
+        {
+            return Err("Magnet times must be 0..10000 ms");
+        }
+        if !(self.flick_proximity_px.is_finite()
+            && (0.0..=640.0).contains(&self.flick_proximity_px))
+        {
+            return Err("Magnet flick distance must be 0..640 px");
+        }
+        let range = |min: f64, max: f64| {
+            min.is_finite() && max.is_finite() && 1.0 <= min && min <= max && max <= 50.0
+        };
+        if !range(self.smooth_x_min, self.smooth_x_max)
+            || !range(self.smooth_y_min, self.smooth_y_max)
+        {
+            return Err("Magnet smoothing must be 1..50 with min <= max");
+        }
+        if ![self.speed_near, self.speed_mid, self.speed_far]
+            .iter()
+            .all(|speed| speed.is_finite() && (0.0..=10.0).contains(speed))
+        {
+            return Err("Magnet booster speeds must be 0..10");
+        }
+        Ok(())
+    }
+
+    /// Auto is the Magnet mode "auto"; its click timing keeps its own state.
+    pub fn auto(&self) -> AutoSettings {
+        AutoSettings {
+            enabled: self.enabled && self.mode == "auto",
+            trigger_button: self.trigger_button.clone(),
+            fov_degrees: self.fov_degrees,
+            delay_ms: self.delay_ms,
+            cooldown_ms: self.cooldown_ms,
+            sleep_ms: self.sleep_ms,
+        }
     }
 }
 
@@ -144,23 +297,39 @@ pub struct AppSettings {
     pub trigger_button: String,
     pub strategy: String,
     pub fov_degrees: u16,
+    /// Motion FOV while `dynamic_fov_key` is held ("off": never).
+    pub dynamic_fov_degrees: u16,
+    pub dynamic_fov_key: String,
     pub offset_x: f64,
     pub offset_y: f64,
-    /// Smoothing strength 1–50 per axis (1 = none); each track draws a
-    /// strength between min and max.
+    /// Smoothing 1–50 per axis: Motion divides the error by a value drawn
+    /// between min and max on every frame (1 moves the whole error).
+    /// Motion Speed per axis: the fraction of the error moved per frame
+    /// (stable Normal).
+    pub motion_speed_x: f64,
+    pub motion_speed_y: f64,
+    /// Inside this FOV the speed is divided by the smoothing strength.
+    pub smooth_fov_degrees: u16,
     pub smoothing_x_min: f32,
     pub smoothing_x_max: f32,
     pub smoothing_y_min: f32,
     pub smoothing_y_max: f32,
     pub sens: f64,
-    /// Normal motion speed per axis: the fraction of the target error moved
-    /// per frame (0.01–1).
-    pub motion_speed_x: f64,
-    pub motion_speed_y: f64,
-    pub motion_no_deadzone: bool,
-    /// Inside this FOV (degrees, same scale as the Motion FOV) the speed is
-    /// divided by the smoothing strength.
-    pub smooth_fov_degrees: u16,
+    /// Scale the Motion step by distance: near (< 30 px), mid (30–80 px)
+    /// and far (≥ 200 px), interpolated between.
+    pub speed_booster: bool,
+    pub speed_near: f64,
+    pub speed_mid: f64,
+    pub speed_far: f64,
+    /// Keep full speed while the crosshair is inside the target box
+    /// (otherwise 35 %).
+    pub continue_inside_box: bool,
+    /// Object Detection Color swap: the enemy outline color in game
+    /// ("off", "yellow", "red", "purple"); only boxes holding that color are
+    /// targets, so teammates (no enemy outline) are not.
+    pub color_swap: String,
+    /// Object Detection: Min confidence of ability classes (0..1).
+    pub ability_confidence: f64,
     pub scale: String,
     pub show_preview: bool,
     pub crop_resolution: u32,
@@ -177,6 +346,7 @@ pub struct AppSettings {
     #[serde(rename = "recoil", alias = "nativeMotion", alias = "native_motion")]
     pub recoil: RecoilSettings,
     pub auto: AutoSettings,
+    pub magnet: MagnetSettings,
 }
 
 impl Default for AppSettings {
@@ -192,17 +362,25 @@ impl Default for AppSettings {
             trigger_button: "right".into(),
             strategy: "pixel_seek".into(),
             fov_degrees: 36,
+            dynamic_fov_degrees: 160,
+            dynamic_fov_key: "off".into(),
             offset_x: 0.0,
             offset_y: 0.0,
+            motion_speed_x: crate::movement::motion::DEFAULT_SPEED,
+            motion_speed_y: crate::movement::motion::DEFAULT_SPEED,
+            smooth_fov_degrees: 20,
             smoothing_x_min: 1.0,
             smoothing_x_max: 1.0,
             smoothing_y_min: 1.0,
             smoothing_y_max: 1.0,
             sens: 0.25,
-            motion_speed_x: crate::movement::DEFAULT_SPEED,
-            motion_speed_y: crate::movement::DEFAULT_SPEED,
-            motion_no_deadzone: false,
-            smooth_fov_degrees: 20,
+            speed_booster: false,
+            speed_near: 1.0,
+            speed_mid: 1.0,
+            speed_far: 1.0,
+            continue_inside_box: false,
+            color_swap: "off".into(),
+            ability_confidence: 0.6,
             scale: "Smooth".into(),
             show_preview: true,
             crop_resolution: 640,
@@ -218,6 +396,7 @@ impl Default for AppSettings {
             compute_target: "cpu".into(),
             recoil: RecoilSettings::default(),
             auto: AutoSettings::default(),
+            magnet: MagnetSettings::default(),
         }
     }
 }
@@ -372,7 +551,47 @@ impl AppSettings {
         }
     }
 
+    pub fn speed_booster(&self) -> Option<crate::movement::motion::SpeedBooster> {
+        self.speed_booster
+            .then_some(crate::movement::motion::SpeedBooster {
+                near: self.speed_near,
+                mid: self.speed_mid,
+                far: self.speed_far,
+            })
+    }
+
+    /// The enemy outline color Object Detection requires, if any.
+    pub fn color_swap(&self) -> Option<crate::pixel_seek::PixelTargetColor> {
+        crate::pixel_seek::PixelTargetColor::parse(&self.color_swap)
+    }
+
     pub fn validate(&mut self) -> Result<(), SettingsError> {
+        // Always on and Toggle exclude each other; Always on wins in files
+        // saved with both.
+        if self.motion_always_on {
+            self.motion_toggle = false;
+        }
+        // Smoothing and offsets are whole numbers (user request).
+        for value in [
+            &mut self.smoothing_x_min,
+            &mut self.smoothing_x_max,
+            &mut self.smoothing_y_min,
+            &mut self.smoothing_y_max,
+        ] {
+            *value = value.round();
+        }
+        for value in [
+            &mut self.offset_x,
+            &mut self.offset_y,
+            &mut self.magnet.offset_x,
+            &mut self.magnet.offset_y,
+            &mut self.magnet.smooth_x_min,
+            &mut self.magnet.smooth_x_max,
+            &mut self.magnet.smooth_y_min,
+            &mut self.magnet.smooth_y_max,
+        ] {
+            *value = value.round();
+        }
         if !TRIGGER_BUTTONS.contains(&self.trigger_button.as_str()) {
             return Err(SettingsError::Invalid("invalid trigger button"));
         }
@@ -386,8 +605,12 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid("Min confidence must be from 0 to 1"));
         }
-        if !(1..=360).contains(&self.fov_degrees) {
+        if !(1..=360).contains(&self.fov_degrees) || !(1..=360).contains(&self.dynamic_fov_degrees)
+        {
             return Err(SettingsError::Invalid("FOV must be 1..360"));
+        }
+        if !DYNAMIC_FOV_KEYS.contains(&self.dynamic_fov_key.as_str()) {
+            return Err(SettingsError::Invalid("invalid dynamic FOV key"));
         }
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err(SettingsError::Invalid("offsets must be finite"));
@@ -400,18 +623,30 @@ impl AppSettings {
         if !self.sens.is_finite() || !(0.01..=10.0).contains(&self.sens) {
             return Err(SettingsError::Invalid("sensitivity must be 0.01..10"));
         }
+        if ![self.speed_near, self.speed_mid, self.speed_far]
+            .iter()
+            .all(|speed| speed.is_finite() && (0.0..=10.0).contains(speed))
+        {
+            return Err(SettingsError::Invalid("booster speeds must be 0..10"));
+        }
         if ![self.motion_speed_x, self.motion_speed_y]
             .iter()
             .all(|speed| speed.is_finite() && (0.01..=1.0).contains(speed))
         {
             return Err(SettingsError::Invalid("motion speed must be 0.01..1"));
         }
-        self.motion_renderer
-            .validate()
-            .map_err(SettingsError::Invalid)?;
         if self.smooth_fov_degrees > 360 {
             return Err(SettingsError::Invalid("Smooth FOV must be 0..360"));
         }
+        if !(0.0..=1.0).contains(&self.ability_confidence) {
+            return Err(SettingsError::Invalid("ability confidence must be 0..1"));
+        }
+        if self.color_swap != "off" && self.color_swap().is_none() {
+            return Err(SettingsError::Invalid("invalid color swap"));
+        }
+        self.motion_renderer
+            .validate()
+            .map_err(SettingsError::Invalid)?;
         if !["Smooth", "Pixel perfect"].contains(&self.scale.as_str()) {
             return Err(SettingsError::Invalid("invalid preview scale"));
         }
@@ -448,14 +683,20 @@ impl AppSettings {
         }
         self.recoil.validate().map_err(SettingsError::Invalid)?;
         self.auto.validate().map_err(SettingsError::Invalid)?;
+        self.magnet.validate().map_err(SettingsError::Invalid)?;
+        // Auto is a Magnet mode; its stored section follows Magnet.
+        self.auto = self.magnet.auto();
         self.show_preview = true;
         Ok(())
     }
 }
 
 fn profile_snapshot(settings: &AppSettings) -> Value {
+    // Auto is derived from Magnet; snapshots store the derived section.
+    let mut derived = settings.clone();
+    derived.auto = derived.magnet.auto();
     let mut value =
-        serde_json::to_value(settings).unwrap_or_else(|_| Value::Object(Default::default()));
+        serde_json::to_value(derived).unwrap_or_else(|_| Value::Object(Default::default()));
     if let Some(object) = value.as_object_mut() {
         object.remove("activeProfile");
         object.remove("profiles");
@@ -482,6 +723,9 @@ pub fn load_settings(path: impl AsRef<Path>) -> AppSettings {
     };
     migrate_smoothing(&mut json);
     migrate_trigger_buttons(&mut json);
+    migrate_recoil(&mut json);
+    migrate_auto_into_magnet(&mut json);
+    migrate_no_deadzone(&mut json);
     migrate_crop_resolution(&mut json);
     let Ok(mut value) = serde_json::from_value::<AppSettings>(json) else {
         return default_settings_with_profiles();
@@ -498,6 +742,103 @@ fn default_settings_with_profiles() -> AppSettings {
     let mut settings = AppSettings::default();
     settings.normalize_profiles();
     settings
+}
+
+/// Stable's `motionNoDeadzone` is `continueInsideBox` ("No deadzone") now,
+/// in the settings and in every profile.
+fn migrate_no_deadzone(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        let Some(object) = settings.as_object_mut() else {
+            return;
+        };
+        if let Some(value) = object.remove("motionNoDeadzone") {
+            object.entry("continueInsideBox").or_insert(value);
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json.get_mut("profiles").and_then(Value::as_array_mut) {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
+}
+
+/// Auto became a Magnet mode (user request, 2026-10-31). Settings saved
+/// before that (no `magnet.fovDegrees`) take Magnet's trigger, FOV and timing
+/// from Auto, and select the Auto mode when Auto was on.
+fn migrate_auto_into_magnet(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        let Some(auto) = settings.get("auto").cloned() else {
+            return;
+        };
+        if settings
+            .get("magnet")
+            .and_then(|magnet| magnet.get("fovDegrees"))
+            .is_some()
+        {
+            return;
+        }
+        if !settings.get("magnet").is_some_and(Value::is_object) {
+            settings["magnet"] = serde_json::json!({});
+        }
+        let magnet = &mut settings["magnet"];
+        for (from, to) in [
+            ("triggerButton", "triggerButton"),
+            ("fovDegrees", "fovDegrees"),
+            ("delayMs", "delayMs"),
+            ("cooldownMs", "cooldownMs"),
+            ("sleepMs", "sleepMs"),
+        ] {
+            if let Some(value) = auto.get(from) {
+                magnet[to] = value.clone();
+            }
+        }
+        if auto.get("enabled") == Some(&serde_json::json!(true)) {
+            magnet["enabled"] = serde_json::json!(true);
+            magnet["mode"] = serde_json::json!("auto");
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json.get_mut("profiles").and_then(Value::as_array_mut) {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
+}
+
+/// Recoil before patterns: its levels become the Custom pattern, and an
+/// unset time per bullet (0) becomes the default, in every profile too.
+fn migrate_recoil(json: &mut serde_json::Value) {
+    fn migrate(settings: &mut serde_json::Value) {
+        let Some(recoil) = settings.get_mut("recoil").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if !recoil.contains_key("recoilPattern") {
+            let custom = recoil
+                .get("recoilLevels")
+                .and_then(Value::as_array)
+                .is_some_and(|levels| !levels.is_empty());
+            recoil.insert(
+                "recoilPattern".into(),
+                serde_json::json!(if custom { "custom" } else { "vandal" }),
+            );
+        }
+        if recoil.get("recoilLevelDurationMs").and_then(Value::as_u64) == Some(0) {
+            recoil.insert("recoilLevelDurationMs".into(), serde_json::json!(100));
+        }
+    }
+    migrate(json);
+    if let Some(profiles) = json.get_mut("profiles").and_then(Value::as_array_mut) {
+        for profile in profiles {
+            if let Some(settings) = profile.get_mut("settings") {
+                migrate(settings);
+            }
+        }
+    }
 }
 
 /// Middle was a trigger choice before it became the profile-cycle button;
@@ -584,6 +925,7 @@ static SETTINGS_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn capture_identity(settings: &AppSettings) -> serde_json::Value {
     let mut current = settings.clone();
+    current.auto = current.magnet.auto(); // derived on save
     current.profiles.clear(); // inactive snapshots are preserved from disk on save
     serde_json::to_value(current).unwrap_or_default()
 }
@@ -727,6 +1069,9 @@ pub struct ModelDefinition {
     pub enabled: bool,
     #[serde(default)]
     pub class_names: Option<HashMap<u32, String>>,
+    /// Output already decoded and NMS-free (`onnx_info::OnnxInfo::end2end`).
+    #[serde(default)]
+    pub end2end: bool,
 }
 fn default_confidence() -> f32 {
     0.5
@@ -907,7 +1252,7 @@ mod tests {
                             .unwrap();
                     }
                     settings.sens = [0.23, 0.75, 1.25][index];
-                    settings.auto.delay_ms = 10 + index as u32;
+                    settings.magnet.delay_ms = 10 + index as u32;
                     settings.sync_active_profile();
                 }
                 settings.activate_profile(active).unwrap();
@@ -930,7 +1275,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(settings.sens, selected.sens);
-                assert_eq!(settings.auto, selected.auto);
+                assert_eq!(settings.magnet, selected.magnet);
             }
         }
     }
@@ -1005,6 +1350,8 @@ mod tests {
         let mut old = serde_json::to_value(AppSettings::default()).unwrap();
         old["triggerButton"] = serde_json::json!("middle");
         old["auto"]["triggerButton"] = serde_json::json!("middle");
+        // Saved before Auto became a Magnet mode.
+        old.as_object_mut().unwrap().remove("magnet");
         let mut snapshot = old.clone();
         snapshot.as_object_mut().unwrap().remove("profiles");
         snapshot["triggerButton"] = serde_json::json!("m4");
@@ -1050,7 +1397,7 @@ mod tests {
         old["strategy"] = serde_json::json!("object_detection");
         let mut second = old.clone();
         second.as_object_mut().unwrap().remove("profiles");
-        second["motionSpeedX"] = serde_json::json!(0.12);
+        second["speedNear"] = serde_json::json!(0.12);
         old["profiles"] = serde_json::json!([
             {"name":"Default","settings":old.clone()},
             {"name":"Second","settings":second}
@@ -1067,7 +1414,7 @@ mod tests {
         assert_eq!(loaded.profiles[0].settings["strategy"], "object_detection");
         assert_eq!(loaded.profiles[1].settings["strategy"], "object_detection");
         loaded.activate_profile(1).unwrap();
-        assert_eq!(loaded.motion_speed_x, 0.12);
+        assert_eq!(loaded.speed_near, 0.12);
         assert_eq!(loaded.strategy, "object_detection");
         let _ = fs::remove_dir_all(directory);
     }
@@ -1086,7 +1433,7 @@ mod tests {
         let path = directory.join("app-settings.json");
         let mut old = serde_json::to_value(AppSettings::default()).unwrap();
         old["cropResolution"] = serde_json::json!(8192);
-        old["motionSpeedX"] = serde_json::json!(0.12);
+        old["speedNear"] = serde_json::json!(0.12);
         let mut second = old.clone();
         second.as_object_mut().unwrap().remove("profiles");
         second["cropResolution"] = serde_json::json!(256);
@@ -1105,7 +1452,7 @@ mod tests {
             loaded.crop_resolution,
             sysx_ui::protocol::MAX_CROP_RESOLUTION
         );
-        assert_eq!(loaded.motion_speed_x, 0.12);
+        assert_eq!(loaded.speed_near, 0.12);
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(
             loaded.profiles[0].settings["cropResolution"],
@@ -1113,7 +1460,7 @@ mod tests {
         );
         loaded.activate_profile(1).unwrap();
         assert_eq!(loaded.crop_resolution, 256);
-        assert_eq!(loaded.motion_speed_x, 0.12);
+        assert_eq!(loaded.speed_near, 0.12);
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -1150,7 +1497,7 @@ mod tests {
         assert!(saved.get("smoothingAlphaX").is_none());
 
         // Out of range or reversed ranges are rejected.
-        for (min, max) in [(6.0, 3.0), (0.5, 3.0), (1.0, 51.0)] {
+        for (min, max) in [(6.0, 3.0), (0.0, 3.0), (1.0, 51.0)] {
             let mut invalid = AppSettings {
                 smoothing_x_min: min,
                 smoothing_x_max: max,
@@ -1259,6 +1606,79 @@ mod tests {
     }
 
     #[test]
+    fn old_recoil_levels_become_the_custom_pattern_and_magnet_is_validated() {
+        let mut json = serde_json::json!({
+            "recoil":{"recoilEnabled":true,"recoilLevels":[3,7],"recoilLevelDurationMs":0},
+            "profiles":[{"name":"Default","settings":{"recoil":{"recoilLevels":[]}}}]
+        });
+        migrate_recoil(&mut json);
+        assert_eq!(json["recoil"]["recoilPattern"], "custom");
+        assert_eq!(json["recoil"]["recoilLevelDurationMs"], 100);
+        assert_eq!(
+            json["profiles"][0]["settings"]["recoil"]["recoilPattern"],
+            "vandal"
+        );
+        let mut settings: AppSettings = serde_json::from_value(json).unwrap();
+        assert!(settings.validate().is_ok());
+
+        let defaults = MagnetSettings::default();
+        assert!(!defaults.enabled && defaults.validate().is_ok());
+        for broken in [
+            MagnetSettings {
+                mode: "aim".into(),
+                ..MagnetSettings::default()
+            },
+            MagnetSettings {
+                trigger_button: "left".into(),
+                ..MagnetSettings::default()
+            },
+            MagnetSettings {
+                smooth_x_min: 0.5,
+                ..MagnetSettings::default()
+            },
+            MagnetSettings {
+                fire_hold_ms: 20_000,
+                ..MagnetSettings::default()
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_auto_becomes_the_magnet_auto_mode() {
+        let mut json = serde_json::json!({
+            "auto":{"enabled":true,"triggerButton":"m4","fovDegrees":50,"delayMs":20,"cooldownMs":300,"sleepMs":5},
+            "magnet":{"enabled":false,"mode":"spray"}
+        });
+        migrate_auto_into_magnet(&mut json);
+        let mut settings: AppSettings = serde_json::from_value(json).unwrap();
+        settings.validate().unwrap();
+        let magnet = &settings.magnet;
+        assert!(magnet.enabled);
+        assert_eq!(magnet.mode, "auto");
+        assert_eq!(
+            (
+                magnet.trigger_button.as_str(),
+                magnet.fov_degrees,
+                magnet.delay_ms,
+                magnet.cooldown_ms,
+                magnet.sleep_ms
+            ),
+            ("m4", 50, 20, 300, 5)
+        );
+        assert_eq!(settings.auto, magnet.auto());
+        // Saved after the change: Magnet already has its own FOV.
+        let mut later = serde_json::to_value(&settings).unwrap();
+        later["magnet"]["mode"] = serde_json::json!("tap");
+        migrate_auto_into_magnet(&mut later);
+        assert_eq!(later["magnet"]["mode"], "tap");
+        let mut tap: AppSettings = serde_json::from_value(later).unwrap();
+        tap.validate().unwrap();
+        assert!(!tap.auto.enabled, "Auto runs only in the auto mode");
+    }
+
+    #[test]
     fn recoil_defaults_are_disabled_and_valid() {
         let settings = AppSettings::default();
         assert!(!settings.recoil.recoil_enabled);
@@ -1266,15 +1686,81 @@ mod tests {
     }
 
     #[test]
-    fn no_deadzone_defaults_off_for_new_and_legacy_settings() {
-        assert!(!AppSettings::default().motion_no_deadzone);
-        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.motion_no_deadzone);
-        let mut enabled = AppSettings::default();
-        enabled.motion_no_deadzone = true;
-        let restored: AppSettings =
-            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
-        assert!(restored.motion_no_deadzone);
+    fn motion_defaults_are_stable_normal_and_its_keys_load() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.continue_inside_box && !defaults.speed_booster);
+        assert_eq!(
+            (defaults.motion_speed_x, defaults.motion_speed_y, defaults.smooth_fov_degrees),
+            (0.045, 0.045, 20)
+        );
+        assert_eq!(
+            (defaults.smoothing_x(), defaults.smoothing_y()),
+            (SmoothingRange::NONE, SmoothingRange::NONE)
+        );
+        let mut legacy: AppSettings =
+            serde_json::from_str(r#"{"motionSpeedX":0.1,"motionSpeedY":0.12,"smoothFovDegrees":30}"#)
+                .unwrap();
+        assert!(legacy.validate().is_ok());
+        assert_eq!((legacy.motion_speed_x, legacy.motion_speed_y), (0.1, 0.12));
+        assert_eq!(legacy.smooth_fov_degrees, 30);
+        let mut json = serde_json::json!({
+            "motionNoDeadzone": true,
+            "profiles": [{"name": "A", "settings": {"motionNoDeadzone": true}}]
+        });
+        migrate_no_deadzone(&mut json);
+        assert_eq!(json["continueInsideBox"], true);
+        assert_eq!(json["profiles"][0]["settings"]["continueInsideBox"], true);
+        assert!(json.get("motionNoDeadzone").is_none());
+        legacy.motion_speed_x = 0.0;
+        assert!(legacy.validate().is_err(), "speed 0.01..1");
+    }
+
+    #[test]
+    fn always_on_excludes_toggle_and_smoothing_and_offsets_are_whole() {
+        let mut settings = AppSettings {
+            motion_always_on: true,
+            motion_toggle: true,
+            smoothing_x_min: 5.4,
+            smoothing_x_max: 7.6,
+            offset_x: -2.5,
+            offset_y: 1.4,
+            ..AppSettings::default()
+        };
+        settings.magnet.smooth_y_max = 6.7;
+        settings.magnet.offset_x = 3.2;
+        settings.speed_near = 1.25;
+        settings.validate().unwrap();
+        assert!(settings.motion_always_on && !settings.motion_toggle);
+        assert_eq!((settings.smoothing_x_min, settings.smoothing_x_max), (5.0, 8.0));
+        assert_eq!((settings.offset_x, settings.offset_y), (-3.0, 1.0));
+        assert_eq!((settings.magnet.smooth_y_max, settings.magnet.offset_x), (7.0, 3.0));
+        assert_eq!(settings.speed_near, 1.25, "the booster keeps its decimals");
+        // Toggle alone stays on; old files with axisGuard load and drop it.
+        let mut toggle: AppSettings =
+            serde_json::from_str(r#"{"motionToggle":true,"axisGuard":false}"#).unwrap();
+        toggle.validate().unwrap();
+        assert!(toggle.motion_toggle);
+        assert!(serde_json::to_value(&toggle).unwrap().get("axisGuard").is_none());
+    }
+
+    #[test]
+    fn color_swap_is_off_by_default_and_validated() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.color_swap(), None);
+        settings.color_swap = "yellow".into();
+        assert_eq!(
+            settings.color_swap(),
+            Some(crate::pixel_seek::PixelTargetColor::Yellow)
+        );
+        assert!(settings.validate().is_ok());
+        settings.color_swap = "green".into();
+        assert!(settings.validate().is_err());
+        // Older files load without it; their targetZone is dropped.
+        let loaded: AppSettings =
+            serde_json::from_str(r#"{"targetZone":"body","colorSwapTo":"red"}"#).unwrap();
+        assert_eq!(loaded.color_swap, "off");
+        let saved = serde_json::to_value(&loaded).unwrap();
+        assert!(saved.get("targetZone").is_none());
     }
 
     #[test]

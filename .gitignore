@@ -14,3 +14,8 @@ dist-package/
 dist-symbols/
 target*/
 /scripts/__pycache__/
+
+# Built-in Object Detection models embedded at build time (not versioned)
+rust-backend/models/*
+!rust-backend/models/.gitkeep
+/runtime-deps/

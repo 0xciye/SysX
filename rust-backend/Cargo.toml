@@ -46,7 +46,9 @@ half = "2"
 # Object Detection dependencies: retained for development, not ready for use.
 # Pixel Seek is the only currently available detection engine.
 openvino = { version = "0.11.1", features = ["runtime-linking"] }
-ort = "2.0.0-rc.14"
+# api-22: works with any onnxruntime.dll from ONNX Runtime 1.22 on (load-dynamic
+# loads the one shipped next to SysX.exe).
+ort = { version = "2.0.0-rc.14", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-22"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,4 +64,4 @@ baracuda-tensorrt = { version = "0.0.1-alpha.94", optional = true }
 turbojpeg = { version = "1.5", default-features = false, features = ["cmake", "require-simd"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_Media", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_Media", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"] }

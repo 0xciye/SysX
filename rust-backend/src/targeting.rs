@@ -1,5 +1,6 @@
 use crate::results::{DetectionMode, DetectionResult};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use crate::target_manager::{Detection, TargetKind};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameCoordinate {
@@ -15,18 +16,11 @@ pub struct TargetCandidate {
     pub score: Option<f32>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct PriorTarget {
-    pub bbox_xyxy: Option<[f32; 4]>,
-    pub class_id: Option<u32>,
-}
-
 /// FOV degrees map to pixels against this fixed reference side, not the
 /// crop: the crop is a native-resolution cutout, so the same setting must be
 /// the same circle on screen at every Crop Resolution (360° = 640 px).
 pub const FOV_REFERENCE_PX: f32 = 640.0;
 
-/// FOV circle radius in image pixels, limited to the image.
 /// Center of an `[left, top, right, bottom]` box, in the box's own coordinate
 /// space (original-frame pixels for model detections).
 pub fn bbox_center(bbox_xyxy: [f32; 4]) -> FrameCoordinate {
@@ -37,218 +31,151 @@ pub fn bbox_center(bbox_xyxy: [f32; 4]) -> FrameCoordinate {
     }
 }
 
+/// FOV circle radius in image pixels, limited to the image.
 pub fn fov_radius_px(width: u32, height: u32, degrees: u16) -> f32 {
     let limit = (width.min(height) as f32 - 1.0).max(0.0) / 2.0;
     ((FOV_REFERENCE_PX - 1.0) * f32::from(degrees) / 720.0).min(limit)
 }
 
-pub(crate) fn fov_row_bounds(height: u32, radius: f32) -> (u32, u32) {
-    let center = height as f32 / 2.0;
-    let limit = i64::from(height);
-    let first = ((center - radius - 0.5).ceil() as i64).clamp(0, limit) as u32;
-    let end = ((center + radius - 0.5).floor() as i64 + 1).clamp(0, limit) as u32;
-    (first, end)
+/// What a model class is for targeting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassRole {
+    /// Selected first, aimed at its center.
+    Head,
+    Target,
+    /// Enemy utility (`ability` classes): a target with its own Min ability
+    /// confidence, selected only without heads and bodies in the FOV.
+    Ability,
+    /// Teammates, utility, weapons, dead bodies, the own character.
+    Ignore,
 }
 
-pub fn highest_pixel_in_fov(
-    mask: &[u8],
-    width: u32,
-    height: u32,
-    degrees: u16,
-) -> Option<FrameCoordinate> {
-    highest_pixel_in_fov_within(mask, width, height, degrees, [0, 0, width, height], None)
-}
+/// Name words of classes that are never targets.
+const IGNORED_WORDS: &[&str] = &[
+    "teammate", "teammates", "team", "tm", "ally", "allies", "friend", "friendly", "utility",
+    "flash", "smoke", "fire", "molotov", "grenade", "nade",
+    "projectile", "weapon", "gun", "dead", "corpse", "third", "self",
+];
 
-/// Topmost mask pixel inside both the FOV circle and `region`
-/// (`[left, top, right, bottom)` in mask pixels, right/bottom exclusive).
-/// Ties on a row go to the pixel closest to `preferred_x`, or the horizontal
-/// center when no tracked position is available.
-pub fn highest_pixel_in_fov_within(
-    mask: &[u8],
-    width: u32,
-    height: u32,
-    degrees: u16,
-    region: [u32; 4],
-    preferred_x: Option<f32>,
-) -> Option<FrameCoordinate> {
-    if width == 0
-        || height == 0
-        || !(1..=360).contains(&degrees)
-        || mask.len() != width as usize * height as usize
-    {
-        return None;
+/// The role of `class_id` from the model's own class names (Ultralytics
+/// `names` metadata): a name with a word from `IGNORED_WORDS` is ignored,
+/// the word `ability`/`abilities` makes an ability, `head` a head, anything
+/// else is a target. Without names the source's fixed classes apply:
+/// 1 head, 2 teammate, 3 ability, 4 utility.
+pub fn class_role(names: Option<&HashMap<u32, String>>, class_id: u32) -> ClassRole {
+    let Some(names) = names else {
+        return match class_id {
+            1 => ClassRole::Head,
+            3 => ClassRole::Ability,
+            2 | 4 => ClassRole::Ignore,
+            _ => ClassRole::Target,
+        };
+    };
+    let Some(name) = names.get(&class_id) else {
+        return ClassRole::Target;
+    };
+    let name = name.to_lowercase();
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.iter().any(|word| IGNORED_WORDS.contains(word)) {
+        ClassRole::Ignore
+    } else if words.iter().any(|word| ["ability", "abilities"].contains(word)) {
+        ClassRole::Ability
+    } else if words.contains(&"head") {
+        ClassRole::Head
+    } else {
+        ClassRole::Target
     }
-    let [left, top, right, bottom] = [
-        region[0].min(width),
-        region[1].min(height),
-        region[2].min(width),
-        region[3].min(height),
-    ];
-    let cx = width as f32 / 2.0;
-    let cy = height as f32 / 2.0;
-    let preferred_x = preferred_x.filter(|x| x.is_finite()).unwrap_or(cx);
-    let radius = fov_radius_px(width, height, degrees);
-    let radius_squared = radius * radius;
-    let (fov_top, fov_bottom) = fov_row_bounds(height, radius);
-    for y in top.max(fov_top)..bottom.min(fov_bottom) {
-        let py = y as f32 + 0.5;
-        let dy = py - cy;
-        let dy_squared = dy * dy;
-        if dy_squared > radius_squared {
-            continue;
-        }
-        let half_width = (radius_squared - dy_squared).max(0.0).sqrt();
-        let row_left = ((cx - half_width - 0.5).floor() as i64)
-            .max(left as i64)
-            .max(0) as u32;
-        let row_right = ((cx + half_width - 0.5).ceil() as i64 + 1)
-            .min(right as i64)
-            .min(width as i64)
-            .max(0) as u32;
-        let mut best_x: Option<u32> = None;
-        let mut best_distance_squared = f32::INFINITY;
-        for x in row_left..row_right {
-            if mask[(y * width + x) as usize] != 0 {
-                let px = x as f32 + 0.5;
-                let dx = px - cx;
-                if dx * dx + dy_squared <= radius_squared {
-                    let anchor_delta = px - preferred_x;
-                    let distance_squared = anchor_delta * anchor_delta;
-                    if distance_squared < best_distance_squared {
-                        best_x = Some(x);
-                        best_distance_squared = distance_squared;
-                    }
-                }
-            }
-            // Stop only after the scan has passed the best hit's distance;
-            // the first pixel past the anchor can still be closer than a far-left hit.
-            if best_x.is_some() {
-                let pixel_x = x as f32 + 0.5;
-                let anchor_delta = pixel_x - preferred_x;
-                if pixel_x >= preferred_x && anchor_delta * anchor_delta >= best_distance_squared {
-                    break;
-                }
-            }
-        }
-        if let Some(x) = best_x {
-            return Some(FrameCoordinate {
-                x: x as f32 + 0.5,
-                y: py,
-            });
-        }
-    }
-    None
 }
 
+/// Head aim point: this fraction of the box height below its top.
+pub const HEAD_RATIO_Y: f32 = 0.15;
+
+/// Where Object Detection aims inside a box: a body `HEAD_RATIO_Y` below
+/// its top, a head or an ability at its center. Heads are selected first
+/// (`TargetManager::select_target`).
+pub fn aim_point(bbox_xyxy: [f32; 4], kind: TargetKind) -> FrameCoordinate {
+    let [left, top, right, bottom] = bbox_xyxy;
+    if kind != TargetKind::Body {
+        return bbox_center(bbox_xyxy);
+    }
+    FrameCoordinate {
+        x: (left + right) * 0.5,
+        y: top + HEAD_RATIO_Y * (bottom - top),
+    }
+}
+
+/// Color swap: a box counts as an enemy only with at least this many pixels
+/// of the selected outline color inside it or within `OUTLINE_MARGIN_PX`.
+pub const OUTLINE_MIN_PIXELS: usize = 3;
+pub const OUTLINE_MARGIN_PX: f32 = 2.0;
+
+/// Whether `bbox_xyxy` (image pixels) holds the outline color of `mask`
+/// (one byte per pixel of a `width` × `height` image, nonzero = color).
+pub fn box_has_outline(mask: &[u8], width: u32, height: u32, bbox_xyxy: [f32; 4]) -> bool {
+    if width == 0 || mask.len() != width as usize * height as usize {
+        return false;
+    }
+    let clamp = |value: f32, limit: u32| value.max(0.0).min(limit as f32) as usize;
+    let [left, top, right, bottom] = bbox_xyxy;
+    let (x0, x1) = (
+        clamp((left - OUTLINE_MARGIN_PX).floor(), width),
+        clamp((right + OUTLINE_MARGIN_PX).ceil(), width),
+    );
+    let (y0, y1) = (
+        clamp((top - OUTLINE_MARGIN_PX).floor(), height),
+        clamp((bottom + OUTLINE_MARGIN_PX).ceil(), height),
+    );
+    let mut count = 0;
+    for y in y0..y1 {
+        let row = &mask[y * width as usize..][..width as usize];
+        count += row[x0..x1].iter().filter(|value| **value != 0).count();
+        if count >= OUTLINE_MIN_PIXELS {
+            return true;
+        }
+    }
+    false
+}
+
+/// Model detections whose class is a target, at or above `minimum_score`
+/// (`ability_score` for abilities), for the target manager.
 pub fn object_detection_candidates(
     result: &DetectionResult,
     minimum_score: f32,
-) -> Vec<TargetCandidate> {
-    if result.mode != DetectionMode::ObjectDetection || !(0.0..=1.0).contains(&minimum_score) {
+    ability_score: f32,
+    names: Option<&HashMap<u32, String>>,
+) -> Vec<Detection> {
+    if result.mode != DetectionMode::ObjectDetection
+        || !(0.0..=1.0).contains(&minimum_score)
+        || !(0.0..=1.0).contains(&ability_score)
+    {
         return Vec::new();
     }
     result
         .objects
         .iter()
         .filter_map(|object| {
-            if object.confidence.is_none_or(|score| score < minimum_score) {
-                return None;
-            }
-            Some(TargetCandidate {
-                coordinate: bbox_center(object.bbox_xyxy),
+            let (kind, threshold) = match class_role(names, object.class_id) {
+                ClassRole::Ignore => return None,
+                ClassRole::Head => (TargetKind::Head, minimum_score),
+                ClassRole::Target => (TargetKind::Body, minimum_score),
+                ClassRole::Ability => (TargetKind::Ability, ability_score),
+            };
+            object.confidence.filter(|score| *score >= threshold)?;
+            Some(Detection {
                 bbox_xyxy: object.bbox_xyxy,
                 class_id: Some(object.class_id),
-                score: object.confidence,
+                confidence: object.confidence,
+                kind,
             })
         })
         .collect()
 }
 
-pub fn object_detection_target(
-    candidates: &[TargetCandidate],
-    width: u32,
-    height: u32,
-    crop_x: u32,
-    crop_y: u32,
-    fov_degrees: u16,
-    previous: Option<&PriorTarget>,
-    previous_is_fresh: bool,
-) -> Option<TargetCandidate> {
-    if width == 0 || height == 0 || !(1..=360).contains(&fov_degrees) {
-        return None;
-    }
-    let cx = width as f32 / 2.0;
-    let cy = height as f32 / 2.0;
-    let radius = fov_radius_px(width, height, fov_degrees);
-    let eligible: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| {
-            let [l, t, r, b] = candidate.bbox_xyxy;
-            let (l, t, r, b) = (
-                l - crop_x as f32,
-                t - crop_y as f32,
-                r - crop_x as f32,
-                b - crop_y as f32,
-            );
-            if r - l > 100.0 {
-                return false;
-            }
-            let dx = (l - cx).max(0.0).max(cx - r);
-            let dy = (t - cy).max(0.0).max(cy - b);
-            dx * dx + dy * dy <= radius * radius
-        })
-        .cloned()
-        .collect();
-    // Class priority (user request): rank 0 is the highest, so only the lowest
-    // class id in the FOV is targeted; nearest-box and prior-box lock then
-    // choose within that class.
-    let top_class = eligible
-        .iter()
-        .filter_map(|candidate| candidate.class_id)
-        .min()?;
-    let eligible: Vec<_> = eligible
-        .into_iter()
-        .filter(|candidate| candidate.class_id == Some(top_class))
-        .collect();
-    let distance = |candidate: &TargetCandidate| {
-        let center = bbox_center(candidate.bbox_xyxy);
-        (center.x - crop_x as f32 - cx).powi(2) + (center.y - crop_y as f32 - cy).powi(2)
-    };
-    let mut selected = eligible
-        .iter()
-        .min_by(|a, b| distance(a).total_cmp(&distance(b)))?
-        .clone();
-    if previous_is_fresh {
-        if let Some(old) = previous.and_then(|p| p.bbox_xyxy.map(|bbox| (bbox, p.class_id))) {
-            let old_box = old.0;
-            let tracked = eligible
-                .iter()
-                .filter(|candidate| candidate.class_id == old.1)
-                .find(|candidate| {
-                    let [l, t, r, b] = candidate.bbox_xyxy;
-                    let [ol, ot, or, ob] = old_box;
-                    let intersection =
-                        (r.min(or) - l.max(ol)).max(0.0) * (b.min(ob) - t.max(ot)).max(0.0);
-                    let area = (r - l).max(0.0) * (b - t).max(0.0);
-                    area > 0.0 && intersection / area > 0.5
-                });
-            if let Some(tracked) = tracked {
-                if distance(&selected) >= distance(tracked) * 0.33 {
-                    selected = tracked.clone();
-                }
-            }
-        }
-    }
-    // Motion aims at the exact box center for every class (user request).
-    Some(TargetCandidate {
-        coordinate: bbox_center(selected.bbox_xyxy),
-        ..selected
-    })
-}
-
-/// Smoothing strength on a 1–50 scale: 1 is no smoothing, 50 the strongest.
-/// A strength `s` filters with alpha `1 / s` (roughly an average over `s`
-/// frames). Each track draws its strength at random from `min..=max`.
+/// Smoothing strength on a 1–50 scale: Motion divides the error by a value
+/// drawn from `min..=max` on every frame (1 moves the whole error).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SmoothingRange {
     pub min: f32,
@@ -271,131 +198,11 @@ impl SmoothingRange {
             && self.min <= self.max
             && self.max <= Self::LIMITS.1
     }
-
-    fn draw_alpha(&self, rng: &mut StdRng) -> f32 {
-        let strength = if self.max > self.min {
-            rng.random_range(self.min..=self.max)
-        } else {
-            self.min
-        };
-        1.0 / strength
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ExponentialTargetSmoother {
-    range_x: SmoothingRange,
-    range_y: SmoothingRange,
-    alpha_x: f32,
-    alpha_y: f32,
-    previous: Option<FrameCoordinate>,
-    rng: StdRng,
-}
-
-impl ExponentialTargetSmoother {
-    pub fn new(range_x: SmoothingRange, range_y: SmoothingRange) -> Option<Self> {
-        Self::with_rng(range_x, range_y, StdRng::from_os_rng())
-    }
-
-    fn with_rng(range_x: SmoothingRange, range_y: SmoothingRange, rng: StdRng) -> Option<Self> {
-        (range_x.is_valid() && range_y.is_valid()).then_some(Self {
-            range_x,
-            range_y,
-            alpha_x: 1.0,
-            alpha_y: 1.0,
-            previous: None,
-            rng,
-        })
-    }
-
-    /// Filter factors drawn for the current track (1 = unsmoothed).
-    pub fn alphas(&self) -> (f32, f32) {
-        (self.alpha_x, self.alpha_y)
-    }
-
-    /// `None` ends the track; the next target starts a new one with freshly
-    /// drawn strengths.
-    pub fn update(&mut self, target: Option<FrameCoordinate>) -> Option<FrameCoordinate> {
-        let Some(current) = target else {
-            self.previous = None;
-            return None;
-        };
-        let next = match self.previous {
-            None => {
-                self.alpha_x = self.range_x.draw_alpha(&mut self.rng);
-                self.alpha_y = self.range_y.draw_alpha(&mut self.rng);
-                current
-            }
-            Some(previous) => FrameCoordinate {
-                x: previous.x + self.alpha_x * (current.x - previous.x),
-                y: previous.y + self.alpha_y * (current.y - previous.y),
-            },
-        };
-        self.previous = Some(next);
-        Some(next)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fov_scan_keeps_in_circle_edge_pixels_and_rejects_outer_pixels() {
-        let mut mask = vec![0; 100 * 100];
-        mask[50 * 100 + 81] = 1;
-        mask[81 * 100 + 50] = 1;
-        mask[18 * 100 + 50] = 1;
-        assert_eq!(
-            highest_pixel_in_fov(&mask, 100, 100, 36),
-            Some(FrameCoordinate { x: 50.5, y: 18.5 })
-        );
-
-        let mut outside = vec![0; 100 * 100];
-        outside[50 * 100 + 82] = 1;
-        outside[82 * 100 + 50] = 1;
-        outside[17 * 100 + 50] = 1;
-        assert_eq!(highest_pixel_in_fov(&outside, 100, 100, 36), None);
-    }
-
-    #[test]
-    fn preferred_x_scan_stops_at_the_nearest_hit_and_keeps_left_ties() {
-        let mut mask = vec![0; 100 * 100];
-        mask[50 * 100 + 40] = 1;
-        mask[50 * 100 + 49] = 1;
-        mask[50 * 100 + 50] = 1;
-        mask[50 * 100 + 60] = 1;
-
-        assert_eq!(
-            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(60.5)),
-            Some(FrameCoordinate { x: 60.5, y: 50.5 })
-        );
-        assert_eq!(
-            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(50.0)),
-            Some(FrameCoordinate { x: 49.5, y: 50.5 })
-        );
-    }
-
-    #[test]
-    fn preferred_x_scan_keeps_searching_for_a_closer_hit_to_the_right() {
-        let mut mask = vec![0; 100 * 100];
-        mask[50 * 100 + 40] = 1;
-        mask[50 * 100 + 56] = 1;
-
-        assert_eq!(
-            highest_pixel_in_fov_within(&mask, 100, 100, 360, [0, 0, 100, 100], Some(55.5)),
-            Some(FrameCoordinate { x: 56.5, y: 50.5 })
-        );
-    }
-
-    fn candidate(class_id: u32, bbox_xyxy: [f32; 4]) -> TargetCandidate {
-        TargetCandidate {
-            coordinate: bbox_center(bbox_xyxy),
-            bbox_xyxy,
-            class_id: Some(class_id),
-            score: Some(0.9),
-        }
-    }
 
     #[test]
     fn bbox_center_is_the_midpoint_of_both_axes() {
@@ -407,14 +214,17 @@ mod tests {
             bbox_center([5.0, 5.0, 6.0, 8.0]),
             FrameCoordinate { x: 5.5, y: 6.5 }
         );
-        assert_eq!(
-            bbox_center([7.0, 7.0, 7.0, 7.0]),
-            FrameCoordinate { x: 7.0, y: 7.0 }
-        );
     }
 
     #[test]
-    fn object_detection_candidates_use_the_box_center() {
+    fn object_detection_candidates_keep_class_and_score_above_the_minimum() {
+        let object = |class_id, confidence| crate::results::DetectionObject {
+            class_id,
+            class_name: class_id.to_string(),
+            bbox_xyxy: [40.0, 10.0, 60.0, 50.0],
+            confidence,
+            pixel_count: None,
+        };
         let result = DetectionResult {
             frame_id: 1,
             timestamp_ns: 0,
@@ -424,13 +234,15 @@ mod tests {
             source_height: 100,
             processed_width: 100,
             processed_height: 100,
-            objects: vec![crate::results::DetectionObject {
-                class_id: 3,
-                class_name: "3".into(),
-                bbox_xyxy: [40.0, 10.0, 60.0, 50.0],
-                confidence: Some(0.8),
-                pixel_count: None,
-            }],
+            objects: vec![
+                object(0, Some(0.8)),
+                object(1, Some(0.9)),
+                object(2, Some(0.9)),
+                object(0, Some(0.49)),
+                object(1, None),
+                object(3, Some(0.65)),
+                object(3, Some(0.55)),
+            ],
             preprocess_ms: 0.0,
             detection_ms: 0.0,
             postprocess_ms: 0.0,
@@ -443,145 +255,87 @@ mod tests {
             fov_degrees: 0,
         };
 
-        let candidates = object_detection_candidates(&result, 0.5);
+        let names: HashMap<u32, String> = [(0, "body"), (1, "head"), (2, "tm"), (3, "ability")]
+            .map(|(id, name)| (id, name.to_owned()))
+            .into();
+        let candidates = object_detection_candidates(&result, 0.5, 0.6, Some(&names));
 
-        assert_eq!(candidates.len(), 1);
+        let bbox_xyxy = [40.0, 10.0, 60.0, 50.0];
         assert_eq!(
-            candidates[0].coordinate,
-            FrameCoordinate { x: 50.0, y: 30.0 }
+            candidates,
+            vec![
+                Detection {
+                    bbox_xyxy,
+                    class_id: Some(0),
+                    confidence: Some(0.8),
+                    kind: TargetKind::Body,
+                },
+                Detection {
+                    bbox_xyxy,
+                    class_id: Some(1),
+                    confidence: Some(0.9),
+                    kind: TargetKind::Head,
+                },
+                Detection {
+                    bbox_xyxy,
+                    class_id: Some(3),
+                    confidence: Some(0.65),
+                    kind: TargetKind::Ability,
+                },
+            ]
         );
-        assert_eq!(candidates[0].class_id, Some(3));
     }
 
     #[test]
-    fn object_detection_aims_at_the_box_center_of_the_nearest_fov_box() {
-        let candidates = [
-            candidate(1, [45.0, 40.0, 55.0, 60.0]),
-            candidate(1, [72.0, 45.0, 82.0, 55.0]),
-        ];
-
-        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
-            .expect("center box is in the FOV");
-
-        assert_eq!(selected.bbox_xyxy, [45.0, 40.0, 55.0, 60.0]);
-        assert_eq!(selected.coordinate, FrameCoordinate { x: 50.0, y: 50.0 });
+    fn class_roles_come_from_the_model_names() {
+        let names: HashMap<u32, String> = [
+            "player", "bot", "weapon", "outline", "dead_body", "Enemy Head", "smoke", "fire",
+            "third_person", "body", "tm", "ability", "flash", "Teammate", "enemy",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(id, name)| (id as u32, (*name).to_owned()))
+        .collect();
+        let roles: Vec<ClassRole> = (0..names.len() as u32 + 1)
+            .map(|id| class_role(Some(&names), id))
+            .collect();
+        use ClassRole::{Ability as A, Head as H, Ignore as I, Target as T};
+        assert_eq!(roles, [T, T, I, T, I, H, I, I, I, T, I, A, I, I, T, T]);
+        // No names: the source's fixed classes.
+        let roles: Vec<ClassRole> = (0..6).map(|id| class_role(None, id)).collect();
+        assert_eq!(roles, [T, H, I, A, I, T]);
     }
 
     #[test]
-    fn object_detection_prefers_rank_zero_over_a_nearer_box() {
-        let candidates = [
-            candidate(7, [45.0, 45.0, 55.0, 55.0]),
-            candidate(0, [70.0, 20.0, 80.0, 40.0]),
-            candidate(3, [48.0, 30.0, 52.0, 40.0]),
-        ];
-
-        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
-            .expect("all boxes are in the FOV");
-
-        assert_eq!(selected.class_id, Some(0));
-        assert_eq!(selected.coordinate, FrameCoordinate { x: 75.0, y: 30.0 });
+    fn heads_are_aimed_at_their_center_other_boxes_near_the_top() {
+        let bbox = [0.0, 100.0, 20.0, 200.0];
+        let center = FrameCoordinate { x: 10.0, y: 150.0 };
+        assert_eq!(aim_point(bbox, TargetKind::Body), FrameCoordinate { x: 10.0, y: 115.0 });
+        assert_eq!(aim_point(bbox, TargetKind::Head), center);
+        assert_eq!(aim_point(bbox, TargetKind::Ability), center);
     }
 
     #[test]
-    fn object_detection_prefers_the_lower_rank_when_rank_zero_is_absent() {
-        let candidates = [
-            candidate(5, [45.0, 45.0, 55.0, 55.0]),
-            candidate(2, [70.0, 45.0, 80.0, 55.0]),
-        ];
-
-        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 360, None, false)
-            .expect("both boxes are in the FOV");
-
-        assert_eq!(selected.class_id, Some(2));
-    }
-
-    #[test]
-    fn object_detection_ignores_a_better_rank_outside_the_fov() {
-        let candidates = [
-            candidate(2, [45.0, 45.0, 55.0, 55.0]),
-            candidate(0, [0.0, 0.0, 6.0, 6.0]),
-        ];
-
-        let selected = object_detection_target(&candidates, 100, 100, 0, 0, 36, None, false)
-            .expect("the class 2 box is in the FOV");
-
-        assert_eq!(selected.class_id, Some(2));
-    }
-
-    #[test]
-    fn object_detection_switches_to_a_better_rank_despite_the_prior_lock() {
-        let candidates = [
-            candidate(4, [45.0, 45.0, 55.0, 55.0]),
-            candidate(1, [65.0, 45.0, 75.0, 55.0]),
-        ];
-        let previous = PriorTarget {
-            bbox_xyxy: Some([45.0, 45.0, 55.0, 55.0]),
-            class_id: Some(4),
-        };
-
-        let selected =
-            object_detection_target(&candidates, 100, 100, 0, 0, 360, Some(&previous), true)
-                .expect("both boxes are in the FOV");
-
-        assert_eq!(selected.class_id, Some(1));
-    }
-
-    #[test]
-    fn object_detection_keeps_a_fresh_overlapping_prior_box_within_its_class() {
-        let candidates = [
-            candidate(0, [55.0, 45.0, 65.0, 55.0]),
-            candidate(0, [60.0, 45.0, 70.0, 55.0]),
-        ];
-        let previous = PriorTarget {
-            bbox_xyxy: Some([60.0, 45.0, 70.0, 55.0]),
-            class_id: Some(0),
-        };
-
-        let selected =
-            object_detection_target(&candidates, 100, 100, 0, 0, 360, Some(&previous), true)
-                .expect("both boxes are in the FOV");
-
-        assert_eq!(selected.bbox_xyxy, [60.0, 45.0, 70.0, 55.0]);
-        assert_eq!(selected.coordinate, FrameCoordinate { x: 65.0, y: 50.0 });
-    }
-
-    #[test]
-    fn smoothing_strength_is_drawn_per_track_within_its_range() {
-        use super::{ExponentialTargetSmoother, SmoothingRange};
-        use rand::{rngs::StdRng, SeedableRng};
-        assert!(SmoothingRange::new(0.5, 2.0).is_none());
-        assert!(SmoothingRange::new(4.0, 3.0).is_none());
-        assert!(SmoothingRange::new(1.0, 51.0).is_none());
-        let point = |x: f32| Some(FrameCoordinate { x, y: x });
-
-        // Strength 1 (no smoothing) follows the target exactly.
-        let mut none =
-            ExponentialTargetSmoother::new(SmoothingRange::NONE, SmoothingRange::NONE).unwrap();
-        none.update(point(0.0));
-        assert_eq!(none.update(point(10.0)), point(10.0));
-
-        // Strength 4 moves a quarter of the way per frame.
-        let fixed = SmoothingRange::new(4.0, 4.0).unwrap();
-        let mut smoother = ExponentialTargetSmoother::new(fixed, fixed).unwrap();
-        smoother.update(point(0.0));
-        assert_eq!(smoother.update(point(8.0)), point(2.0));
-
-        // A range draws a strength per track, held for the whole track.
-        let range = SmoothingRange::new(2.0, 8.0).unwrap();
-        let mut smoother =
-            ExponentialTargetSmoother::with_rng(range, range, StdRng::seed_from_u64(7)).unwrap();
-        let mut strengths = Vec::new();
-        for _ in 0..40 {
-            smoother.update(point(0.0));
-            let alpha = smoother.alpha_x;
-            assert!((1.0 / 8.0..=0.5).contains(&alpha), "{alpha}");
-            smoother.update(point(1.0));
-            assert_eq!(smoother.alpha_x, alpha, "held within the track");
-            strengths.push((1.0 / alpha * 100.0).round() as i32);
-            smoother.update(None); // target lost: next track draws again
+    fn only_boxes_with_the_outline_color_count() {
+        let (width, height) = (20u32, 10u32);
+        let mut mask = vec![0u8; 200];
+        // Three outline pixels in column 12, rows 2..5.
+        for y in 2..5 {
+            mask[y * 20 + 12] = 1;
         }
-        strengths.sort_unstable();
-        strengths.dedup();
-        assert!(strengths.len() > 10, "draws vary between tracks");
+        assert!(box_has_outline(&mask, width, height, [10.0, 1.0, 14.0, 8.0]));
+        // Two pixels away from the box edge still counts (margin).
+        assert!(box_has_outline(&mask, width, height, [3.0, 1.0, 10.5, 8.0]));
+        assert!(!box_has_outline(&mask, width, height, [0.0, 0.0, 8.0, 9.0]));
+        // Fewer than OUTLINE_MIN_PIXELS.
+        mask[4 * 20 + 12] = 0;
+        assert!(!box_has_outline(&mask, width, height, [10.0, 1.0, 14.0, 8.0]));
+        assert!(!box_has_outline(&mask[..10], width, height, [0.0, 0.0, 20.0, 10.0]));
+    }
+
+    #[test]
+    fn fov_radius_uses_the_fixed_reference_and_is_limited_to_the_image() {
+        assert!((fov_radius_px(640, 640, 360) - 319.5).abs() < 1e-3);
+        assert!((fov_radius_px(100, 100, 360) - 49.5).abs() < 1e-3);
     }
 }

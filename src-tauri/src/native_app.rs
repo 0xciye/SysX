@@ -1,4 +1,4 @@
-﻿//! Native SysX host: embedded backend, Medius I/O, movement and a Slint monitor.
+//! Native SysX host: embedded backend, Medius I/O, movement and a Slint monitor.
 //! Settings and Preview run in the native Slint application.
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -224,6 +224,10 @@ impl MonitorLifecycle {
     }
 }
 
+/// Latest Magnet sample from the backend (one per processed frame while
+/// Magnet is enabled).
+static MAGNET_TARGET: Mutex<Option<crate::magnet::MagnetTargetEvent>> = Mutex::new(None);
+
 fn start_backend(
     movement_state: Arc<crate::movement::MovementState>,
     auto_target: Arc<Mutex<AutoTargetEvent>>,
@@ -237,6 +241,7 @@ fn start_backend(
         .args(["serve", "--host", "127.0.0.1", "--port", "0", "--data-dir"])
         .arg(&data_dir)
         .env("RECEIVER_IPC_TOKEN", &token)
+        .env("SYSX_LIBRARY_DIR", library_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -267,6 +272,14 @@ fn start_backend(
                 };
                 if value.get("event").and_then(|value| value.as_str()) == Some("movement_target") {
                     crate::movement::set_target(&movement_state, &value);
+                    continue;
+                }
+                if value.get("event").and_then(|value| value.as_str()) == Some("magnet_target") {
+                    if let Ok(event) =
+                        serde_json::from_value::<crate::magnet::MagnetTargetEvent>(value)
+                    {
+                        *lock_recover(&MAGNET_TARGET) = Some(event);
+                    }
                     continue;
                 }
                 if matches!(
@@ -599,7 +612,11 @@ fn monitor_medius(
     let mut move_completion: Option<std::sync::mpsc::Receiver<Result<(), String>>> = None;
     let mut movement_error = None;
     let mut vertical_adjustment = crate::movement::VerticalAdjustmentClock::default();
+    // Recoil pulls come once per bullet; they wait here while a command is in
+    // flight instead of being lost.
+    let mut pending_recoil: i64 = 0;
     let mut auto_state = crate::auto::AutoState::new();
+    let mut magnet = crate::magnet::MagnetState::default();
     let mut next_health_check = Instant::now() + Duration::from_millis(250);
     loop {
         if let Some(event) = events.recv_timeout(Duration::from_millis(4)) {
@@ -623,17 +640,35 @@ fn monitor_medius(
         if !events.is_connected() {
             break;
         }
+        let held = |button: u16| {
+            events
+                .held(Class::Button)
+                .iter()
+                .any(|usage| usage.id == button)
+        };
+        let magnet_event = lock_recover(&MAGNET_TARGET).clone();
+        let magnet_held = magnet_event.as_ref().is_some_and(|event| {
+            crate::movement::trigger_button_index(&event.settings.trigger_button)
+                .is_some_and(|button| held(button))
+        });
+        magnet.update(
+            magnet_event.as_ref(),
+            magnet_held,
+            Instant::now(),
+            crate::magnet::unix_ms(),
+        );
+        // A burst runs while the weapon fires: the physical left button or a
+        // Magnet press.
         let recoil_settings = crate::movement::recoil_settings(movement_state);
-        let recoil_held = events
-            .held(Class::Button)
-            .iter()
-            .any(|usage| usage.id == u16::from(Button::LEFT.as_id()));
-        let recoil_target_ready = crate::movement::has_fresh_target(movement_state);
-        let recoil = vertical_adjustment.sample(
-            recoil_held && recoil_target_ready,
+        let firing = held(u16::from(Button::LEFT.as_id())) || magnet.holding();
+        pending_recoil = pending_recoil.saturating_add(vertical_adjustment.sample(
+            firing,
             &recoil_settings,
             Instant::now(),
-        );
+        ));
+        if !firing {
+            pending_recoil = 0;
+        }
         if Instant::now() >= next_health_check {
             next_health_check = Instant::now() + Duration::from_millis(250);
             let health = device.query_health();
@@ -668,15 +703,28 @@ fn monitor_medius(
         if !serial.is_idle() {
             continue;
         }
+        if let Some(op) = magnet.next_op() {
+            let submitted = match op {
+                crate::magnet::MagnetOp::Move(dx, dy) => serial.submit_medius_move(dx, dy),
+                crate::magnet::MagnetOp::Press => serial.submit_medius_left_press(true),
+                crate::magnet::MagnetOp::Release => serial.submit_medius_left_press(false),
+            };
+            match submitted {
+                Ok(completion) => {
+                    move_completion = Some(completion);
+                    serial.pump();
+                    continue;
+                }
+                Err(error) => {
+                    movement_error = Some(format!("Magnet output failed: {error}"));
+                    break;
+                }
+            }
+        }
         let auto_input = lock_recover(auto_target).clone();
-        let auto_held = auto_trigger_held(&auto_input, |button| {
-            events
-                .held(Class::Button)
-                .iter()
-                .any(|usage| usage.id == button)
-        });
-        if let Some(crate::auto::AutoAction::LeftClick) =
-            auto_input.action(&mut auto_state, auto_held, Instant::now())
+        let auto_held = auto_trigger_held(&auto_input, held);
+        let auto_action = auto_input.action(&mut auto_state, auto_held, Instant::now());
+        if let Some(crate::auto::AutoAction::LeftClick) = auto_action.filter(|_| !magnet.holding())
         {
             match serial.submit_medius_left_click() {
                 Ok(completion) => {
@@ -690,17 +738,13 @@ fn monitor_medius(
                 }
             }
         }
+        let recoil = pending_recoil.clamp(-32, 32);
+        pending_recoil -= recoil;
         let target = crate::movement::take_target(movement_state);
         let mut remainder = None;
         let (dx, dy) = if let Some(target) = target {
-            let held = crate::movement::trigger_button_index(&target.trigger_button).is_some_and(
-                |button| {
-                    events
-                        .held(Class::Button)
-                        .iter()
-                        .any(|usage| usage.id == button)
-                },
-            );
+            let held =
+                crate::movement::trigger_button_index(&target.trigger_button).is_some_and(held);
             // Control events advance the shared routing revision before new
             // frames arrive. Never apply a batch queued by the previous mode.
             let motion_active = target.config_revision == auto_input.config_revision()
@@ -731,6 +775,14 @@ fn monitor_medius(
                 }
             }
         }
+    }
+    // Never leave the left button held by Magnet (best effort: the device
+    // may already be gone).
+    if magnet.holding() {
+        let _ = crate::medius_device::dispatch(
+            &device,
+            &crate::serial_queue::encode_medius_left_press(false),
+        );
     }
     if movement_error.is_some() {
         set_device_status(device_state, DeviceStatus::error());
@@ -765,13 +817,11 @@ fn prepare_runtime(_data_dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
         }
         // A fixed path (safe: only one SysX runs) keeps the backend exe at the
         // same location every launch, so a Windows Firewall allow rule for LAN
-        // UDP is granted once instead of re-prompting per run. Leftovers from
-        // crashed runs and older per-process `runtime-*` folders are removed.
+        // UDP is granted once instead of re-prompting per run. Older
+        // per-process `runtime-*` folders are removed.
         if let Ok(entries) = fs::read_dir(_data_dir) {
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name == "runtime" || name.starts_with("runtime-") {
+                if entry.file_name().to_string_lossy().starts_with("runtime-") {
                     let _ = fs::remove_dir_all(entry.path());
                 }
             }
@@ -783,11 +833,18 @@ fn prepare_runtime(_data_dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
         } else {
             "receiver-backend"
         });
-        fs::write(&executable, EMBEDDED_BACKEND).map_err(|error| error.to_string())?;
-        // DirectML.dll and other ONNX Runtime libraries load from beside the
-        // backend; Windows' own older DirectML.dll cannot create the device.
-        for (name, bytes) in EMBEDDED_LIBRARIES {
-            fs::write(runtime_dir.join(name), bytes).map_err(|error| error.to_string())?;
+        // The backend (with its models) is large: it stays between launches
+        // and is written again only when this build carries another one
+        // (startup was slow with a write per launch, user report 2026-10-31).
+        let stamp = runtime_dir.join("receiver-backend.stamp");
+        let expected = format!("{EMBEDDED_BACKEND_HASH:x} {}", EMBEDDED_BACKEND.len());
+        let current = fs::read_to_string(&stamp).ok().as_deref() == Some(expected.as_str())
+            && fs::metadata(&executable)
+                .is_ok_and(|meta| meta.len() == EMBEDDED_BACKEND.len() as u64);
+        if !current {
+            let _ = fs::remove_file(&stamp);
+            fs::write(&executable, EMBEDDED_BACKEND).map_err(|error| error.to_string())?;
+            fs::write(&stamp, expected).map_err(|error| error.to_string())?;
         }
         #[cfg(unix)]
         {
@@ -795,7 +852,24 @@ fn prepare_runtime(_data_dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
                 .map_err(|error| error.to_string())?;
         }
-        Ok((executable, Some(runtime_dir)))
+        // No folder to clean on exit: the next launch reuses it.
+        Ok((executable, None))
+    }
+}
+
+/// Where onnxruntime.dll, DirectML.dll and the other runtime libraries
+/// ship: next to SysX.exe (in development, next to the backend sidecar).
+fn library_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 }
 

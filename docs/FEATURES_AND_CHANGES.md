@@ -9,7 +9,7 @@ Tài liệu này mô tả cách SysX hoạt động sau đợt làm việc 2026-
 ## 1. Tổng quan kiến trúc
 
 ```
-OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)──▶ monitor /monitor.html
+OBS Studio ──(UDP UP01, JPEG/mask)──▶ receiver-backend ──(WebSocket)──▶ monitor /monitor.html
   sysx-canvas-sender.dll   ◀──SYSCFG──   (Rust, nhúng trong SysX.exe)  ──▶ config  /config.html
                                               ▲   │ movement_target / auto_target (stdout)
                                               │   ▼
@@ -41,12 +41,12 @@ OBS Studio ──(UDP RCVR v1, JPEG)──▶ receiver-backend ──(WebSocket)
 
 ## 3. Giao thức receiver ↔ sender
 
-- **UDP RCVR v1** (`rust-backend/src/udp.rs`): header 30 byte big-endian (magic `RCVR`, version 1, frame_id, chunk index/total, width/height, timestamp). Kiểm tra mọi trường, JPEG phải có SOI ở chunk đầu và EOI ở chunk cuối, giới hạn bộ nhớ (64 MiB/frame, 128 MiB tổng, 32 frame dở dang, hết hạn 100 ms).
-- **SYSCFG** (`rust-backend/src/receiver.rs`): receiver gửi `SYSCFG 1 CROP <Crop Resolution>`
+- **UDP UP01** (`rust-backend/src/udp.rs`, rework 2026-10-31 theo logic StreamBoost; `RCVR` v1 đã bỏ): header 22 byte little-endian (magic `UP01`, frame_id u32, chunk index/total, payload_size, timestamp_us), mỗi gói tối đa 1.400 byte payload. Payload là JPEG (kích thước đọc từ SOF của JPEG) hoặc mặt nạ màu `SXM1` từ chế độ Plugin mask. Kiểm tra mọi trường, giới hạn bộ nhớ (64 MiB/frame, 128 MiB tổng, 32 frame dở dang, hết hạn 100 ms).
+- **SYSCFG** (`rust-backend/src/receiver.rs`): receiver gửi `SYSCFG 1 CROP <Crop Resolution>` (thêm `MASK <màu> <cỡ>` khi bật Plugin mask ở Pixel Seek)
   - khi thấy sender mới,
   - khi đổi Crop Resolution,
   - **và lặp lại mỗi 1 giây** khi sender còn gửi (bù gói bị router làm rơi trên LAN).
-  Chỉ địa chỉ có gói bắt đầu bằng `RCVR` mới được coi là sender; gói rác trong mạng không giành được lệnh crop.
+  Chỉ địa chỉ có gói bắt đầu bằng `UP01` mới được coi là sender; gói rác trong mạng không giành được lệnh crop.
 - **Bộ đệm nhận UDP 8 MiB** để một loạt ~100 gói của một frame không bị rơi trong lúc đang giải mã frame trước.
 - Test: `crop_config_is_repeated_to_the_rcvr_sender_and_never_to_stray_hosts`, `decoded_frame_keeps_the_sender_jpeg_for_preview`.
 

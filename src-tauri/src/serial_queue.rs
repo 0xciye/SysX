@@ -209,7 +209,31 @@ pub fn is_medius_left_click(bytes: &[u8]) -> bool {
     bytes == [b'C']
 }
 
+/// Left button press and release kept separate (Magnet holds the button).
+pub fn encode_medius_left_press(pressed: bool) -> Vec<u8> {
+    vec![if pressed { b'D' } else { b'U' }]
+}
+
+pub fn decode_medius_left_press(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [b'D'] => Some(true),
+        [b'U'] => Some(false),
+        _ => None,
+    }
+}
+
 impl<W: AsyncSerialWriter> SerialCommandQueue<W> {
+    pub fn submit_medius_left_press(
+        &mut self,
+        pressed: bool,
+    ) -> Result<Receiver<Result<(), String>>, String> {
+        self.submit(QueuedSerialCommand {
+            kind: 0,
+            bytes: encode_medius_left_press(pressed),
+            request_ms: MOVE_REQUEST_MS,
+        })
+    }
+
     pub fn submit_medius_left_click(&mut self) -> Result<Receiver<Result<(), String>>, String> {
         self.submit(QueuedSerialCommand {
             kind: 0,

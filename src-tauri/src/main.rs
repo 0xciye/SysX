@@ -4,8 +4,11 @@
 )]
 
 mod auto;
+// Shared with the backend; the host uses only the preview decoder.
+#[allow(dead_code)]
 #[path = "../../native-shared/jpeg.rs"]
 mod jpeg;
+mod magnet;
 mod medius_device;
 mod monitor_window;
 mod movement;

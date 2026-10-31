@@ -40,7 +40,9 @@ if (
 // GPU (AMD, Intel, NVIDIA); CoreML on macOS. CUDA and TensorRT through ONNX
 // Runtime are opt-in: their provider DLLs are several hundred MB and need the
 // NVIDIA CUDA/cuDNN/TensorRT runtimes on the user's machine.
-if (target.includes("windows")) features.push("directml");
+// Windows loads ONNX Runtime from the onnxruntime.dll shipped next to
+// SysX.exe (user request, 2026-10-31), so the backend links it dynamically.
+if (target.includes("windows")) features.push("ort/load-dynamic", "directml");
 if (target.includes("apple")) features.push("coreml");
 if (process.env.SYSX_ORT_CUDA === "1") features.push("cuda", "ort-tensorrt");
 if (features.length > 0) args.push("--features", features.join(","));
@@ -56,15 +58,33 @@ const sidecar = path.join(sidecarDir, `receiver-backend-${target}${binaryExtensi
 if (!existsSync(binary)) throw new Error(`Rust backend build did not produce ${binary}`);
 mkdirSync(sidecarDir, { recursive: true });
 copyFileSync(binary, sidecar);
-// ONNX Runtime libraries the build copied next to the backend (DirectML.dll,
-// provider DLLs) travel with it: build.rs embeds them and SysX extracts them
-// beside the backend at launch.
+// Runtime libraries ship next to SysX.exe, not inside it. They come from
+// SYSX_ORT_DIR (an ONNX Runtime DirectML release: onnxruntime.dll,
+// DirectML.dll, optional onnxruntime_providers_*.dll and OpenVINO DLLs) and
+// from anything the backend build copied next to its binary.
 const libraryPattern = /\.(dll|dylib|so)$/i;
 for (const name of readdirSync(sidecarDir)) {
   if (libraryPattern.test(name)) rmSync(path.join(sidecarDir, name));
 }
-for (const name of readdirSync(path.dirname(binary))) {
-  if (libraryPattern.test(name)) copyFileSync(path.join(path.dirname(binary), name), path.join(sidecarDir, name));
+const librarySources = [path.dirname(binary)];
+if (process.env.SYSX_ORT_DIR) librarySources.push(path.resolve(process.env.SYSX_ORT_DIR));
+for (const dir of librarySources) {
+  if (!existsSync(dir)) throw new Error(`SYSX_ORT_DIR does not exist: ${dir}`);
+  for (const name of readdirSync(dir)) {
+    if (libraryPattern.test(name)) copyFileSync(path.join(dir, name), path.join(sidecarDir, name));
+  }
+}
+if (target.includes("windows") && !existsSync(path.join(sidecarDir, "onnxruntime.dll"))) {
+  console.warn(
+    "warning: no onnxruntime.dll for the Windows build. Set SYSX_ORT_DIR to an ONNX Runtime "
+      + "DirectML release folder (1.22 or newer); Pixel Seek runs without it, Object Detection does not.",
+  );
+}
+// Next to the release host too, so target/release/SysX.exe runs as shipped.
+const hostDir = path.join(root, "src-tauri", "target", profile);
+mkdirSync(hostDir, { recursive: true });
+for (const name of readdirSync(sidecarDir)) {
+  if (libraryPattern.test(name)) copyFileSync(path.join(sidecarDir, name), path.join(hostDir, name));
 }
 if (binaryExtension === "") chmodSync(sidecar, 0o755);
 if (binaryExtension === "") {

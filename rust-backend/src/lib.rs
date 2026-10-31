@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod auto_target;
+pub mod builtin_models;
 pub mod cli;
 pub mod config;
 pub mod crop;
@@ -17,6 +18,7 @@ pub mod pixel_seek;
 pub mod receiver;
 pub mod results;
 pub mod service;
+pub mod target_manager;
 pub mod targeting;
 #[path = "../../native-shared/timer_resolution.rs"]
 pub mod timer_resolution;

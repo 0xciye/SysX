@@ -26,7 +26,15 @@ fn release_left(device: &Device) -> Result<(), String> {
 }
 
 pub fn dispatch(device: &Device, record: &[u8]) -> Result<(), String> {
-    if crate::serial_queue::is_medius_left_click(record) {
+    if let Some(pressed) = crate::serial_queue::decode_medius_left_press(record) {
+        if pressed {
+            catch_unwind(AssertUnwindSafe(|| device.press(Button::LEFT)))
+                .map_err(|_| "Medius button press panicked".to_owned())?
+                .map_err(|error| error.to_string())
+        } else {
+            release_left(device)
+        }
+    } else if crate::serial_queue::is_medius_left_click(record) {
         let pressed = catch_unwind(AssertUnwindSafe(|| device.press(Button::LEFT)))
             .map_err(|_| "Medius button press panicked".to_owned())
             .and_then(|result| result.map_err(|error| error.to_string()));

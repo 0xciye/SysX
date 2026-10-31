@@ -9,6 +9,10 @@ pub struct OnnxInfo {
     /// Width and height of the single NCHW input, when both are fixed.
     pub input_size: Option<(u32, u32)>,
     pub class_names: Option<HashMap<u32, String>>,
+    /// The output is already decoded and NMS-free, `[1, N, 6]` rows of
+    /// `x1, y1, x2, y2, score, class`: Ultralytics `end2end: True`, an
+    /// export with `nms: True`, or a YOLOv10 model (always NMS-free).
+    pub end2end: bool,
 }
 
 /// One protobuf field: number and either a varint or a length-delimited payload.
@@ -128,14 +132,20 @@ fn parse_names(text: &str) -> Option<HashMap<u32, String>> {
 pub fn read(bytes: &[u8]) -> Result<OnnxInfo, &'static str> {
     let model = fields(bytes)?;
     let mut info = OnnxInfo::default();
+    let (mut end2end, mut nms_export, mut yolov10) = (None, false, false);
     for entry in bytes_of(&model, 14) {
         let entry = fields(entry)?;
         let key = bytes_of(&entry, 1).next().unwrap_or_default();
-        if key == b"names" {
-            let value = bytes_of(&entry, 2).next().unwrap_or_default();
-            info.class_names = parse_names(&String::from_utf8_lossy(value));
+        let value = String::from_utf8_lossy(bytes_of(&entry, 2).next().unwrap_or_default());
+        match key {
+            b"names" => info.class_names = parse_names(&value),
+            b"end2end" => end2end = Some(value.trim().eq_ignore_ascii_case("true")),
+            b"args" => nms_export = value.replace(' ', "").contains("'nms':True"),
+            b"description" => yolov10 = value.to_ascii_lowercase().contains("yolov10"),
+            _ => {}
         }
     }
+    info.end2end = end2end.unwrap_or(yolov10) || nms_export;
     let graph = bytes_of(&model, 7).next().ok_or("ONNX file has no graph")?;
     let graph = fields(graph)?;
     // Older exports also list weights as graph inputs; skip those.
@@ -201,6 +211,29 @@ mod tests {
         let names = info.class_names.unwrap();
         assert_eq!(names[&0], "Enemy");
         assert_eq!(names[&1], "Head");
+        assert!(!info.end2end);
+    }
+
+    #[test]
+    fn nms_free_exports_are_recognized_from_their_metadata() {
+        let with = |entries: &[(&str, &str)]| {
+            let base = model(&[Some(1), Some(3), Some(64), Some(64)], "{0: 'a'}");
+            let meta: Vec<u8> = entries
+                .iter()
+                .flat_map(|(key, value)| {
+                    tag(14, &[tag(1, key.as_bytes()), tag(2, value.as_bytes())].concat())
+                })
+                .collect();
+            read(&[base, meta].concat()).unwrap().end2end
+        };
+        assert!(with(&[("end2end", "True")]));
+        assert!(!with(&[("end2end", "False")]));
+        assert!(with(&[("args", "{'batch': 1, 'nms': True}")]));
+        assert!(!with(&[("args", "{'batch': 1, 'nms': False}")]));
+        assert!(with(&[("description", "Ultralytics YOLOv10s model")]));
+        // An explicit end2end entry wins over the model family.
+        assert!(!with(&[("description", "Ultralytics YOLOv10s model"), ("end2end", "False")]));
+        assert!(!with(&[]));
     }
 
     #[test]

@@ -18,7 +18,7 @@ slint::slint! {
     import { ScrollView } from "std-widgets.slint";
     export struct MouseKey { label: string, known: bool, down: bool }
     export struct ConfigOption { label: string, value: string }
-    export struct ConfigField { key: string, label: string, value: string, kind: string, choices: [ConfigOption], unit: string, key2: string, value2: string, cap1: string, cap2: string, y: float, h: float, first: bool }
+    export struct ConfigField { key: string, label: string, value: string, kind: string, choices: [ConfigOption], unit: string, key2: string, value2: string, hint: string, x: float, w: float, y: float, h: float, min: float, max: float, step: float }
     component ConfigAction inherits FocusScope {
         in property <string> caption;
         in property <bool> active;
@@ -66,6 +66,8 @@ slint::slint! {
         default-font-family: root.body-font;
         default-font-size: 13px;
         in property <string> profile: "Default";
+        // Toggle mode: "ON"/"OFF"; empty hides the chip.
+        in property <string> motion-toggle;
         in property <string> device: "No device";
         in property <color> device-ink: #9aa9b4;
         in property <string> status: "Starting receiver";
@@ -117,6 +119,16 @@ slint::slint! {
                     HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 7px;
                         if root.width > 460px: Text { text: "ACTIVE PROFILE"; color: #9aa9b4; font-size: 10px; vertical-alignment: center; }
                         Text { text: root.profile; color: #ebf1f5; font-size: 12px; font-weight: 600; overflow: elide; vertical-alignment: center; }
+                    }
+                }
+                if root.motion-toggle != "": chip := Rectangle {
+                    property <color> ink: root.motion-toggle == "ON" ? #35d07f : #9aa9b4;
+                    width: 86px; border-radius: 5px; border-width: 1px; border-color: self.ink.with-alpha(0.42); background: self.ink.with-alpha(0.10);
+                    accessible-role: text;
+                    accessible-label: "Motion toggle " + root.motion-toggle;
+                    HorizontalLayout { padding-left: 9px; padding-right: 8px; spacing: 6px;
+                        Rectangle { width: 7px; height: 7px; y: 10px; border-radius: 4px; background: chip.ink; }
+                        Text { text: "MOTION " + root.motion-toggle; color: #ebf1f5; font-size: 11px; font-weight: 600; vertical-alignment: center; }
                     }
                 }
                 Rectangle { width: root.width > 430px ? 122px : 92px; border-radius: 5px; border-width: 1px; border-color: root.device-ink.with-alpha(0.42); background: root.device-ink.with-alpha(0.10);
@@ -296,16 +308,188 @@ slint::slint! {
             clicked => { root.focus(); root.toggled(); }
         }
     }
-    component SettingsSegment inherits FocusScope {
+    component SettingsDropdown inherits FocusScope {
+        in property <[ConfigOption]> options;
+        in property <string> value;
+        // Label of the selected option (supplied with the field).
+        in property <string> display;
+        in property <string> label;
+        in property <string> font;
+        callback picked(string);
+        callback stepped();
+        height: 36px;
+        accessible-role: combobox;
+        accessible-label: root.label;
+        accessible-value: root.display;
+        key-pressed(event) => {
+            if event.repeat {
+                return reject;
+            }
+            if event.text == Key.Return || event.text == Key.Space {
+                popup.show();
+                accept
+            } else if event.text == Key.DownArrow {
+                root.stepped();
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            border-radius: 6px;
+            background: touch.has-hover ? Palette.control-hover : Palette.control;
+            border-width: root.has-focus ? 2px : 1px;
+            border-color: root.has-focus ? Palette.accent : Palette.border;
+            Text {
+                x: 12px; width: parent.width - 40px; height: parent.height;
+                text: root.display; font-family: root.font; font-size: 13px;
+                color: Palette.text; vertical-alignment: center; overflow: elide;
+            }
+            // A small down triangle built from rows (no font glyph needed).
+            Rectangle {
+                x: parent.width - 24px; y: (parent.height - 5px) / 2; width: 9px; height: 5px;
+                for row in [9, 7, 5, 3, 1]: Rectangle {
+                    x: (9 - row) * 0.5px; y: (9 - row) * 0.5px; width: row * 1px; height: 1px;
+                    background: Palette.muted;
+                }
+            }
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.focus(); popup.show(); }
+            }
+        }
+        popup := PopupWindow {
+            x: 0px; y: root.height + 4px; width: root.width;
+            height: root.options.length * 32px + 10px;
+            Rectangle {
+                border-radius: 8px; background: Palette.panel;
+                border-width: 1px; border-color: Palette.border;
+                drop-shadow-blur: 12px; drop-shadow-color: #00000080;
+                VerticalLayout {
+                    padding: 5px;
+                    for option in root.options: Rectangle {
+                        height: 32px; border-radius: 5px;
+                        background: option-touch.has-hover ? Palette.control-hover
+                            : (option.value == root.value ? Palette.control : transparent);
+                        Text {
+                            x: 10px; width: parent.width - 40px; height: parent.height;
+                            text: option.label; font-family: root.font; font-size: 13px;
+                            color: Palette.text; vertical-alignment: center; overflow: elide;
+                        }
+                        if option.value == root.value: Rectangle {
+                            x: parent.width - 20px; y: (parent.height - 6px) / 2;
+                            width: 6px; height: 6px; border-radius: 3px; background: Palette.accent;
+                        }
+                        option-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.picked(option.value); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    component SettingsSlider inherits FocusScope {
+        in property <string> label;
+        in property <float> value;
+        in property <float> minimum;
+        in property <float> maximum: 1;
+        in property <float> step: 0.01;
+        in property <string> unit;
+        in property <string> font;
+        in property <string> mono-font;
+        callback committed(string);
+        // The shown value; follows `value` until dragged (rows are rebuilt
+        // from the settings draft after each change).
+        in-out property <float> live: root.value;
+        property <float> span: max(0.000001, root.maximum - root.minimum);
+        property <float> fraction: clamp((root.live - root.minimum) / root.span, 0, 1);
+        property <string> shown: "" + (round(root.live * 100) / 100) + root.unit;
+        function snapped(v: float) -> float {
+            return clamp(round((v - root.minimum) / root.step) * root.step + root.minimum,
+                root.minimum, root.maximum);
+        }
+        function commit() {
+            root.committed("" + (round(root.live * 1000) / 1000));
+        }
+        height: 44px;
+        accessible-role: slider;
+        accessible-label: root.label;
+        accessible-value: root.shown;
+        accessible-value-minimum: root.minimum;
+        accessible-value-maximum: root.maximum;
+        accessible-value-step: root.step;
+        key-pressed(event) => {
+            if event.text == Key.LeftArrow || event.text == Key.DownArrow {
+                root.live = root.snapped(root.live - root.step);
+                root.commit();
+                accept
+            } else if event.text == Key.RightArrow || event.text == Key.UpArrow {
+                root.live = root.snapped(root.live + root.step);
+                root.commit();
+                accept
+            } else {
+                reject
+            }
+        }
+        Text {
+            x: 0px; y: 0px; width: parent.width - 70px; height: 18px;
+            text: root.label; font-family: root.font; font-size: 13px; font-weight: 600;
+            color: Palette.text; vertical-alignment: center; overflow: elide;
+        }
+        Text {
+            x: parent.width - 70px; y: 0px; width: 70px; height: 18px;
+            text: root.shown; font-family: root.mono-font; font-size: 13px;
+            color: Palette.text; horizontal-alignment: right; vertical-alignment: center;
+        }
+        Rectangle {
+            x: 7px; y: 30px; width: parent.width - 14px; height: 4px; border-radius: 2px;
+            background: Palette.border;
+            Rectangle {
+                x: 0px; width: parent.width * root.fraction; height: parent.height;
+                border-radius: 2px; background: Palette.text;
+            }
+        }
+        Rectangle {
+            x: (parent.width - 14px) * root.fraction; y: 25px;
+            width: 14px; height: 14px; border-radius: 7px;
+            background: Palette.text;
+            border-width: root.has-focus ? 3px : 1px;
+            border-color: root.has-focus ? Palette.accent : Palette.window;
+        }
+        drag := TouchArea {
+            y: 18px; height: parent.height - 18px;
+            mouse-cursor: pointer;
+            function at(x: length) {
+                root.live = root.snapped(root.minimum
+                    + clamp((x - 7px) / max(1px, self.width - 14px), 0, 1) * root.span);
+            }
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    root.focus();
+                    self.at(self.mouse-x);
+                } else if event.kind == PointerEventKind.up {
+                    root.commit();
+                }
+            }
+            moved => {
+                if self.pressed {
+                    self.at(self.mouse-x);
+                }
+            }
+        }
+    }
+    component SettingsEngineCard inherits FocusScope {
         in property <string> caption;
+        in property <string> detail;
         in property <bool> selected;
-        in property <bool> unavailable;
         in property <string> font;
         callback picked();
         accessible-role: tab;
+        accessible-checked: root.selected;
         accessible-label: root.caption;
         key-pressed(event) => {
-            if !event.repeat && !root.unavailable && (event.text == Key.Return || event.text == Key.Space) {
+            if !event.repeat && (event.text == Key.Return || event.text == Key.Space) {
                 root.picked();
                 accept
             } else {
@@ -313,65 +497,53 @@ slint::slint! {
             }
         }
         Rectangle {
-            border-radius: 4px;
-            background: root.selected ? Palette.accent.with-alpha(0.16)
-                : (touch.has-hover && !root.unavailable ? Palette.control-hover : transparent);
-            border-width: root.has-focus ? 2px : (root.selected ? 1px : 0px);
-            border-color: root.has-focus ? Palette.text : Palette.accent.with-alpha(0.7);
+            border-radius: 8px;
+            background: touch.has-hover ? Palette.control-hover : Palette.control;
+            border-width: root.has-focus ? 2px : 1px;
+            border-color: root.has-focus ? Palette.text
+                : (root.selected ? Palette.accent.with-alpha(0.7) : Palette.border);
+            Rectangle {
+                x: 16px; y: (parent.height - 16px) / 2; width: 16px; height: 16px;
+                border-radius: 8px; border-width: 1px;
+                border-color: root.selected ? Palette.text : Palette.muted;
+                background: transparent;
+                if root.selected: Rectangle {
+                    x: 4px; y: 4px; width: 8px; height: 8px; border-radius: 4px;
+                    background: Palette.text;
+                }
+            }
             Text {
-                text: root.caption;
-                font-family: root.font; font-size: 12px;
-                font-weight: root.selected ? 600 : 400;
-                color: root.unavailable ? Palette.muted : (root.selected ? Palette.text : Palette.text-secondary);
-                horizontal-alignment: center; vertical-alignment: center;
-                width: parent.width - 8px; overflow: elide;
+                x: 44px; y: (parent.height / 2) - 19px; width: parent.width - 56px; height: 20px;
+                text: root.caption; font-family: root.font; font-size: 13px; font-weight: 600;
+                color: Palette.text; vertical-alignment: center; overflow: elide;
+            }
+            Text {
+                x: 44px; y: parent.height / 2 + 1px; width: parent.width - 56px; height: 18px;
+                text: root.detail; font-family: root.font; font-size: 12px;
+                color: Palette.text-secondary; vertical-alignment: center; overflow: elide;
             }
             touch := TouchArea {
-                enabled: !root.unavailable;
-                mouse-cursor: root.unavailable ? default : pointer;
+                mouse-cursor: pointer;
                 clicked => { root.focus(); root.picked(); }
-            }
-        }
-    }
-    component SettingsSegmented inherits Rectangle {
-        in property <[ConfigOption]> options;
-        in property <string> value;
-        in property <string> font;
-        callback picked(string);
-        height: 30px; border-radius: 6px;
-        background: Palette.control; border-width: 1px; border-color: Palette.border;
-        HorizontalLayout {
-            padding: 2px; spacing: 2px;
-            for option in root.options: SettingsSegment {
-                horizontal-stretch: 1;
-                caption: option.label; font: root.font;
-                selected: option.value == root.value;
-                picked => { root.picked(option.value); }
             }
         }
     }
     component SettingsInput inherits Rectangle {
         in property <string> text;
         in property <string> unit;
-        in property <string> caption;
         in property <bool> invalid;
         in property <bool> mono: true;
         in property <string> font;
         in property <string> mono-font;
         in property <string> label;
         callback edited(string);
-        height: 30px; border-radius: 6px;
+        height: 36px; border-radius: 6px;
         background: Palette.control;
         border-width: input.has-focus || root.invalid ? 2px : 1px;
         border-color: root.invalid ? Palette.error : (input.has-focus ? Palette.accent : Palette.border);
-        if root.caption != "": Text {
-            x: 9px; width: 26px; height: parent.height;
-            text: root.caption; font-family: root.font; font-size: 11px;
-            color: Palette.muted; vertical-alignment: center;
-        }
         input := TextInput {
-            x: root.caption != "" ? 36px : 10px;
-            width: parent.width - self.x - (root.unit != "" ? 34px : 10px);
+            x: 12px;
+            width: parent.width - self.x - (root.unit != "" ? 40px : 12px);
             height: parent.height;
             text: root.text;
             font-family: root.mono ? root.mono-font : root.font;
@@ -381,11 +553,11 @@ slint::slint! {
             selection-foreground-color: Palette.text;
             vertical-alignment: center;
             single-line: true;
-            accessible-label: root.caption != "" ? root.label + " " + root.caption : root.label;
+            accessible-label: root.label;
             edited => { root.edited(self.text); }
         }
         if root.unit != "": Text {
-            x: parent.width - 32px; width: 24px; height: parent.height;
+            x: parent.width - 38px; width: 28px; height: parent.height;
             text: root.unit; font-family: root.font; font-size: 12px;
             color: Palette.muted; horizontal-alignment: right; vertical-alignment: center;
         }
@@ -430,8 +602,8 @@ slint::slint! {
 
     export component SettingsWindow inherits Window {
         title: "SysX Settings";
-        preferred-width: 760px; preferred-height: 720px;
-        min-width: 620px; min-height: 560px;
+        preferred-width: 940px; preferred-height: 780px;
+        min-width: 760px; min-height: 600px;
         background: Palette.window;
         default-font-family: root.body-font;
         in property <string> body-font: "Segoe UI";
@@ -518,133 +690,161 @@ slint::slint! {
                     content := Rectangle {
                         width: settings-list.visible-width;
                         height: root.content-height * 1px;
+                        // Page margin, card padding and the gap between cells.
                         property <length> pad: 20px;
-                        property <length> panel-width: self.width - 2 * self.pad;
-                        property <length> control-width: min(300px, max(232px, self.panel-width * 0.5));
-                        for field in root.fields: row := Rectangle {
-                            x: content.pad; y: field.y * 1px;
-                            width: content.panel-width;
-                            height: field.kind == "section" ? (30 + field.h) * 1px : 44px;
-                            property <length> control-x: self.width - 14px - content.control-width;
-                            property <bool> is-invalid: root.invalid-key != "" && (root.invalid-key == field.key || root.invalid-key == field.key2);
+                        property <length> card-pad: 18px;
+                        property <length> gap: 16px;
+                        property <length> inner-x: self.pad + self.card-pad;
+                        property <length> inner-w: self.width - 2 * (self.pad + self.card-pad);
+                        for field in root.fields: cell := Rectangle {
+                            x: field.kind == "section" ? content.pad
+                                : content.inner-x + field.x * (content.inner-w + content.gap);
+                            y: field.y * 1px;
+                            width: field.kind == "section" ? content.width - 2 * content.pad
+                                : field.w * (content.inner-w + content.gap) - content.gap;
+                            height: field.h * 1px;
+                            property <bool> is-invalid: root.invalid-key != ""
+                                && (root.invalid-key == field.key || root.invalid-key == field.key2);
+                            property <bool> labeled: field.kind == "dropdown" || field.kind == "number"
+                                || field.kind == "text" || field.kind == "info"
+                                || field.kind == "rename" || field.kind == "profile-actions";
                             if field.kind == "section": Rectangle {
                                 Text {
                                     x: 2px; y: 0px; height: 22px;
                                     text: field.label; color: Palette.text;
-                                    font-size: 14px; font-weight: 600; vertical-alignment: center;
+                                    font-size: 15px; font-weight: 600; vertical-alignment: center;
                                 }
                                 Rectangle {
-                                    y: 30px; height: field.h * 1px;
-                                    border-radius: 8px; background: Palette.panel;
+                                    y: 32px; height: parent.height - 32px;
+                                    border-radius: 10px; background: Palette.panel;
                                     border-width: 1px; border-color: Palette.border;
                                 }
                             }
-                            if field.kind != "section": Rectangle {
-                                if !field.first: Rectangle {
-                                    x: 14px; y: 0px; width: parent.width - 28px; height: 1px;
-                                    background: Palette.divider;
-                                }
+                            if field.kind == "subhead": Text {
+                                y: 0px; height: 22px; width: parent.width;
+                                text: field.label; color: Palette.text;
+                                font-size: 14px; font-weight: 600; vertical-alignment: center;
+                            }
+                            if cell.labeled: Text {
+                                y: 0px; height: 18px; width: parent.width;
+                                text: field.label; color: Palette.text;
+                                font-size: 13px; font-weight: 600; vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if field.hint != "": Text {
+                                y: parent.height - 16px; height: 16px; width: parent.width;
+                                text: field.hint; color: Palette.muted;
+                                font-size: 12px; vertical-alignment: center; overflow: elide;
+                            }
+                            if field.kind == "toggle": Rectangle {
+                                y: 0px; height: 36px;
                                 Text {
-                                    x: 14px; width: row.control-x - 26px; height: parent.height;
-                                    text: field.label; color: Palette.text; font-size: 13px;
+                                    x: 0px; width: parent.width - 80px; height: parent.height;
+                                    text: field.label; color: Palette.text; font-size: 13px; font-weight: 600;
                                     vertical-alignment: center; overflow: elide;
                                 }
-                                if field.kind == "toggle": SettingsSwitch {
-                                    x: parent.width - 14px - self.width; y: (parent.height - self.height) / 2;
+                                SettingsSwitch {
+                                    x: parent.width - self.width; y: (parent.height - self.height) / 2;
                                     checked: field.value == "true"; label: field.label; font: root.body-font;
                                     toggled => { root.field-activated(field.key); }
                                 }
-                                if field.kind == "choice": SettingsSegmented {
-                                    x: row.control-x; y: (parent.height - self.height) / 2;
-                                    width: content.control-width;
-                                    options: field.choices; value: field.value; font: root.body-font;
-                                    picked(value) => { root.field-selected(field.key, value); }
+                            }
+                            if field.kind == "dropdown": SettingsDropdown {
+                                y: 24px; width: parent.width;
+                                options: field.choices; value: field.value; display: field.value2;
+                                label: field.label; font: root.body-font;
+                                picked(value) => { root.field-selected(field.key, value); }
+                                stepped => { root.field-activated(field.key); }
+                            }
+                            if field.kind == "number" || field.kind == "text": SettingsInput {
+                                y: 24px; width: parent.width;
+                                text: field.value; unit: field.unit; label: field.label;
+                                mono: field.kind == "number";
+                                invalid: cell.is-invalid;
+                                font: root.body-font; mono-font: root.mono-font;
+                                edited(text) => { root.field-edited(field.key, text); }
+                            }
+                            if field.kind == "slider": SettingsSlider {
+                                y: 0px; width: parent.width;
+                                label: field.label; value: field.value.to-float(); unit: field.unit;
+                                minimum: field.min; maximum: field.max; step: field.step;
+                                font: root.body-font; mono-font: root.mono-font;
+                                committed(text) => { root.field-edited(field.key, text); }
+                            }
+                            if field.kind == "info": Rectangle {
+                                y: 24px; height: 36px;
+                                border-radius: 6px; background: Palette.control;
+                                border-width: 1px; border-color: Palette.border;
+                                Text {
+                                    x: 12px; width: parent.width - 24px; height: parent.height;
+                                    text: field.value; color: Palette.text-secondary; font-size: 13px;
+                                    font-family: root.mono-font; vertical-alignment: center; overflow: elide;
                                 }
-                                if field.kind == "number" || field.kind == "text": SettingsInput {
-                                    x: row.control-x; y: (parent.height - self.height) / 2;
-                                    width: content.control-width;
-                                    text: field.value; unit: field.unit; label: field.label;
-                                    mono: field.kind == "number";
-                                    invalid: row.is-invalid;
+                            }
+                            if field.kind == "engine": HorizontalLayout {
+                                spacing: content.gap;
+                                SettingsEngineCard {
+                                    caption: "Pixel Seek"; detail: "Fast pixel-based detection";
+                                    selected: field.value == "pixel_seek"; font: root.body-font;
+                                    picked => { root.field-selected("strategy", "pixel_seek"); }
+                                }
+                                SettingsEngineCard {
+                                    caption: "Object Detection"; detail: "AI model recognition";
+                                    selected: field.value == "object_detection"; font: root.body-font;
+                                    picked => { root.field-selected("strategy", "object_detection"); }
+                                }
+                            }
+                            if field.kind == "offset": Rectangle {
+                                // The center cross is the target; the dot is where
+                                // the offsets aim relative to it.
+                                height: 56px; border-radius: 8px; background: Palette.control;
+                                border-width: 1px; border-color: Palette.border;
+                                property <length> dx: clamp(field.value.to-float() * 2px,
+                                    -(self.width / 2 - 10px), self.width / 2 - 10px);
+                                property <length> dy: clamp(field.value2.to-float() * 2px,
+                                    -(self.height / 2 - 6px), self.height / 2 - 6px);
+                                Rectangle {
+                                    x: parent.width / 2 - 8px; y: parent.height / 2; width: 16px; height: 1px;
+                                    background: Palette.text-secondary;
+                                }
+                                Rectangle {
+                                    x: parent.width / 2; y: parent.height / 2 - 8px; width: 1px; height: 16px;
+                                    background: Palette.text-secondary;
+                                }
+                                Rectangle {
+                                    x: parent.width / 2 + parent.dx - 4px; y: parent.height / 2 + parent.dy - 4px;
+                                    width: 8px; height: 8px; border-radius: 4px; background: Palette.accent;
+                                }
+                                Rectangle {
+                                    x: parent.width - self.width - 8px; y: parent.height - 24px;
+                                    width: readout.preferred-width + 12px; height: 18px; border-radius: 4px;
+                                    background: Palette.panel;
+                                    readout := Text {
+                                        width: parent.width; height: parent.height;
+                                        text: field.unit; font-family: root.mono-font; font-size: 11px;
+                                        color: Palette.text-secondary;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            if field.kind == "rename": HorizontalLayout {
+                                y: 24px; height: 36px; spacing: 8px;
+                                SettingsInput {
+                                    text: field.value; mono: false; label: field.label;
                                     font: root.body-font; mono-font: root.mono-font;
                                     edited(text) => { root.field-edited(field.key, text); }
                                 }
-                                if field.kind == "pair": HorizontalLayout {
-                                    x: row.control-x; y: (parent.height - 30px) / 2;
-                                    width: content.control-width; height: 30px; spacing: 8px;
-                                    SettingsInput {
-                                        text: field.value; caption: field.cap1; unit: field.unit; label: field.label;
-                                        invalid: root.invalid-key == field.key;
-                                        font: root.body-font; mono-font: root.mono-font;
-                                        edited(text) => { root.field-edited(field.key, text); }
-                                    }
-                                    SettingsInput {
-                                        text: field.value2; caption: field.cap2; unit: field.unit; label: field.label;
-                                        invalid: root.invalid-key == field.key2;
-                                        font: root.body-font; mono-font: root.mono-font;
-                                        edited(text) => { root.field-edited(field.key2, text); }
-                                    }
+                                SettingsButton {
+                                    y: 3px; width: 84px; caption: "Rename"; font: root.body-font;
+                                    activated => { root.field-activated(field.key2); }
                                 }
-                                if field.kind == "engine": Rectangle {
-                                    // Wider than other controls so both names read in full.
-                                    x: max(120px, row.control-x - 120px); y: (parent.height - 30px) / 2;
-                                    width: parent.width - 14px - self.x; height: 30px;
-                                    border-radius: 6px; background: Palette.control;
-                                    border-width: 1px; border-color: Palette.border;
-                                    HorizontalLayout {
-                                        padding: 2px; spacing: 2px;
-                                        SettingsSegment {
-                                            width: (parent.width - 6px) / 2; caption: "Pixel Seek";
-                                            selected: field.value == "pixel_seek"; font: root.body-font;
-                                            picked => { root.field-selected("strategy", "pixel_seek"); }
-                                        }
-                                        SettingsSegment {
-                                            width: (parent.width - 6px) / 2; caption: "Object Detection";
-                                            selected: field.value == "object_detection"; font: root.body-font;
-                                            picked => { root.field-selected("strategy", "object_detection"); }
-                                        }
-                                    }
-                                }
-                                if field.kind == "model-import": HorizontalLayout {
-                                    x: row.control-x; y: (parent.height - 30px) / 2;
-                                    width: content.control-width; height: 30px; spacing: 8px;
-                                    SettingsInput {
-                                        text: field.value; mono: false; label: field.label;
-                                        font: root.body-font; mono-font: root.mono-font;
-                                        edited(text) => { root.field-edited(field.key, text); }
-                                    }
-                                    SettingsButton {
-                                        width: 76px; caption: "Import"; font: root.body-font;
-                                        activated => { root.field-activated(field.key2); }
-                                    }
-                                }
-                                if field.kind == "info": Text {
-                                    x: row.control-x; width: content.control-width; height: parent.height;
-                                    text: field.value; color: Palette.text-secondary; font-size: 13px;
-                                    font-family: root.mono-font;
-                                    vertical-alignment: center; overflow: elide;
-                                }
-                                if field.kind == "rename": HorizontalLayout {
-                                    x: row.control-x; y: (parent.height - 30px) / 2;
-                                    width: content.control-width; height: 30px; spacing: 8px;
-                                    SettingsInput {
-                                        text: field.value; mono: false; label: field.label;
-                                        font: root.body-font; mono-font: root.mono-font;
-                                        edited(text) => { root.field-edited(field.key, text); }
-                                    }
-                                    SettingsButton {
-                                        width: 76px; caption: "Rename"; font: root.body-font;
-                                        activated => { root.field-activated(field.key2); }
-                                    }
-                                }
-                                if field.kind == "profile-actions": HorizontalLayout {
-                                    x: row.control-x; y: (parent.height - 30px) / 2;
-                                    width: content.control-width; height: 30px; spacing: 8px;
-                                    for action in field.choices: SettingsButton {
-                                        horizontal-stretch: 1; caption: action.label; font: root.body-font;
-                                        kind: action.value == "profile.delete" ? "danger" : "secondary";
-                                        activated => { root.field-activated(action.value); }
-                                    }
+                            }
+                            if field.kind == "profile-actions": HorizontalLayout {
+                                y: 24px; height: 36px; spacing: 8px;
+                                for action in field.choices: SettingsButton {
+                                    y: 3px; horizontal-stretch: 1; caption: action.label; font: root.body-font;
+                                    kind: action.value == "profile.delete" ? "danger" : "secondary";
+                                    activated => { root.field-activated(action.value); }
                                 }
                             }
                         }
@@ -681,20 +881,40 @@ fn ink(rgb: u32) -> slint::Color {
     slint::Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// Settings page geometry (logical px): each section is its own page with
-/// a heading over one panel of rows.
+/// Settings page geometry (logical px): each section is its own page with a
+/// heading over one card; inside the card, rows of cells laid out on a grid
+/// (label above the control, an optional hint below).
 const SETTINGS_TOP: f32 = 20.0;
-const SETTINGS_HEADING: f32 = 30.0;
-const SETTINGS_ROW: f32 = 44.0;
+/// Section title above its card.
+const SETTINGS_HEADING: f32 = 32.0;
+const CARD_PAD: f32 = 18.0;
+const ROW_GAP: f32 = 16.0;
+const HINT_HEIGHT: f32 = 20.0;
 
-/// One page of native Settings: a rail entry and its laid-out rows.
+/// One page of native Settings: a rail entry and its laid-out cells.
 struct SettingsPageLayout {
     section: ConfigSection,
     fields: Vec<ConfigField>,
     height: f32,
 }
 
+/// Smoothing and offsets are whole numbers (user request); the speed
+/// booster keeps its decimals.
+fn whole_number_key(key: &str) -> bool {
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    leaf.starts_with("smoothing") || leaf.starts_with("smooth") || leaf.starts_with("offset")
+}
+
 fn setting_text(settings: &serde_json::Value, key: &str) -> String {
+    if whole_number_key(key) {
+        if let Some(number) = key
+            .split('.')
+            .try_fold(settings, |value, part| value.get(part))
+            .and_then(serde_json::Value::as_f64)
+        {
+            return format!("{}", number.round() as i64);
+        }
+    }
     key.split('.')
         .try_fold(settings, |value, part| value.get(part))
         .map(|value| {
@@ -730,6 +950,51 @@ fn options(items: &[(&str, &str)]) -> ModelRc<ConfigOption> {
     ))
 }
 
+const BUTTONS: &[(&str, &str)] = &[
+    ("Right click", "right"),
+    ("Mouse button 4", "m4"),
+    ("Mouse button 5", "m5"),
+];
+const DYNAMIC_FOV_KEYS: &[(&str, &str)] = &[
+    ("Off", "off"),
+    ("Right click", "right"),
+    ("Mouse button 4", "m4"),
+    ("Mouse button 5", "m5"),
+];
+const MAGNET_MODES: &[(&str, &str)] = &[
+    ("Spray (hold fire)", "spray"),
+    ("Tap fire", "tap"),
+    ("Silent flick (near)", "silent_proximity"),
+    ("Silent flick", "silent_immediate"),
+    ("Auto (center crossing)", "auto"),
+];
+
+/// Fixed dropdown choices per setting key, as (label, value).
+fn choice_options(key: &str) -> &'static [(&'static str, &'static str)] {
+    match key {
+        "pixelColor" => &[("Yellow", "yellow"), ("Red", "red"), ("Purple", "purple")],
+        "scale" => &[("Smooth", "Smooth"), ("Pixel perfect", "Pixel perfect")],
+        "triggerButton" | "magnet.triggerButton" => BUTTONS,
+        "dynamicFovKey" | "magnet.dynamicFovKey" => DYNAMIC_FOV_KEYS,
+        "modelBackend" => MODEL_BACKENDS,
+        "computeTarget" => &[("CPU", "cpu"), ("GPU", "gpu"), ("NPU", "npu")],
+        "modelPrecision" => &[("FP16", "fp16"), ("INT8", "int8")],
+        "colorSwap" => &[
+            ("Off", "off"),
+            ("Yellow", "yellow"),
+            ("Red", "red"),
+            ("Purple", "purple"),
+        ],
+        "magnet.mode" => MAGNET_MODES,
+        "recoil.recoilPattern" => &[
+            ("Vandal", "vandal"),
+            ("Phantom", "phantom"),
+            ("Custom", "custom"),
+        ],
+        _ => &[],
+    }
+}
+
 fn field(key: &str, label: &str, kind: &str) -> ConfigField {
     ConfigField {
         key: key.into(),
@@ -740,276 +1005,570 @@ fn field(key: &str, label: &str, kind: &str) -> ConfigField {
         unit: Default::default(),
         key2: Default::default(),
         value2: Default::default(),
-        cap1: Default::default(),
-        cap2: Default::default(),
+        hint: Default::default(),
+        x: 0.0,
+        w: 1.0,
         y: 0.0,
         h: 0.0,
-        first: false,
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     }
 }
 
-/// Collects the rows of the Settings page, one section at a time.
+/// Height of one cell by its kind, plus the hint line.
+fn cell_height(cell: &ConfigField) -> f32 {
+    let body = match cell.kind.as_str() {
+        "subhead" => 22.0,
+        "toggle" => 36.0,
+        "slider" => 44.0,
+        "engine" => 66.0,
+        "offset" => 56.0,
+        _ => 60.0,
+    };
+    body + if cell.hint.is_empty() {
+        0.0
+    } else {
+        HINT_HEIGHT
+    }
+}
+
+fn with_hint(mut cell: ConfigField, hint: &str) -> ConfigField {
+    cell.hint = hint.into();
+    cell
+}
+
+/// A dropdown over `choices`; `value2` carries the selected label.
+fn dropdown_of(
+    settings: &serde_json::Value,
+    key: &str,
+    label: &str,
+    choices: Vec<(String, String)>,
+) -> ConfigField {
+    let mut cell = field(key, label, "dropdown");
+    let value = setting_text(settings, key);
+    cell.value2 = choices
+        .iter()
+        .find(|(_, choice)| *choice == value)
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(|| value.clone())
+        .into();
+    cell.value = value.into();
+    cell.choices = ModelRc::new(VecModel::from(
+        choices
+            .into_iter()
+            .map(|(label, value)| ConfigOption {
+                label: label.into(),
+                value: value.into(),
+            })
+            .collect::<Vec<_>>(),
+    ));
+    cell
+}
+
+fn dropdown(settings: &serde_json::Value, key: &str, label: &str) -> ConfigField {
+    let choices = choice_options(key)
+        .iter()
+        .map(|(label, value)| ((*label).to_owned(), (*value).to_owned()))
+        .collect();
+    dropdown_of(settings, key, label, choices)
+}
+
+fn number(settings: &serde_json::Value, key: &str, label: &str, unit: &str) -> ConfigField {
+    let mut cell = field(key, label, "number");
+    cell.value = setting_text(settings, key).into();
+    cell.unit = unit.into();
+    cell
+}
+
+fn toggle(settings: &serde_json::Value, key: &str, label: &str) -> ConfigField {
+    let mut cell = field(key, label, "toggle");
+    cell.value = setting_text(settings, key).into();
+    cell
+}
+
+fn slider(
+    settings: &serde_json::Value,
+    key: &str,
+    label: &str,
+    (min, max, step): (f32, f32, f32),
+    unit: &str,
+) -> ConfigField {
+    let mut cell = field(key, label, "slider");
+    cell.value = setting_text(settings, key).into();
+    (cell.min, cell.max, cell.step) = (min, max, step);
+    cell.unit = unit.into();
+    cell
+}
+
+fn subhead(label: &str) -> ConfigField {
+    field("", label, "subhead")
+}
+
+/// The offset pad: the center cross is the target, the dot the offset aim.
+fn offset_pad(settings: &serde_json::Value, key_x: &str, key_y: &str) -> ConfigField {
+    let mut cell = field(key_x, "Offset", "offset");
+    cell.value = setting_text(settings, key_x).into();
+    cell.key2 = key_y.into();
+    cell.value2 = setting_text(settings, key_y).into();
+    let signed = |key: &str| {
+        let value = setting_text(settings, key).parse::<f64>().unwrap_or(0.0);
+        format!("{}{}", if value < 0.0 { "" } else { "+" }, value)
+    };
+    cell.unit = format!("{}, {}", signed(key_x), signed(key_y)).into();
+    cell
+}
+
+fn is_on(settings: &serde_json::Value, key: &str) -> bool {
+    key.split('.')
+        .try_fold(settings, |value, part| value.get(part))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// Collects the Settings pages: a section per page, rows of cells inside.
 #[derive(Default)]
 struct SettingsPage {
-    fields: Vec<ConfigField>,
+    pages: Vec<SettingsPageLayout>,
 }
 
 impl SettingsPage {
     fn section(&mut self, label: &str) {
-        self.fields.push(field("", label, "section"));
+        let mut heading = field("", label, "section");
+        heading.y = SETTINGS_TOP;
+        self.pages.push(SettingsPageLayout {
+            section: ConfigSection {
+                label: label.into(),
+            },
+            fields: vec![heading],
+            height: SETTINGS_TOP + SETTINGS_HEADING + CARD_PAD,
+        });
     }
 
-    fn row(&mut self, row: ConfigField) {
-        self.fields.push(row);
-    }
-
-    fn setting(
-        &mut self,
-        settings: &serde_json::Value,
-        key: &str,
-        label: &str,
-        kind: &str,
-        unit: &str,
-    ) {
-        let choices: &[(&str, &str)] = match key {
-            "pixelColor" => &[("Yellow", "yellow"), ("Red", "red"), ("Purple", "purple")],
-            "scale" => &[("Smooth", "Smooth"), ("Pixel perfect", "Pixel perfect")],
-            "triggerButton" | "auto.triggerButton" => {
-                &[("Right", "right"), ("M4", "m4"), ("M5", "m5")]
-            }
-            "modelBackend" => MODEL_BACKENDS,
-            "computeTarget" => &[("CPU", "cpu"), ("GPU", "gpu"), ("NPU", "npu")],
-            _ => &[],
+    /// One row of equally wide cells.
+    fn row(&mut self, cells: Vec<ConfigField>) {
+        let Some(page) = self.pages.last_mut() else {
+            return;
         };
-        let mut row = field(key, label, kind);
-        row.value = setting_text(settings, key).into();
-        row.unit = unit.into();
-        if kind == "choice" {
-            row.choices = options(choices);
+        let columns = cells.len().max(1) as f32;
+        let height = cells.iter().map(cell_height).fold(0.0, f32::max);
+        for (index, mut cell) in cells.into_iter().enumerate() {
+            cell.x = index as f32 / columns;
+            cell.w = 1.0 / columns;
+            cell.y = page.height;
+            cell.h = cell_height(&cell);
+            page.fields.push(cell);
         }
-        self.row(row);
+        page.height += height + ROW_GAP;
     }
 
-    /// Two inputs on one row (X/Y or Min/Max), each with its own key.
-    #[allow(clippy::too_many_arguments)]
-    fn pair(
-        &mut self,
-        settings: &serde_json::Value,
-        label: &str,
-        (key, cap1): (&str, &str),
-        (key2, cap2): (&str, &str),
-        unit: &str,
-    ) {
-        let mut row = field(key, label, "pair");
-        row.value = setting_text(settings, key).into();
-        row.key2 = key2.into();
-        row.value2 = setting_text(settings, key2).into();
-        row.cap1 = cap1.into();
-        row.cap2 = cap2.into();
-        row.unit = unit.into();
-        self.row(row);
-    }
-
-    /// Splits the rows into one page per section and positions each page's
-    /// heading, panel and rows from the top.
-    fn layout(self) -> Vec<SettingsPageLayout> {
-        let mut pages = Vec::<SettingsPageLayout>::new();
-        for mut row in self.fields {
-            if row.kind == "section" {
-                row.y = SETTINGS_TOP;
-                pages.push(SettingsPageLayout {
-                    section: ConfigSection {
-                        label: row.label.clone(),
-                    },
-                    fields: vec![row],
-                    height: SETTINGS_TOP + SETTINGS_HEADING,
-                });
-                continue;
-            }
-            let Some(page) = pages.last_mut() else {
-                continue;
-            };
-            row.y = page.height;
-            row.first = page.fields.len() == 1;
-            page.height += SETTINGS_ROW;
-            page.fields[0].h += SETTINGS_ROW;
-            page.fields.push(row);
+    /// Closes each card under its section title.
+    fn layout(mut self) -> Vec<SettingsPageLayout> {
+        for page in &mut self.pages {
+            let bottom = page.height - ROW_GAP + CARD_PAD;
+            page.fields[0].h = bottom - SETTINGS_TOP;
+            page.height = bottom + SETTINGS_TOP;
         }
-        for page in &mut pages {
-            page.height += SETTINGS_TOP;
-        }
-        pages
+        self.pages
     }
 }
 
-fn settings_page(settings: &serde_json::Value, model_path: &str) -> Vec<SettingsPageLayout> {
+/// `models`: the built-in models as (id, label).
+fn settings_page(
+    settings: &serde_json::Value,
+    models: &[(String, String)],
+) -> Vec<SettingsPageLayout> {
     let mut page = SettingsPage::default();
+
     page.section("Profiles");
-    let profiles = settings
+    let names: Vec<(String, String)> = settings
         .get("profiles")
-        .and_then(serde_json::Value::as_array);
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| profile.get("name").and_then(serde_json::Value::as_str))
+        .map(|name| (name.to_owned(), name.to_owned()))
+        .collect();
     let active_name = profile_name_of(settings);
-    let mut select = field("profile.select", "Active profile", "choice");
+    let mut select = dropdown_of(settings, "profile.select", "Active profile", names);
     select.value = active_name.clone().into();
-    select.choices = ModelRc::new(VecModel::from(
-        profiles
-            .into_iter()
-            .flatten()
-            .filter_map(|profile| profile.get("name").and_then(serde_json::Value::as_str))
-            .map(|name| ConfigOption {
-                label: name.into(),
-                value: name.into(),
-            })
-            .collect::<Vec<_>>(),
-    ));
-    page.row(select);
+    select.value2 = active_name.clone().into();
     let mut rename = field("profile.rename", "Name", "rename");
     rename.value = active_name.into();
     rename.key2 = "profile.rename.apply".into();
-    page.row(rename);
+    page.row(vec![
+        with_hint(select, "The middle mouse button cycles profiles"),
+        rename,
+    ]);
     let mut actions = field("profile.actions", "Manage", "profile-actions");
     actions.choices = options(&[
         ("New", "profile.create"),
         ("Duplicate", "profile.clone"),
         ("Delete", "profile.delete"),
     ]);
-    page.row(actions);
+    page.row(vec![actions]);
 
     page.section("Detection");
-    let mut engine = field("engine", "Engine", "engine");
+    let mut engine = field("strategy", "Engine", "engine");
     engine.value = setting_text(settings, "strategy").into();
-    page.row(engine);
-    if engine_is_object_detection(settings) {
-        let mut import = field("model.path", "Model file", "model-import");
-        import.value = model_path.into();
-        import.key2 = "model.import".into();
-        page.row(import);
-        let mut active = field("model.active", "Active model", "info");
-        active.value = settings
-            .get("activeModelId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("None")
-            .into();
-        page.row(active);
-        page.setting(settings, "modelConfidence", "Min confidence", "number", "");
-        page.setting(settings, "modelBackend", "Runtime", "choice", "");
-        // Only OpenVINO picks its device; the GPU runtimes imply theirs.
-        if settings
-            .get("modelBackend")
-            .and_then(serde_json::Value::as_str)
-            == Some("openvino")
-        {
-            page.setting(settings, "computeTarget", "Device", "choice", "");
-        }
-    } else {
-        page.setting(settings, "pixelColor", "Target color", "choice", "");
-    }
-    page.setting(settings, "fovDegrees", "FOV", "number", "°");
-    page.setting(settings, "colorFilter", "Color filter", "toggle", "");
-    page.setting(
-        settings,
-        "cropResolution",
-        "Crop resolution",
-        "number",
-        "px",
+    page.row(vec![engine]);
+    let sensitivity = with_hint(
+        number(settings, "sens", "In-game sensitivity", ""),
+        "Your in-game mouse sensitivity",
     );
-    page.setting(settings, "scale", "Preview scaling", "choice", "");
+    if engine_is_object_detection(settings) {
+        page.row(vec![subhead("AI Model Settings")]);
+        let model = if models.is_empty() {
+            let mut none = field("activeModelId", "Model", "info");
+            none.value = "None built in".into();
+            none
+        } else {
+            dropdown_of(
+                settings,
+                "activeModelId",
+                "Model",
+                models
+                    .iter()
+                    .map(|(id, label)| (label.clone(), id.clone()))
+                    .collect(),
+            )
+        };
+        page.row(vec![
+            with_hint(model, "Built-in AI model"),
+            with_hint(
+                dropdown(settings, "modelBackend", "Runtime"),
+                "Inference backend",
+            ),
+        ]);
+        // Only OpenVINO picks its device; the GPU runtimes imply theirs.
+        let openvino = setting_text(settings, "modelBackend") == "openvino";
+        let precision = with_hint(
+            dropdown(settings, "modelPrecision", "Compute"),
+            "Precision mode",
+        );
+        let color_swap = with_hint(
+            dropdown(settings, "colorSwap", "Color swap"),
+            "Only detect enemies with this outline color",
+        );
+        let target_color = with_hint(
+            dropdown(settings, "pixelColor", "Target color"),
+            "Color used by the color filter",
+        );
+        let confidence = slider(
+            settings,
+            "modelConfidence",
+            "Min confidence",
+            (0.0, 1.0, 0.01),
+            "",
+        );
+        if openvino {
+            page.row(vec![
+                with_hint(
+                    dropdown(settings, "computeTarget", "Device"),
+                    "Processing unit",
+                ),
+                precision,
+            ]);
+            page.row(vec![color_swap, target_color]);
+            page.row(vec![sensitivity]);
+        } else {
+            page.row(vec![precision, color_swap]);
+            page.row(vec![target_color, sensitivity]);
+        }
+        page.row(vec![
+            confidence,
+            slider(
+                settings,
+                "abilityConfidence",
+                "Min ability confidence",
+                (0.0, 1.0, 0.01),
+                "",
+            ),
+        ]);
+    } else {
+        page.row(vec![subhead("Pixel Seek")]);
+        page.row(vec![
+            with_hint(
+                dropdown(settings, "pixelColor", "Target color"),
+                "Target outline color",
+            ),
+            sensitivity,
+        ]);
+    }
+    page.row(vec![subhead("Capture")]);
+    // Object Detection captures the model's input size instead.
+    if engine_is_object_detection(settings) {
+        page.row(vec![dropdown(settings, "scale", "Preview scaling")]);
+    } else {
+        page.row(vec![
+            number(settings, "cropResolution", "Crop resolution", "px"),
+            dropdown(settings, "scale", "Preview scaling"),
+        ]);
+    }
+    page.row(vec![with_hint(
+        toggle(settings, "colorFilter", "Color filter"),
+        "Black out everything but the target color before detection",
+    )]);
 
     page.section("Motion");
-    page.setting(settings, "motionEnabled", "Motion", "toggle", "");
-    page.setting(settings, "motionAlwaysOn", "Always on", "toggle", "");
-    page.setting(settings, "motionToggle", "Toggle", "toggle", "");
-    page.setting(settings, "motionNoDeadzone", "No deadzone", "toggle", "");
-    page.setting(settings, "triggerButton", "Trigger button", "choice", "");
-    page.pair(
+    page.row(vec![
+        toggle(settings, "motionEnabled", "Motion"),
+        with_hint(
+            toggle(settings, "motionAlwaysOn", "Always on"),
+            "Off with Toggle off: hold the trigger",
+        ),
+        with_hint(
+            toggle(settings, "motionToggle", "Toggle"),
+            "Each trigger press turns Motion on or off",
+        ),
+    ]);
+    page.row(vec![
+        number(settings, "fovDegrees", "FOV", "°"),
+        dropdown(settings, "triggerButton", "Trigger button"),
+    ]);
+    page.row(vec![
+        number(settings, "dynamicFovDegrees", "Dynamic FOV size", "°"),
+        dropdown(settings, "dynamicFovKey", "Dynamic FOV key"),
+    ]);
+    page.row(vec![
+        number(settings, "offsetX", "X offset", "px"),
+        number(settings, "offsetY", "Y offset", "px"),
+    ]);
+    page.row(vec![offset_pad(settings, "offsetX", "offsetY")]);
+    // Stable Normal motion (user request, 2026-11-01): Speed per axis, and a
+    // smoothing strength that applies only inside the Smooth FOV.
+    page.row(vec![
+        with_hint(
+            number(settings, "motionSpeedX", "Speed X", ""),
+            "Fraction of the error per frame (0.01–1)",
+        ),
+        with_hint(
+            number(settings, "motionSpeedY", "Speed Y", ""),
+            "Fraction of the error per frame (0.01–1)",
+        ),
+    ]);
+    page.row(vec![with_hint(
+        number(settings, "smoothFovDegrees", "Smooth FOV", "°"),
+        "Smoothing applies inside this circle, fading out at the target",
+    )]);
+    smoothing_rows(
+        &mut page,
         settings,
-        "Speed",
-        ("motionSpeedX", "X"),
-        ("motionSpeedY", "Y"),
-        "",
+        [
+            "smoothingXMin",
+            "smoothingXMax",
+            "smoothingYMin",
+            "smoothingYMax",
+        ],
     );
-    page.setting(settings, "smoothFovDegrees", "Smooth FOV", "number", "°");
-    page.pair(
+    booster_rows(
+        &mut page,
         settings,
-        "X smoothing",
-        ("smoothingXMin", "Min"),
-        ("smoothingXMax", "Max"),
-        "",
+        ["speedBooster", "speedNear", "speedMid", "speedFar"],
     );
-    page.pair(
-        settings,
-        "Y smoothing",
-        ("smoothingYMin", "Min"),
-        ("smoothingYMax", "Max"),
-        "",
-    );
-    page.pair(settings, "Offset", ("offsetX", "X"), ("offsetY", "Y"), "px");
-    page.setting(settings, "sens", "In-game sensitivity", "number", "");
-    page.setting(
+    page.row(vec![with_hint(
+        toggle(settings, "continueInsideBox", "No deadzone"),
+        "Keep moving within 1 px of the target",
+    )]);
+    page.row(vec![toggle(
         settings,
         "motionRenderer.enabled",
-        "Normal + ABCurves",
-        "toggle",
-        "",
-    );
+        "ABCurves texture",
+    )]);
 
-    page.section("Auto");
-    page.setting(settings, "auto.enabled", "Auto", "toggle", "");
-    page.setting(
+    page.section("Magnet");
+    let mode = setting_text(settings, "magnet.mode");
+    page.row(vec![toggle(settings, "magnet.enabled", "Magnet")]);
+    page.row(vec![
+        number(settings, "magnet.fovDegrees", "FOV", "°"),
+        dropdown(settings, "magnet.triggerButton", "Trigger button"),
+        dropdown(settings, "magnet.mode", "Magnet mode"),
+    ]);
+    page.row(vec![
+        with_hint(
+            number(settings, "magnet.delayMs", "Delay", "ms"),
+            "Before firing",
+        ),
+        with_hint(
+            number(settings, "magnet.sleepMs", "Sleep", "ms"),
+            "Between checks",
+        ),
+    ]);
+    match mode.as_str() {
+        "spray" => page.row(vec![
+            with_hint(
+                number(settings, "magnet.forcedReleaseMs", "Max burst", "ms"),
+                "Longest hold before a forced release",
+            ),
+            with_hint(
+                number(settings, "magnet.cooldownMs", "Cooldown", "ms"),
+                "After a forced release",
+            ),
+        ]),
+        "tap" => page.row(vec![
+            with_hint(
+                number(settings, "magnet.fireHoldMs", "Hold", "ms"),
+                "How long each tap holds the button",
+            ),
+            with_hint(
+                number(settings, "magnet.resetTimeoutMs", "Tap interval", "ms"),
+                "Wait after a tap before the next one",
+            ),
+        ]),
+        "auto" => page.row(vec![with_hint(
+            number(settings, "magnet.cooldownMs", "Cooldown", "ms"),
+            "Between shots",
+        )]),
+        "silent_proximity" => page.row(vec![
+            with_hint(
+                number(settings, "magnet.fireHoldMs", "Hold", "ms"),
+                "How long the flick holds the button",
+            ),
+            with_hint(
+                number(settings, "magnet.flickProximityPx", "Flick distance", "px"),
+                "Flick only this close to the target",
+            ),
+        ]),
+        "silent_immediate" => page.row(vec![with_hint(
+            number(settings, "magnet.fireHoldMs", "Hold", "ms"),
+            "How long the flick holds the button",
+        )]),
+        _ => {}
+    }
+    page.row(vec![
+        number(
+            settings,
+            "magnet.dynamicFovDegrees",
+            "Dynamic FOV size",
+            "°",
+        ),
+        dropdown(settings, "magnet.dynamicFovKey", "Dynamic FOV key"),
+    ]);
+    page.row(vec![
+        number(settings, "magnet.offsetX", "X offset", "px"),
+        number(settings, "magnet.offsetY", "Y offset", "px"),
+    ]);
+    page.row(vec![offset_pad(
         settings,
-        "auto.triggerButton",
-        "Trigger button",
-        "choice",
-        "",
-    );
-    page.setting(settings, "auto.fovDegrees", "FOV", "number", "°");
-    page.setting(settings, "auto.delayMs", "Delay", "number", "ms");
-    page.setting(settings, "auto.cooldownMs", "Cooldown", "number", "ms");
-    page.setting(settings, "auto.sleepMs", "Sleep", "number", "ms");
+        "magnet.offsetX",
+        "magnet.offsetY",
+    )]);
+    // Auto clicks on center crossings and never pulls.
+    if mode != "auto" {
+        smoothing_rows(
+            &mut page,
+            settings,
+            [
+                "magnet.smoothXMin",
+                "magnet.smoothXMax",
+                "magnet.smoothYMin",
+                "magnet.smoothYMax",
+            ],
+        );
+        booster_rows(
+            &mut page,
+            settings,
+            [
+                "magnet.speedBooster",
+                "magnet.speedNear",
+                "magnet.speedMid",
+                "magnet.speedFar",
+            ],
+        );
+    }
+
     page.section("Recoil");
-    page.setting(settings, "recoil.recoilEnabled", "Recoil", "toggle", "");
-    page.setting(settings, "recoil.recoilLevels", "Levels", "text", "");
-    page.setting(
-        settings,
-        "recoil.recoilPercentage",
-        "Strength",
-        "number",
-        "%",
-    );
-    page.setting(
-        settings,
-        "recoil.recoilStartDelayMs",
-        "Start delay",
-        "number",
-        "ms",
-    );
-    page.setting(
-        settings,
-        "recoil.recoilLevelDurationMs",
-        "Time per level",
-        "number",
-        "ms",
-    );
+    page.row(vec![toggle(settings, "recoil.recoilEnabled", "Recoil")]);
+    page.row(vec![with_hint(
+        dropdown(settings, "recoil.recoilPattern", "Pattern"),
+        "Pull per bullet; Custom uses your own list",
+    )]);
+    page.row(vec![with_hint(
+        slider(
+            settings,
+            "recoil.recoilPercentage",
+            "Recoil reduction factor",
+            (0.0, 100.0, 1.0),
+            "%",
+        ),
+        "Higher values = more recoil compensation",
+    )]);
+    page.row(vec![
+        with_hint(
+            number(settings, "recoil.recoilStartDelayMs", "Start delay", "ms"),
+            "Delay before compensation starts",
+        ),
+        with_hint(
+            number(
+                settings,
+                "recoil.recoilLevelDurationMs",
+                "Time per bullet",
+                "ms",
+            ),
+            "Time per pattern step",
+        ),
+    ]);
+    if setting_text(settings, "recoil.recoilPattern") == "custom" {
+        let mut levels = field("recoil.recoilLevels", "Recoil pattern", "text");
+        levels.value = setting_text(settings, "recoil.recoilLevels").into();
+        page.row(vec![with_hint(
+            levels,
+            "Comma-separated pull per bullet; the last repeats",
+        )]);
+    }
 
     page.section("Connection");
-    page.setting(settings, "port", "UDP input port", "number", "");
+    page.row(vec![with_hint(
+        number(settings, "port", "UDP input port", ""),
+        "OBS sender port (default 4200)",
+    )]);
     page.layout()
+}
+
+/// X and Y smoothing, each a Min and a Max slider under its heading.
+fn smoothing_rows(page: &mut SettingsPage, settings: &serde_json::Value, keys: [&str; 4]) {
+    let range = (1.0, 50.0, 1.0);
+    page.row(vec![subhead("X Smooth"), subhead("Y Smooth")]);
+    page.row(vec![
+        slider(settings, keys[0], "Min", range, ""),
+        slider(settings, keys[2], "Min", range, ""),
+    ]);
+    page.row(vec![
+        slider(settings, keys[1], "Max", range, ""),
+        slider(settings, keys[3], "Max", range, ""),
+    ]);
+}
+
+/// Speed booster: on/off, then Short/Medium/Long distance multipliers.
+fn booster_rows(page: &mut SettingsPage, settings: &serde_json::Value, keys: [&str; 4]) {
+    page.row(vec![with_hint(
+        toggle(settings, keys[0], "Speed booster"),
+        "Scale the pull by distance: short < 30 px, medium 30–80 px, long > 80 px",
+    )]);
+    if is_on(settings, keys[0]) {
+        let range = (0.0, 3.0, 0.05);
+        page.row(vec![
+            slider(settings, keys[1], "Short", range, "×"),
+            slider(settings, keys[2], "Medium", range, "×"),
+            slider(settings, keys[3], "Long", range, "×"),
+        ]);
+    }
 }
 
 /// Object Detection runtimes: ONNX Runtime on CPU or a GPU execution
 /// provider, and OpenVINO (CPU/GPU/NPU).
 #[cfg(not(target_os = "macos"))]
 const MODEL_BACKENDS: &[(&str, &str)] = &[
-    ("CPU", "onnxruntime"),
-    ("DirectML", "directml"),
-    ("CUDA", "cuda"),
+    ("ONNX Runtime · CPU", "onnxruntime"),
+    ("ONNX Runtime · DirectML", "directml"),
+    ("ONNX Runtime · CUDA", "cuda"),
     ("TensorRT", "tensorrt"),
     ("OpenVINO", "openvino"),
 ];
 #[cfg(target_os = "macos")]
 const MODEL_BACKENDS: &[(&str, &str)] = &[
-    ("CPU", "onnxruntime"),
-    ("CoreML", "coreml"),
+    ("ONNX Runtime · CPU", "onnxruntime"),
+    ("ONNX Runtime · CoreML", "coreml"),
     ("OpenVINO", "openvino"),
 ];
 #[cfg(not(target_os = "macos"))]
@@ -1039,7 +1598,7 @@ fn profile_name_of(settings: &serde_json::Value) -> String {
 
 #[cfg(test)]
 fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
-    settings_page(settings, "")
+    settings_page(settings, &[])
         .into_iter()
         .flat_map(|page| page.fields)
         .collect()
@@ -1048,8 +1607,8 @@ fn settings_fields(settings: &serde_json::Value) -> Vec<ConfigField> {
 /// Shows `settings` in the window: the rail, the current page's rows and
 /// the profile being edited.
 fn show_settings(app: &SettingsWindow, settings: &serde_json::Value) {
-    let model_path = MODEL_PATH.with(|path| path.borrow().clone());
-    let mut pages = settings_page(settings, &model_path);
+    let models = BUILTIN_MODELS.with(|models| models.borrow().clone());
+    let mut pages = settings_page(settings, &models);
     let current = usize::try_from(app.get_current_page())
         .unwrap_or(0)
         .min(pages.len().saturating_sub(1));
@@ -1069,34 +1628,54 @@ fn show_settings(app: &SettingsWindow, settings: &serde_json::Value) {
 }
 
 thread_local! {
-    /// Folder typed into Settings for the next model import; not a setting.
-    static MODEL_PATH: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Object Detection models built into this SysX, from the backend.
+    static BUILTIN_MODELS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Field labels for messages, instead of storage keys.
 fn setting_label(key: &str) -> &str {
     match key {
         "modelConfidence" => "Min confidence",
+        "abilityConfidence" => "Min ability confidence",
+        "continueInsideBox" => "No deadzone",
         "fovDegrees" => "FOV",
+        "dynamicFovDegrees" => "Dynamic FOV size",
         "cropResolution" => "Crop resolution",
+        "speedNear" => "Booster short",
+        "speedMid" => "Booster medium",
+        "speedFar" => "Booster long",
         "motionSpeedX" => "Speed X",
         "motionSpeedY" => "Speed Y",
         "smoothFovDegrees" => "Smooth FOV",
-        "smoothingXMin" => "X smoothing min",
-        "smoothingXMax" => "X smoothing max",
-        "smoothingYMin" => "Y smoothing min",
-        "smoothingYMax" => "Y smoothing max",
-        "offsetX" => "Offset X",
-        "offsetY" => "Offset Y",
+        "smoothingXMin" => "X smooth min",
+        "smoothingXMax" => "X smooth max",
+        "smoothingYMin" => "Y smooth min",
+        "smoothingYMax" => "Y smooth max",
+        "offsetX" => "X offset",
+        "offsetY" => "Y offset",
         "sens" => "In-game sensitivity",
-        "auto.fovDegrees" => "Auto FOV",
-        "auto.delayMs" => "Auto delay",
-        "auto.cooldownMs" => "Auto cooldown",
-        "auto.sleepMs" => "Auto sleep",
-        "recoil.recoilLevels" => "Recoil levels",
-        "recoil.recoilPercentage" => "Recoil strength",
+        "magnet.fovDegrees" => "Magnet FOV",
+        "magnet.dynamicFovDegrees" => "Magnet dynamic FOV size",
+        "magnet.offsetX" => "Magnet X offset",
+        "magnet.offsetY" => "Magnet Y offset",
+        "magnet.delayMs" => "Magnet delay",
+        "magnet.cooldownMs" => "Magnet cooldown",
+        "magnet.sleepMs" => "Magnet sleep",
+        "magnet.fireHoldMs" => "Magnet hold",
+        "magnet.flickProximityPx" => "Magnet flick distance",
+        "magnet.forcedReleaseMs" => "Magnet max burst",
+        "magnet.resetTimeoutMs" => "Magnet tap interval",
+        "magnet.smoothXMin" => "Magnet X smooth min",
+        "magnet.smoothXMax" => "Magnet X smooth max",
+        "magnet.smoothYMin" => "Magnet Y smooth min",
+        "magnet.smoothYMax" => "Magnet Y smooth max",
+        "magnet.speedNear" => "Magnet booster short",
+        "magnet.speedMid" => "Magnet booster medium",
+        "magnet.speedFar" => "Magnet booster long",
+        "recoil.recoilLevels" => "Recoil pattern",
+        "recoil.recoilPercentage" => "Recoil reduction factor",
         "recoil.recoilStartDelayMs" => "Recoil start delay",
-        "recoil.recoilLevelDurationMs" => "Recoil time per level",
+        "recoil.recoilLevelDurationMs" => "Recoil time per bullet",
         "port" => "UDP input port",
         other => other,
     }
@@ -1123,7 +1702,54 @@ fn set_status(app: &SettingsWindow, message: slint::SharedString) {
     app.set_message_kind(kind.into());
 }
 
+/// The other end of a Min/Max smoothing range, and whether `key` is the Min.
+fn smoothing_partner(key: &str) -> Option<(String, bool)> {
+    let (stem, is_min) = if let Some(stem) = key.strip_suffix("Min") {
+        (stem, true)
+    } else {
+        (key.strip_suffix("Max")?, false)
+    };
+    stem.to_ascii_lowercase().contains("smooth").then(|| {
+        (
+            format!("{stem}{}", if is_min { "Max" } else { "Min" }),
+            is_min,
+        )
+    })
+}
+
 fn update_setting(settings: &mut serde_json::Value, key: &str, input: &str) -> Result<(), String> {
+    update_one_setting(settings, key, input)?;
+    // Motion runs while the trigger is held unless Always on or Toggle is
+    // on; switching one on switches the other off.
+    let other = match key {
+        "motionAlwaysOn" => Some("motionToggle"),
+        "motionToggle" => Some("motionAlwaysOn"),
+        _ => None,
+    };
+    if let Some(other) = other {
+        if input == "true" {
+            update_one_setting(settings, other, "false")?;
+        }
+    }
+    // Dragging Min past Max (or Max under Min) moves the other end along.
+    if let Some((partner, is_min)) = smoothing_partner(key) {
+        let read = |settings: &serde_json::Value, key: &str| {
+            setting_text(settings, key).parse::<f64>().ok()
+        };
+        if let (Some(value), Some(other)) = (read(settings, key), read(settings, &partner)) {
+            if (is_min && value > other) || (!is_min && value < other) {
+                update_one_setting(settings, &partner, input)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_one_setting(
+    settings: &mut serde_json::Value,
+    key: &str,
+    input: &str,
+) -> Result<(), String> {
     let parts = key.split('.').collect::<Vec<_>>();
     let (leaf, parents) = parts
         .split_last()
@@ -1159,7 +1785,11 @@ fn update_setting(settings: &mut serde_json::Value, key: &str, input: &str) -> R
             if !number.is_finite() {
                 return Err(format!("{name} must be finite"));
             }
-            serde_json::json!(number)
+            if whole_number_key(key) {
+                serde_json::json!(number.round())
+            } else {
+                serde_json::json!(number)
+            }
         }
     } else if current.is_array() && key == "recoil.recoilLevels" {
         serde_json::json!(sysx_ui::settings::parse_recoil_levels(input).map_err(str::to_owned)?)
@@ -1170,23 +1800,54 @@ fn update_setting(settings: &mut serde_json::Value, key: &str, input: &str) -> R
 }
 
 fn activate_setting(settings: &mut serde_json::Value, key: &str) -> Result<(), String> {
+    if key == "activeModelId" || key == "activeModelId.prev" {
+        let models = BUILTIN_MODELS.with(|models| models.borrow().clone());
+        let current = settings
+            .get("activeModelId")
+            .and_then(serde_json::Value::as_str);
+        let step = if key == "activeModelId" {
+            1
+        } else {
+            models.len().saturating_sub(1)
+        };
+        let next = models
+            .iter()
+            .position(|(id, _)| Some(id.as_str()) == current)
+            .map(|index| &models[(index + step) % models.len()].0)
+            .or(models.first().map(|(id, _)| id))
+            .ok_or_else(|| "This build has no built-in model".to_owned())?;
+        settings["activeModelId"] = serde_json::json!(next);
+        return Ok(());
+    }
     let current = key
         .split('.')
         .try_fold(&*settings, |value, part| value.get(part));
-    let choices: &[&str] = match key {
-        "pixelColor" => &["yellow", "red", "purple"],
-        "scale" => &["Smooth", "Pixel perfect"],
-        "triggerButton" | "auto.triggerButton" => &["right", "m4", "m5"],
-        "strategy" => &["pixel_seek", "object_detection"],
-        "modelBackend" => &MODEL_BACKEND_VALUES,
-        "computeTarget" => &["cpu", "gpu", "npu"],
+    let choices: Vec<&str> = match key {
+        "strategy" => vec!["pixel_seek", "object_detection"],
+        "modelBackend" => MODEL_BACKEND_VALUES.to_vec(),
+        "pixelColor"
+        | "scale"
+        | "triggerButton"
+        | "magnet.triggerButton"
+        | "dynamicFovKey"
+        | "magnet.dynamicFovKey"
+        | "computeTarget"
+        | "modelPrecision"
+        | "colorSwap"
+        | "magnet.mode"
+        | "recoil.recoilPattern" => choice_options(key)
+            .iter()
+            .map(|(_, value)| *value)
+            .collect(),
         "colorFilter"
         | "motionEnabled"
         | "motionAlwaysOn"
         | "motionToggle"
-        | "motionNoDeadzone"
+        | "speedBooster"
+        | "continueInsideBox"
         | "motionRenderer.enabled"
-        | "auto.enabled"
+        | "magnet.speedBooster"
+        | "magnet.enabled"
         | "recoil.recoilEnabled" => {
             let value = current
                 .and_then(serde_json::Value::as_bool)
@@ -1234,6 +1895,13 @@ fn refresh(app: &Receiver, view: &View, last: &RefCell<RenderCache>) {
             })
             .map(|p| p.name.as_str())
             .unwrap_or("Default")
+            .into(),
+    );
+    app.set_motion_toggle(
+        state
+            .filter(|s| s.motion_enabled && s.motion_toggle && !s.motion_always_on)
+            .map(|s| if s.motion_toggled { "ON" } else { "OFF" })
+            .unwrap_or("")
             .into(),
     );
     let device = state.and_then(|s| s.device.as_ref());
@@ -1743,9 +2411,6 @@ pub fn run(
             let result = if key == "profile.rename" {
                 *profile_name.borrow_mut() = value.to_string();
                 Ok(())
-            } else if key == "model.path" {
-                MODEL_PATH.with(|path| *path.borrow_mut() = value.to_string());
-                Ok(())
             } else {
                 let result = draft
                     .borrow_mut()
@@ -1837,28 +2502,6 @@ pub fn run(
         let commands = commands.clone();
         let weak = settings_app.as_weak();
         move |key| {
-            if key == "model.import" {
-                let path = MODEL_PATH.with(|path| path.borrow().trim().to_owned());
-                let result = if path.is_empty() {
-                    Err("Enter the .onnx model file or its folder.".to_owned())
-                } else {
-                    commands
-                        .try_send(serde_json::json!({
-                            "version":1,"type":"import_model_bundle","path":path
-                        }))
-                        .map_err(|_| "Backend command queue is unavailable.".to_owned())
-                };
-                if let Some(app) = weak.upgrade() {
-                    set_status(
-                        &app,
-                        result
-                            .map(|_| "Importing model…".to_owned())
-                            .unwrap_or_else(|error| error)
-                            .into(),
-                    );
-                }
-                return;
-            }
             if key.starts_with("profile.") {
                 let result = if dirty.get() {
                     Err("Apply current settings before changing profiles.".to_owned())
@@ -2016,6 +2659,23 @@ pub fn run(
                         if event == Some("app_settings") && !settings_dirty_events.get() {
                             // The reload right after Apply keeps its success message.
                             let keep_status = apply_success_until.is_some();
+                            if let Some(models) = value.get("builtin_models") {
+                                // Each entry: {id, label, variants}.
+                                let models = models
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|model| {
+                                        let id = model.get("id")?.as_str()?;
+                                        let label = model
+                                            .get("label")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or(id);
+                                        Some((id.to_owned(), label.to_owned()))
+                                    })
+                                    .collect();
+                                BUILTIN_MODELS.with(|list| *list.borrow_mut() = models);
+                            }
                             if let Some(settings) = value.get("settings") {
                                 *settings_draft_events.borrow_mut() = Some(settings.clone());
                                 settings_dirty_events.set(false);
@@ -2084,34 +2744,6 @@ pub fn run(
                             let _ = settings_commands_events.try_send(serde_json::json!({
                                 "version":1,"type":"get_app_settings"
                             }));
-                        } else if command_type == Some("import_model_bundle") {
-                            if let Some(app) = settings_weak_events.upgrade() {
-                                let id = value.get("active_model_id").cloned();
-                                let message = if event == Some("ack") {
-                                    if let (Some(settings), Some(id)) =
-                                        (settings_draft_events.borrow_mut().as_mut(), id)
-                                    {
-                                        settings["activeModelId"] = id;
-                                        // Object Detection crops to the model's input size.
-                                        if let Some(side) = value.get("input_width").cloned() {
-                                            settings["cropResolution"] = side;
-                                        }
-                                    }
-                                    settings_dirty_events.set(true);
-                                    sync_flags(&app, true, &invalid_settings_events.borrow());
-                                    if let Some(settings) = settings_draft_events.borrow().as_ref()
-                                    {
-                                        show_settings(&app, settings);
-                                    }
-                                    "Model imported. Apply Changes to use it."
-                                } else {
-                                    value
-                                        .get("message")
-                                        .and_then(|message| message.as_str())
-                                        .unwrap_or("Model import failed.")
-                                };
-                                set_status(&app, message.into());
-                            }
                         } else if event == Some("error")
                             && command_type.is_some_and(|kind| kind.ends_with("profile"))
                         {
@@ -2260,19 +2892,43 @@ mod overlay_routing_tests {
     #[test]
     fn object_detection_shows_model_controls_instead_of_target_color() {
         let fields = super::settings_fields(&serde_json::json!({"strategy":"pixel_seek"}));
-        let engine = fields.iter().find(|field| field.key == "engine").unwrap();
+        let engine = fields.iter().find(|field| field.key == "strategy").unwrap();
         assert_eq!(engine.kind, "engine");
         assert_eq!(engine.value.as_str(), "pixel_seek");
         assert!(fields.iter().any(|field| field.key == "pixelColor"));
-        assert!(!fields.iter().any(|field| field.key == "model.path"));
+        assert!(!fields.iter().any(|field| field.key == "activeModelId"));
         let fields = super::settings_fields(&serde_json::json!({
             "strategy":"object_detection","activeModelId":"yolo",
             "modelConfidence":"0.5","modelBackend":"onnxruntime","computeTarget":"cpu"
         }));
         let field = |key| fields.iter().find(|field| field.key == key);
-        assert!(field("pixelColor").is_none());
-        assert_eq!(field("model.path").unwrap().key2.as_str(), "model.import");
-        assert_eq!(field("model.active").unwrap().value.as_str(), "yolo");
+        assert!(field("pixelColor").is_some(), "the color filter's color");
+        assert_eq!(field("activeModelId").unwrap().kind.as_str(), "info");
+        let models = [
+            ("light".to_owned(), "Light (256×256)".to_owned()),
+            ("heavy".to_owned(), "Heavy (640×640)".to_owned()),
+        ];
+        let with_models = super::settings_page(
+            &serde_json::json!({"strategy":"object_detection","activeModelId":"heavy"}),
+            &models,
+        );
+        let model = with_models
+            .iter()
+            .flat_map(|page| page.fields.iter())
+            .find(|field| field.key == "activeModelId")
+            .unwrap();
+        assert_eq!(
+            (model.kind.as_str(), model.value.as_str()),
+            ("dropdown", "heavy")
+        );
+        assert_eq!(model.choices.row_count(), 2);
+        assert_eq!(model.value2.as_str(), "Heavy (640×640)", "shown by label");
+        super::BUILTIN_MODELS.with(|list| *list.borrow_mut() = models.to_vec());
+        let mut draft = serde_json::json!({"activeModelId":"heavy"});
+        super::activate_setting(&mut draft, "activeModelId").unwrap();
+        assert_eq!(draft["activeModelId"], "light", "› wraps around");
+        super::activate_setting(&mut draft, "activeModelId.prev").unwrap();
+        assert_eq!(draft["activeModelId"], "heavy");
         assert_eq!(field("modelConfidence").unwrap().value.as_str(), "0.5");
         assert_eq!(
             field("modelBackend").unwrap().choices.row_count(),
@@ -2302,7 +2958,7 @@ mod overlay_routing_tests {
                 "Profiles",
                 "Detection",
                 "Motion",
-                "Auto",
+                "Magnet",
                 "Recoil",
                 "Connection"
             ]
@@ -2341,34 +2997,125 @@ mod overlay_routing_tests {
     }
 
     #[test]
-    fn each_settings_section_is_its_own_page_laid_out_from_the_top() {
-        let pages = super::settings_page(
-            &serde_json::json!({
-                "profiles":[{"name":"Default"}],"activeProfile":0,
-                "auto":{}
-            }),
-            "",
+    fn each_settings_section_is_its_own_page_laid_out_as_a_grid() {
+        let settings = serde_json::json!({
+            "profiles":[{"name":"Default"}],"activeProfile":0,
+            "speedBooster":true,"magnet":{"mode":"spray","speedBooster":true}
+        });
+        let pages = super::settings_page(&settings, &[]);
+        let labels: Vec<_> = pages
+            .iter()
+            .map(|page| page.section.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Profiles",
+                "Detection",
+                "Motion",
+                "Magnet",
+                "Recoil",
+                "Connection"
+            ]
         );
-        assert_eq!(pages.len(), 6);
         for page in &pages {
-            let (heading, rows) = page.fields.split_first().unwrap();
+            let (heading, cells) = page.fields.split_first().unwrap();
             assert_eq!(heading.kind, "section");
-            assert_eq!(heading.label, page.section.label);
             assert_eq!(heading.y, super::SETTINGS_TOP, "{}", heading.label);
-            assert!(!rows.is_empty(), "{}", heading.label);
-            assert!(rows.iter().all(|row| row.kind != "section"));
-            assert_eq!(heading.h, rows.len() as f32 * super::SETTINGS_ROW);
-            assert!(rows[0].first && rows.iter().skip(1).all(|row| !row.first));
-            assert_eq!(rows[0].y, super::SETTINGS_TOP + super::SETTINGS_HEADING);
-            for pair in rows.windows(2) {
-                assert_eq!(pair[1].y, pair[0].y + super::SETTINGS_ROW);
+            assert!(!cells.is_empty(), "{}", heading.label);
+            assert_eq!(
+                cells[0].y,
+                super::SETTINGS_TOP + super::SETTINGS_HEADING + super::CARD_PAD
+            );
+            let mut previous_bottom = 0.0_f32;
+            let mut row_y = f32::NAN;
+            for cell in cells {
+                assert!(cell.kind != "section");
+                assert!(
+                    cell.x >= 0.0 && cell.x + cell.w <= 1.0 + 1e-6,
+                    "{}",
+                    cell.label
+                );
+                assert_eq!(cell.h, super::cell_height(cell), "{}", cell.label);
+                if cell.y != row_y {
+                    assert!(
+                        cell.y >= previous_bottom,
+                        "{}: rows never overlap",
+                        cell.label
+                    );
+                    row_y = cell.y;
+                }
+                previous_bottom = previous_bottom.max(cell.y + cell.h);
             }
-            let last = rows.last().unwrap();
+            // The card closes under the last row; the page adds its margin.
+            assert_eq!(heading.y + heading.h, previous_bottom + super::CARD_PAD);
             assert_eq!(
                 page.height,
-                last.y + super::SETTINGS_ROW + super::SETTINGS_TOP
+                previous_bottom + super::CARD_PAD + super::SETTINGS_TOP
             );
         }
+        let all: Vec<_> = pages.iter().flat_map(|page| page.fields.iter()).collect();
+        let find = |key: &str| all.iter().filter(|cell| cell.key == key).count();
+        // Short / Medium / Long boosters for both Motion and Magnet.
+        for key in [
+            "speedNear",
+            "speedMid",
+            "speedFar",
+            "magnet.speedNear",
+            "magnet.speedFar",
+        ] {
+            assert_eq!(find(key), 1, "{key}");
+        }
+        let mode = all.iter().find(|cell| cell.key == "magnet.mode").unwrap();
+        assert_eq!(mode.kind, "dropdown");
+        assert!(mode.choices.iter().any(|choice| choice.value == "auto"));
+        // Auto has no smoothing or booster.
+        let auto = super::settings_page(&serde_json::json!({"magnet":{"mode":"auto"}}), &[]);
+        let auto: Vec<_> = auto.iter().flat_map(|page| page.fields.iter()).collect();
+        assert!(!auto
+            .iter()
+            .any(|cell| cell.key.starts_with("magnet.smooth")));
+        assert!(!auto.iter().any(|cell| cell.key == "magnet.speedBooster"));
+        assert!(auto.iter().any(|cell| cell.key == "magnet.delayMs"));
+    }
+
+    #[test]
+    fn a_smoothing_min_past_its_max_moves_the_max_along() {
+        let mut settings = serde_json::json!({
+            "smoothingXMin":5.0,"smoothingXMax":8.0,
+            "magnet":{"smoothYMin":4.0,"smoothYMax":6.0}
+        });
+        // Whole numbers: 9.5 becomes 10.
+        super::update_setting(&mut settings, "smoothingXMin", "9.5").unwrap();
+        assert_eq!(settings["smoothingXMin"], 10.0);
+        assert_eq!(settings["smoothingXMax"], 10.0);
+        assert_eq!(super::setting_text(&settings, "smoothingXMax"), "10");
+        super::update_setting(&mut settings, "magnet.smoothYMax", "3").unwrap();
+        assert_eq!(settings["magnet"]["smoothYMin"], 3.0);
+        super::update_setting(&mut settings, "smoothingXMin", "2").unwrap();
+        assert_eq!(
+            settings["smoothingXMax"], 10.0,
+            "inside the range: unchanged"
+        );
+    }
+
+    #[test]
+    fn always_on_and_toggle_switch_each_other_off_and_offsets_are_whole() {
+        let mut settings = serde_json::json!({
+            "motionAlwaysOn":false,"motionToggle":false,"offsetX":0.0,"speedNear":1.0
+        });
+        super::update_setting(&mut settings, "motionToggle", "true").unwrap();
+        super::update_setting(&mut settings, "motionAlwaysOn", "true").unwrap();
+        assert_eq!((settings["motionAlwaysOn"].as_bool(), settings["motionToggle"].as_bool()), (Some(true), Some(false)));
+        super::update_setting(&mut settings, "motionToggle", "true").unwrap();
+        assert_eq!((settings["motionAlwaysOn"].as_bool(), settings["motionToggle"].as_bool()), (Some(false), Some(true)));
+        // Turning one off leaves the other alone (both off = hold the trigger).
+        super::update_setting(&mut settings, "motionToggle", "false").unwrap();
+        assert_eq!(settings["motionAlwaysOn"], false);
+        super::update_setting(&mut settings, "offsetX", "-2.6").unwrap();
+        assert_eq!(super::setting_text(&settings, "offsetX"), "-3");
+        super::update_setting(&mut settings, "speedNear", "1.25").unwrap();
+        assert_eq!(settings["speedNear"], 1.25, "the booster keeps decimals");
     }
 
     #[test]
@@ -2529,34 +3276,44 @@ mod render_tests {
         app.hide().unwrap();
         drop(app);
 
-        window.set_size(slint::PhysicalSize::new(760, 720));
+        window.set_size(slint::PhysicalSize::new(940, 1000));
         let settings = SettingsWindow::new().unwrap();
         if !cfg!(windows) {
             settings.set_body_font("DejaVu Sans".into());
             settings.set_mono_font("DejaVu Sans Mono".into());
         }
-        let settings_json = serde_json::json!({
+        let settings_json: serde_json::Value = serde_json::from_str(
+            r#"{
             "profiles":[{"name":"Default"},{"name":"Low recoil"}],"activeProfile":0,
             "pixelColor":"yellow","fovDegrees":90,"colorFilter":false,
             "cropResolution":256,"scale":"Smooth","motionEnabled":true,
-            "motionAlwaysOn":false,"motionToggle":false,"motionNoDeadzone":true,"triggerButton":"right",
-            "offsetX":0,"offsetY":0,"motionSpeedX":0.045,"motionSpeedY":0.045,
-            "smoothFovDegrees":20,"smoothingXMin":1,"smoothingXMax":3,
-            "smoothingYMin":1,"smoothingYMax":3,"sens":1.0,
+            "motionAlwaysOn":false,"motionToggle":false,"triggerButton":"m4",
+            "dynamicFovDegrees":160,"dynamicFovKey":"right",
+            "speedBooster":true,"speedNear":0.8,"speedMid":1.25,"speedFar":1.5,
+            "continueInsideBox":false,"abilityConfidence":0.6,"motionSpeedX":0.045,"motionSpeedY":0.045,"smoothFovDegrees":20,"colorSwap":"yellow",
+            "offsetX":0,"offsetY":4,"smoothingXMin":5,"smoothingXMax":6,
+            "smoothingYMin":6,"smoothingYMax":8,"sens":0.35,
+            "modelPrecision":"fp16",
             "motionRenderer":{"enabled":false},
-            "auto":{"enabled":false,"triggerButton":"m4",
-                "fovDegrees":45,"delayMs":50,"cooldownMs":100,"sleepMs":0},
-            "recoil":{"recoilEnabled":false,"recoilLevels":[1,2,3],
-                "recoilPercentage":50,"recoilStartDelayMs":100,"recoilLevelDurationMs":50},
+            "recoil":{"recoilEnabled":true,"recoilPattern":"custom","recoilLevels":[1,2,3,3,4,3,4,5,5,7],
+                "recoilPercentage":75,"recoilStartDelayMs":130,"recoilLevelDurationMs":50},
+            "magnet":{"enabled":true,"mode":"tap","triggerButton":"m5","fovDegrees":120,
+                "dynamicFovDegrees":160,"dynamicFovKey":"right","offsetX":0,"offsetY":2,
+                "delayMs":30,"cooldownMs":120,"sleepMs":0,"fireHoldMs":30,"forcedReleaseMs":250,
+                "flickProximityPx":26.0,"smoothXMin":4,"smoothXMax":5.9,
+                "smoothYMin":10.7,"smoothYMax":12.5,"speedBooster":true,
+                "speedNear":1.0,"speedMid":1.2,"speedFar":1.6},
             "port":4200
-        });
+        }"#,
+        )
+        .unwrap();
         show_settings(&settings, &settings_json);
         settings.set_dirty(true);
         settings.show().unwrap();
         settings.invoke_reset_scroll();
-        let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
+        let mut pixels = vec![slint::Rgb8Pixel::default(); 940 * 1000];
         window.draw_if_needed(|renderer| {
-            renderer.render(&mut pixels, 760);
+            renderer.render(&mut pixels, 940);
         });
         assert!(pixels.iter().any(|p| p.r != 0 || p.g != 0 || p.b != 0));
         if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
@@ -2565,7 +3322,7 @@ mod render_tests {
                 .iter()
                 .flat_map(|p| [p.r, p.g, p.b])
                 .collect::<Vec<_>>();
-            image::RgbImage::from_raw(760, 720, raw)
+            image::RgbImage::from_raw(940, 1000, raw)
                 .unwrap()
                 .save(std::path::Path::new(&dir).join("settings-native.png"))
                 .unwrap();
@@ -2576,17 +3333,17 @@ mod render_tests {
             settings.set_current_page(page as i32);
             show_settings(&settings, &json);
             assert_eq!(settings.get_current_page(), page as i32);
-            let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
+            let mut pixels = vec![slint::Rgb8Pixel::default(); 940 * 1000];
             window.request_redraw();
             window.draw_if_needed(|renderer| {
-                renderer.render(&mut pixels, 760);
+                renderer.render(&mut pixels, 940);
             });
             if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
                 let raw = pixels
                     .iter()
                     .flat_map(|p| [p.r, p.g, p.b])
                     .collect::<Vec<_>>();
-                image::RgbImage::from_raw(760, 720, raw)
+                image::RgbImage::from_raw(940, 1000, raw)
                     .unwrap()
                     .save(std::path::Path::new(&dir).join(format!("settings-page-{page}.png")))
                     .unwrap();
@@ -2595,23 +3352,29 @@ mod render_tests {
         // Detection page with the Object Detection model and runtime rows.
         let mut json = settings_json.clone();
         json["strategy"] = "object_detection".into();
-        json["activeModelId"] = "v11_256".into();
+        json["activeModelId"] = "light_256".into();
+        super::BUILTIN_MODELS.with(|list| {
+            *list.borrow_mut() = vec![
+                ("light_256".into(), "Light (256×256)".into()),
+                ("heavy_640".into(), "Heavy (640×640)".into()),
+            ]
+        });
         json["modelConfidence"] = "0.5".into();
         json["modelBackend"] = "openvino".into();
         json["computeTarget"] = "gpu".into();
         settings.set_current_page(1);
         show_settings(&settings, &json);
-        let mut pixels = vec![slint::Rgb8Pixel::default(); 760 * 720];
+        let mut pixels = vec![slint::Rgb8Pixel::default(); 940 * 1000];
         window.request_redraw();
         window.draw_if_needed(|renderer| {
-            renderer.render(&mut pixels, 760);
+            renderer.render(&mut pixels, 940);
         });
         if let Ok(dir) = std::env::var("SYSX_NATIVE_CAPTURE_DIR") {
             let raw = pixels
                 .iter()
                 .flat_map(|p| [p.r, p.g, p.b])
                 .collect::<Vec<_>>();
-            image::RgbImage::from_raw(760, 720, raw)
+            image::RgbImage::from_raw(940, 1000, raw)
                 .unwrap()
                 .save(std::path::Path::new(&dir).join("settings-object-detection.png"))
                 .unwrap();

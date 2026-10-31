@@ -297,9 +297,8 @@ mod tests {
 
     #[test]
     fn optional_texture_still_closes_a_synthetic_feedback_loop() {
-        use crate::movement::{
-            MotionParams, MovementController, MovementTargetSample, DEFAULT_SPEED,
-        };
+        use crate::movement::{MotionParams, MovementController, MovementTargetSample};
+        use crate::targeting::SmoothingRange;
         // Mathematical loop only: no OBS, device or game claims. Nominal conversion
         // at sensitivity .25 is .25 image px/count. Include delayed visual feedback.
         for latency_ms in [16, 30, 50] {
@@ -317,7 +316,7 @@ mod tests {
                     config_revision: 0,
                     frame_id: tick as u64,
                     target: Some((92.0 - delayed, 32.0)),
-                    smoothing_alpha: (1.0, 1.0),
+                    target_box: None,
                     crop_origin: (0, 0),
                     processed_size: (64, 64),
                     received_s: tick as f64 * 0.004,
@@ -326,10 +325,11 @@ mod tests {
                 let normal = controller.delta(
                     &sample,
                     MotionParams {
-                        offsets: (0.0, 0.0),
-                        speed: (DEFAULT_SPEED, DEFAULT_SPEED),
-                        smooth_fov_degrees: 20,
-                        no_deadzone: false,
+                        smoothing_x: SmoothingRange {
+                            min: 20.0,
+                            max: 30.0,
+                        },
+                        ..MotionParams::default()
                     },
                 );
                 let report = if error.abs() <= 1.0 {
@@ -446,9 +446,7 @@ mod tests {
 
     #[test]
     fn normal_then_abcurves_composes_without_panicking_or_replaying() {
-        use crate::movement::{
-            MotionParams, MovementController, MovementTargetSample, DEFAULT_SPEED,
-        };
+        use crate::movement::{MotionParams, MovementController, MovementTargetSample};
         let profile = synthetic_profile();
         let start = Instant::now();
         let mut controller = MovementController::new(0.25);
@@ -458,21 +456,13 @@ mod tests {
                 config_revision: 0,
                 frame_id,
                 target: Some((232.0, 32.0)),
-                smoothing_alpha: (1.0, 1.0),
+                target_box: None,
                 crop_origin: (0, 0),
                 processed_size: (64, 64),
                 received_s: frame_id as f64 * 0.004,
                 age_s: 0.0,
             };
-            let intent = controller.delta(
-                &sample,
-                MotionParams {
-                    offsets: (0.0, 0.0),
-                    speed: (DEFAULT_SPEED, DEFAULT_SPEED),
-                    smooth_fov_degrees: 20,
-                    no_deadzone: false,
-                },
-            );
+            let intent = controller.delta(&sample, MotionParams::default());
             let report = output
                 .filter(
                     Some(&profile),

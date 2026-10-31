@@ -683,6 +683,65 @@ pub fn decode_yolo_output(
     Ok(result)
 }
 
+/// Already decoded, NMS-free output (Ultralytics end-to-end / YOLOv10 / NMS
+/// exports): `[1, N, 6]` rows, or `[1, 6, N]`, of `x1, y1, x2, y2, score,
+/// class` in input pixels. Keeps rows at or above `confidence_threshold`
+/// without a second NMS.
+pub fn decode_end2end_output(
+    shape: &[usize],
+    values: &[f32],
+    confidence_threshold: f32,
+) -> Result<Vec<YoloBox>, InferenceError> {
+    if !(0.0..=1.0).contains(&confidence_threshold) || shape.len() != 3 || shape[0] != 1 {
+        return Err(InferenceError::Output(
+            "expected a batch-1 output and a threshold from 0 to 1".into(),
+        ));
+    }
+    let (rows, row_major) = match (shape[1], shape[2]) {
+        (rows, 6) => (rows, true),
+        (6, rows) => (rows, false),
+        _ => {
+            return Err(InferenceError::Output(
+                "expected NMS-free output shaped [1, N, 6] (x1, y1, x2, y2, score, class)".into(),
+            ));
+        }
+    };
+    if rows.checked_mul(6) != Some(values.len()) {
+        return Err(InferenceError::Output(
+            "output dimensions do not match its values".into(),
+        ));
+    }
+    let at = |row: usize, field: usize| {
+        if row_major {
+            values[row * 6 + field]
+        } else {
+            values[field * rows + row]
+        }
+    };
+    let mut result: Vec<YoloBox> = (0..rows)
+        .filter_map(|row| {
+            let bbox_xyxy = [at(row, 0), at(row, 1), at(row, 2), at(row, 3)];
+            let confidence = at(row, 4);
+            let class = at(row, 5).round();
+            let valid = confidence.is_finite()
+                && confidence >= confidence_threshold
+                && class.is_finite()
+                && (0.0..=u32::MAX as f32).contains(&class)
+                && bbox_xyxy.iter().all(|value| value.is_finite())
+                && bbox_xyxy[2] > bbox_xyxy[0]
+                && bbox_xyxy[3] > bbox_xyxy[1];
+            valid.then_some(YoloBox {
+                class_id: class as u32,
+                confidence,
+                bbox_xyxy,
+            })
+        })
+        .collect();
+    result.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    result.truncate(300);
+    Ok(result)
+}
+
 pub fn to_detection_objects(
     boxes: Vec<YoloBox>,
     classes: Option<&std::collections::HashMap<u32, String>>,
@@ -752,6 +811,36 @@ mod tests {
     }
 
     #[test]
+    fn decodes_nms_free_rows_without_a_second_nms() {
+        let rows = vec![
+            10.0, 10.0, 20.0, 30.0, 0.30, 1.0, // below the threshold
+            40.0, 40.0, 60.0, 60.0, 0.80, 0.0, // body
+            42.0, 41.0, 58.0, 59.0, 0.90, 1.0, // overlapping head: kept
+            41.0, 41.0, 59.0, 59.0, 0.70, 0.0, // overlapping body: kept (no NMS)
+            0.0, 0.0, 0.0, 0.0, 0.00, 0.0, // padding row
+            5.0, 5.0, 4.0, 9.0, 0.95, 2.0, // invalid box
+        ];
+        let detections = decode_end2end_output(&[1, 6, 6], &rows, 0.5).unwrap();
+        let summary: Vec<(u32, f32)> = detections
+            .iter()
+            .map(|detection| (detection.class_id, detection.confidence))
+            .collect();
+        assert_eq!(summary, [(1, 0.9), (0, 0.8), (0, 0.7)]);
+        assert_eq!(detections[0].bbox_xyxy, [42.0, 41.0, 58.0, 59.0]);
+        // Field-major [1, 6, N] (N != 6) gives the same boxes.
+        let wide: Vec<f32> = rows[6..12]
+            .iter()
+            .zip(&rows[12..18])
+            .flat_map(|(a, b)| [*a, *b])
+            .collect();
+        let detections = decode_end2end_output(&[1, 6, 2], &wide, 0.5).unwrap();
+        assert_eq!(detections.len(), 2);
+        assert_eq!(detections[0].bbox_xyxy, [42.0, 41.0, 58.0, 59.0]);
+        assert!(decode_end2end_output(&[1, 300, 9], &vec![0.0; 2700], 0.5).is_err());
+        assert!(decode_end2end_output(&[1, 2, 6], &[0.0; 6], 0.5).is_err());
+    }
+
+    #[test]
     fn supports_anchor_major_output_and_class_aware_nms() {
         let values = vec![
             20.0, 20.0, 10.0, 10.0, 0.4, 0.95, // candidate 0
@@ -793,5 +882,50 @@ mod tests {
             200,
         );
         assert_eq!(objects[0].bbox_xyxy, [101.0, 202.0, 103.0, 204.0]);
+    }
+
+    /// Loads every runtime the shipped DLLs provide and runs a tiny model
+    /// through it. Needs `SYSX_RUNTIME_SMOKE_MODEL` (an ONNX that doubles a
+    /// `[1,3,H,W]` input) and the DLL folder on `PATH`/`ORT_DYLIB_PATH`; a
+    /// device this machine lacks is reported, not failed.
+    #[test]
+    #[ignore]
+    fn runtime_smoke() {
+        let Ok(model) = std::env::var("SYSX_RUNTIME_SMOKE_MODEL") else {
+            return;
+        };
+        let devices = openvino::Core::new()
+            .map_err(|error| error.to_string())
+            .and_then(|core| {
+                core.available_devices()
+                    .map(|devices| format!("{devices:?}"))
+                    .map_err(|error| error.to_string())
+            });
+        println!("OpenVINO devices: {devices:?}");
+        let image = RgbImage::from_pixel(8, 8, image::Rgb([51, 102, 255]));
+        let mut ran = 0;
+        for (backend, compute) in [
+            ("onnxruntime", "cpu"),
+            ("directml", "gpu"),
+            ("cuda", "gpu"),
+            ("openvino", "cpu"),
+            ("openvino", "gpu"),
+            ("openvino", "npu"),
+        ] {
+            let runtime = match backend {
+                "openvino" => OpenVinoRuntime::load(&model, "", compute).map(DetectionRuntime::OpenVino),
+                _ => OnnxRuntime::load(&model, backend).map(DetectionRuntime::Onnx),
+            };
+            match runtime.and_then(|mut runtime| runtime.infer(&image)) {
+                Ok(output) => {
+                    assert_eq!(output.shape, [1, 3, 8, 8]);
+                    assert!((output.values[0] - 0.4).abs() < 1e-3, "{}", output.values[0]);
+                    println!("{backend}/{compute}: ok on {}", output.device);
+                    ran += 1;
+                }
+                Err(error) => println!("{backend}/{compute}: {error}"),
+            }
+        }
+        assert!(ran > 0, "no runtime ran");
     }
 }

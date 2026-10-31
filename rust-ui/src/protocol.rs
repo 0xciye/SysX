@@ -30,6 +30,12 @@ pub struct BackendState {
     pub motion_always_on: bool,
     #[serde(default)]
     pub motion_no_deadzone: bool,
+    /// Motion's trigger turns it on and off (Toggle mode)...
+    #[serde(default)]
+    pub motion_toggle: bool,
+    /// ...and it is on now.
+    #[serde(default)]
+    pub motion_toggled: bool,
     #[serde(default)]
     pub motion_renderer: crate::settings::MotionRendererSettings,
     #[serde(default)]

@@ -8,7 +8,8 @@ param(
     [string] $ExecutablePath
 )
 # Builds SysX and packs what another Windows PC needs to run it into one
-# archive: SysX.exe (backend + native Settings embedded), a LAN firewall helper, and
+# archive: SysX.exe (backend, built-in models + native Settings embedded), the
+# runtime DLLs next to it, a LAN firewall helper, and
 # HUONG-DAN.txt. The OBS plugin DLL is built separately
 # (scripts/build-obs-plugin.ps1). The Visual C++ x64 runtime is installed by
 # the user.
@@ -58,6 +59,13 @@ $stage = Join-Path $outDir "SysX"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $sysx (Join-Path $stage "SysX.exe")
+# Runtime libraries ship next to SysX.exe: onnxruntime.dll, DirectML.dll and
+# any provider/OpenVINO DLLs the build collected.
+$libraries = @(Get-ChildItem -LiteralPath (Join-Path $root "src-tauri\binaries") -Filter *.dll -File)
+$libraries | Copy-Item -Destination $stage -Force
+if (-not ($libraries.Name -contains "onnxruntime.dll")) {
+    Write-Warning "onnxruntime.dll is missing: Object Detection will not start in this package."
+}
 
 $firewall = @'
 @echo off
@@ -79,6 +87,7 @@ Yeu cau (nguoi dung tu cai):
 
 Chay SysX:
   - Chay SysX.exe. Cua so Preview va Settings native mo trong ung dung.
+  - Giu cac file .dll (onnxruntime.dll, DirectML.dll, ...) cung thu muc voi SysX.exe.
   - Dung Settings trong cua so app de chinh va Apply Changes.
   - Dong cua so app de thoat SysX. Chi chay duoc 1 SysX cung luc.
   - Cai dat duoc luu o %LOCALAPPDATA%\SysX.
@@ -90,7 +99,7 @@ Chay qua LAN (OBS o may khac):
 '@
 Set-Content -Path (Join-Path $stage "HUONG-DAN.txt") -Value $guide -Encoding utf8
 
-$allowedNames = @("SysX.exe", "Mo-cong-UDP-4200.bat", "HUONG-DAN.txt")
+$allowedNames = @("SysX.exe", "Mo-cong-UDP-4200.bat", "HUONG-DAN.txt") + @($libraries.Name)
 $unexpected = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
     $allowedNames -notcontains $_.Name
 })
