@@ -6,7 +6,7 @@ use crate::inference::{
 };
 use crate::pixel_seek::{
     color_mask, color_mask_into, head_point, process_pixel_seek_with_scratch, try_pack_mask,
-    PixelSeekOutput, PixelSeekScratch, PixelTargetColor,
+    PixelSeekScratch, PixelTargetColor,
 };
 use crate::receiver::SourceFrame;
 use crate::results::{DetectionMode, DetectionObject, DetectionResult};
@@ -84,6 +84,10 @@ pub struct ProcessedFrame {
     /// The target's box in original-frame coordinates (Motion slows down
     /// while the crosshair is inside it).
     pub target_box: Option<[f32; 4]>,
+    /// Where a Magnet trigger press snaps: `result.target_xy`, or while Auto
+    /// owns the frame (which publishes no target) the tracked target's head
+    /// point.
+    pub snap_target: Option<[f32; 2]>,
     /// Color filter on: its applied mask, packed one bit per pixel, so Preview
     /// shows the same image Motion/Auto processed.
     pub mask: Option<Vec<u8>>,
@@ -558,6 +562,7 @@ fn process_frame_with_scratch(
             Some(mask) => Some(try_pack_mask(mask).ok_or(ProcessError::ColorMaskAllocationFailed)?),
             None => None,
         };
+        let snap_target = result.target_xy;
         return Ok(ProcessedFrame {
             auto_config_revision: config.auto_config_revision,
             frame: SourceFrame { ..frame },
@@ -566,6 +571,7 @@ fn process_frame_with_scratch(
             crop_x: rect.x,
             crop_y: rect.y,
             target_box,
+            snap_target,
             mask: output_mask,
         });
     }
@@ -580,25 +586,16 @@ fn process_frame_with_scratch(
         }
         mask
     };
-    // Auto owns this frame while active and only checks the mask around
-    // the center.
-    let mut output = if config.auto_target_active {
-        PixelSeekOutput {
-            objects: Vec::new(),
-            mask,
-        }
-    } else {
-        process_pixel_seek_with_scratch(
-            processed,
-            rect,
-            config.pixel_color,
-            mask,
-            pixel_seek_scratch,
-        )
-    };
-    let selected = if config.auto_target_active {
-        None
-    } else {
+    // Auto fires from the mask around the center; the target is still
+    // tracked so a Magnet trigger press in the Auto mode can snap to it.
+    let mut output = process_pixel_seek_with_scratch(
+        processed,
+        rect,
+        config.pixel_color,
+        mask,
+        pixel_seek_scratch,
+    );
+    let selected = {
         let clusters: Vec<Detection> = output
             .objects
             .iter()
@@ -620,7 +617,12 @@ fn process_frame_with_scratch(
         )
         .map(TrackedEntity::bbox_xyxy)
     };
-    // Only the targeted cluster is reported.
+    // Only the targeted cluster is reported; Auto frames report none.
+    let snap_target = selected.map(|bbox_xyxy| {
+        let point: FrameCoordinate = head_point(bbox_xyxy);
+        [point.x, point.y]
+    });
+    let selected = selected.filter(|_| !config.auto_target_active);
     let (class_id, class_name) = config.pixel_color.class();
     output.objects = selected
         .map(|bbox_xyxy| DetectionObject {
@@ -699,6 +701,7 @@ fn process_frame_with_scratch(
         crop_x: rect.x,
         crop_y: rect.y,
         target_box: selected,
+        snap_target,
         mask: output_mask,
     })
 }

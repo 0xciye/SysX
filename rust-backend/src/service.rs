@@ -387,7 +387,8 @@ impl ReceiverService {
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     let target_valid = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, target_valid);
-                    if settings.magnet.enabled && settings.magnet.mode != "auto" {
+                    // Every mode, Auto included: each trigger press snaps.
+                    if settings.magnet.enabled {
                         (events.emit)(magnet_event(
                             &settings,
                             processed,
@@ -2076,9 +2077,7 @@ fn magnet_active(settings: &AppSettings, device: &Value) -> bool {
 /// Magnet is enabled; the host treats a sample older than 100 ms as no target.
 fn magnet_event(settings: &AppSettings, processed: &ProcessedFrame, revision: u64) -> Value {
     let error = processed
-        .result
-        .target_xy
-        .filter(|_| !processed.result.auto_active)
+        .snap_target
         .map(|target| {
             let (x, y) = crate::movement::crop_target_error(
                 (f64::from(target[0]), f64::from(target[1])),

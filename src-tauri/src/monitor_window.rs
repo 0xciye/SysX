@@ -964,8 +964,7 @@ const DYNAMIC_FOV_KEYS: &[(&str, &str)] = &[
 const MAGNET_MODES: &[(&str, &str)] = &[
     ("Spray (hold fire)", "spray"),
     ("Tap fire", "tap"),
-    ("Silent flick (near)", "silent_proximity"),
-    ("Silent flick", "silent_immediate"),
+    ("Flick", "silent_immediate"),
     ("Auto (center crossing)", "auto"),
 ];
 
@@ -1207,6 +1206,14 @@ fn settings_page(
         ("Delete", "profile.delete"),
     ]);
     page.row(vec![actions]);
+    // Quick switches for the active profile (user request); the same
+    // settings as the toggles on the Motion, Magnet and Recoil pages.
+    page.row(vec![subhead("Modules")]);
+    page.row(vec![
+        toggle(settings, "motionEnabled", "Motion"),
+        toggle(settings, "magnet.enabled", "Magnet"),
+        toggle(settings, "recoil.recoilEnabled", "Recoil"),
+    ]);
 
     page.section("Detection");
     let mut engine = field("strategy", "Engine", "engine");
@@ -1312,7 +1319,6 @@ fn settings_page(
 
     page.section("Motion");
     page.row(vec![
-        toggle(settings, "motionEnabled", "Motion"),
         with_hint(
             toggle(settings, "motionAlwaysOn", "Always on"),
             "Off with Toggle off: hold the trigger",
@@ -1378,61 +1384,32 @@ fn settings_page(
 
     page.section("Magnet");
     let mode = setting_text(settings, "magnet.mode");
-    page.row(vec![toggle(settings, "magnet.enabled", "Magnet")]);
     page.row(vec![
         number(settings, "magnet.fovDegrees", "FOV", "°"),
         dropdown(settings, "magnet.triggerButton", "Trigger button"),
         dropdown(settings, "magnet.mode", "Magnet mode"),
     ]);
-    page.row(vec![
-        with_hint(
-            number(settings, "magnet.delayMs", "Delay", "ms"),
-            "Before firing",
-        ),
-        with_hint(
-            number(settings, "magnet.sleepMs", "Sleep", "ms"),
-            "Between checks",
-        ),
-    ]);
+    // Each press snaps to the target, then: Tap one shot, Spray a burst,
+    // Flick one shot and back; Auto keeps its center-crossing timing.
     match mode.as_str() {
-        "spray" => page.row(vec![
+        "spray" => page.row(vec![with_hint(
+            number(settings, "magnet.forcedReleaseMs", "Max burst", "ms"),
+            "How long one burst holds the button",
+        )]),
+        "auto" => page.row(vec![
             with_hint(
-                number(settings, "magnet.forcedReleaseMs", "Max burst", "ms"),
-                "Longest hold before a forced release",
+                number(settings, "magnet.delayMs", "Delay", "ms"),
+                "Before firing",
             ),
             with_hint(
                 number(settings, "magnet.cooldownMs", "Cooldown", "ms"),
-                "After a forced release",
+                "Between shots",
+            ),
+            with_hint(
+                number(settings, "magnet.sleepMs", "Sleep", "ms"),
+                "Between checks",
             ),
         ]),
-        "tap" => page.row(vec![
-            with_hint(
-                number(settings, "magnet.fireHoldMs", "Hold", "ms"),
-                "How long each tap holds the button",
-            ),
-            with_hint(
-                number(settings, "magnet.resetTimeoutMs", "Tap interval", "ms"),
-                "Wait after a tap before the next one",
-            ),
-        ]),
-        "auto" => page.row(vec![with_hint(
-            number(settings, "magnet.cooldownMs", "Cooldown", "ms"),
-            "Between shots",
-        )]),
-        "silent_proximity" => page.row(vec![
-            with_hint(
-                number(settings, "magnet.fireHoldMs", "Hold", "ms"),
-                "How long the flick holds the button",
-            ),
-            with_hint(
-                number(settings, "magnet.flickProximityPx", "Flick distance", "px"),
-                "Flick only this close to the target",
-            ),
-        ]),
-        "silent_immediate" => page.row(vec![with_hint(
-            number(settings, "magnet.fireHoldMs", "Hold", "ms"),
-            "How long the flick holds the button",
-        )]),
         _ => {}
     }
     page.row(vec![
@@ -1453,8 +1430,8 @@ fn settings_page(
         "magnet.offsetX",
         "magnet.offsetY",
     )]);
-    // Auto clicks on center crossings and never pulls.
-    if mode != "auto" {
+    // Only a spray burst pulls after the snap.
+    if mode == "spray" {
         smoothing_rows(
             &mut page,
             settings,
@@ -1478,7 +1455,6 @@ fn settings_page(
     }
 
     page.section("Recoil");
-    page.row(vec![toggle(settings, "recoil.recoilEnabled", "Recoil")]);
     page.row(vec![with_hint(
         dropdown(settings, "recoil.recoilPattern", "Pattern"),
         "Pull per bullet; Custom uses your own list",
@@ -1661,10 +1637,7 @@ fn setting_label(key: &str) -> &str {
         "magnet.delayMs" => "Magnet delay",
         "magnet.cooldownMs" => "Magnet cooldown",
         "magnet.sleepMs" => "Magnet sleep",
-        "magnet.fireHoldMs" => "Magnet hold",
-        "magnet.flickProximityPx" => "Magnet flick distance",
         "magnet.forcedReleaseMs" => "Magnet max burst",
-        "magnet.resetTimeoutMs" => "Magnet tap interval",
         "magnet.smoothXMin" => "Magnet X smooth min",
         "magnet.smoothXMax" => "Magnet X smooth max",
         "magnet.smoothYMin" => "Magnet Y smooth min",
@@ -3300,7 +3273,7 @@ mod render_tests {
             "magnet":{"enabled":true,"mode":"tap","triggerButton":"m5","fovDegrees":120,
                 "dynamicFovDegrees":160,"dynamicFovKey":"right","offsetX":0,"offsetY":2,
                 "delayMs":30,"cooldownMs":120,"sleepMs":0,"fireHoldMs":30,"forcedReleaseMs":250,
-                "flickProximityPx":26.0,"smoothXMin":4,"smoothXMax":5.9,
+                "smoothXMin":4,"smoothXMax":5.9,
                 "smoothYMin":10.7,"smoothYMax":12.5,"speedBooster":true,
                 "speedNear":1.0,"speedMid":1.2,"speedFar":1.6},
             "port":4200

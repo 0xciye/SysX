@@ -69,10 +69,9 @@ impl RecoilSettings {
 }
 
 /// Magnet modes (user's `magnet.rs`, plus Auto's center-crossing click).
-pub const MAGNET_MODES: [&str; 5] = [
+pub const MAGNET_MODES: [&str; 4] = [
     "spray",
     "tap",
-    "silent_proximity",
     "silent_immediate",
     "auto",
 ];
@@ -94,19 +93,14 @@ pub struct MagnetSettings {
     pub dynamic_fov_key: String,
     pub offset_x: f64,
     pub offset_y: f64,
-    /// Wait after a target appears before firing.
+    /// Auto mode: wait after a target appears before firing.
     pub delay_ms: u32,
-    /// Spray: wait after a forced release before the next burst.
+    /// Auto mode: wait after a shot before the next one.
     pub cooldown_ms: u32,
-    /// Evaluate Magnet at most this often (0: every device tick).
+    /// Auto mode: evaluate at most this often (0: every device tick).
     pub sleep_ms: u32,
-    /// Tap and silent modes: how long the button stays pressed.
-    pub fire_hold_ms: u32,
     /// Spray: the longest burst.
     pub forced_release_ms: u32,
-    /// Tap: wait after a release before the next tap (source `reset_timeout_ms`).
-    pub reset_timeout_ms: u32,
-    pub flick_proximity_px: f64,
     /// Pull divisor drawn in [min, max] per move (1 = the whole error).
     pub smooth_x_min: f64,
     pub smooth_x_max: f64,
@@ -132,10 +126,7 @@ impl Default for MagnetSettings {
             delay_ms: 0,
             cooldown_ms: 90,
             sleep_ms: 0,
-            fire_hold_ms: 30,
             forced_release_ms: 250,
-            reset_timeout_ms: 250,
-            flick_proximity_px: 26.0,
             smooth_x_min: 4.0,
             smooth_x_max: 4.0,
             smooth_y_min: 5.0,
@@ -170,19 +161,12 @@ impl MagnetSettings {
             self.delay_ms,
             self.cooldown_ms,
             self.sleep_ms,
-            self.fire_hold_ms,
             self.forced_release_ms,
-            self.reset_timeout_ms,
         ]
         .iter()
         .any(|ms| *ms > 10_000)
         {
             return Err("Magnet times must be 0..10000 ms");
-        }
-        if !(self.flick_proximity_px.is_finite()
-            && (0.0..=640.0).contains(&self.flick_proximity_px))
-        {
-            return Err("Magnet flick distance must be 0..640 px");
         }
         let range = |min: f64, max: f64| {
             min.is_finite() && max.is_finite() && 1.0 <= min && min <= max && max <= 50.0
@@ -566,6 +550,10 @@ impl AppSettings {
     }
 
     pub fn validate(&mut self) -> Result<(), SettingsError> {
+        // Silent flick (near) was removed (user request, 2026-11-01).
+        if self.magnet.mode == "silent_proximity" {
+            self.magnet.mode = "silent_immediate".into();
+        }
         // Always on and Toggle exclude each other; Always on wins in files
         // saved with both.
         if self.motion_always_on {
@@ -1637,7 +1625,7 @@ mod tests {
                 ..MagnetSettings::default()
             },
             MagnetSettings {
-                fire_hold_ms: 20_000,
+                forced_release_ms: 20_000,
                 ..MagnetSettings::default()
             },
         ] {
@@ -1741,6 +1729,19 @@ mod tests {
         toggle.validate().unwrap();
         assert!(toggle.motion_toggle);
         assert!(serde_json::to_value(&toggle).unwrap().get("axisGuard").is_none());
+    }
+
+    #[test]
+    fn the_removed_silent_flick_near_loads_as_silent_flick() {
+        let mut settings = AppSettings::default();
+        settings.magnet.mode = "silent_proximity".into();
+        settings.validate().unwrap();
+        assert_eq!(settings.magnet.mode, "silent_immediate");
+        let saved: AppSettings =
+            serde_json::from_str(r#"{"magnet":{"flickProximityPx":26.0}}"#).unwrap();
+        assert!(serde_json::to_value(&saved).unwrap()["magnet"]
+            .get("flickProximityPx")
+            .is_none());
     }
 
     #[test]
