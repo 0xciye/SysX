@@ -29,12 +29,14 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
     timer_resolution::request_fine_timer();
-    let restart =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(native_app::run)).unwrap_or(true);
-    std::process::ExitCode::from(if restart {
-        supervisor::EXIT_RESTART
-    } else {
-        supervisor::EXIT_DONE
+    let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(native_app::run))
+        .unwrap_or_else(|panic| Some(format!("panic: {}", native_app::panic_message(&*panic))));
+    std::process::ExitCode::from(match reason {
+        Some(reason) => {
+            supervisor::record_reason(&reason);
+            supervisor::EXIT_RESTART
+        }
+        None => supervisor::EXIT_DONE,
     } as u8)
 }
 

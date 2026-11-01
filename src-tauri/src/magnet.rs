@@ -2,17 +2,21 @@
 //! 2026-11-01): each press of its trigger is one action, started on the
 //! first frame after the press that has a target in Magnet's FOV (the frame
 //! on screen at the press is skipped; with no target it waits while the
-//! trigger is held). The action snaps onto the target, the whole error at
-//! once through the source's `pixel_to_counts` (px / (sens × 0.022 × 3.125)),
-//! then:
+//! trigger is held):
 //!
-//! - `tap`: one shot.
-//! - `spray`: holds the button for a burst, pulling toward the target on
-//!   every new frame by error / smoothing (drawn in [min, max] per axis, px
-//!   sent as device counts like the source) × the distance speed booster;
-//!   released after `forced_release_ms` ("Max burst") or on target loss.
-//! - `silent_immediate` ("Flick"): one shot, then moves back by the snap.
-//! - `auto`: one shot; the center-crossing clicks come from `auto.rs`.
+//! - `tap`: pulls error × 0.45 (the source's tap pull, px sent as device
+//!   counts) and fires one shot.
+//! - `spray`: pulls on every new frame by error / smoothing (drawn in
+//!   [min, max] per axis, px sent as device counts like the source) × the
+//!   distance speed booster, and fires only once the crosshair is inside
+//!   the target's box (user request: "spray fires only on a valid target"),
+//!   holding the button for a burst while it keeps pulling; released after
+//!   `forced_release_ms` ("Max burst") or on target loss.
+//! - `silent_immediate` ("Flick"): the only snap (user request): the whole
+//!   error at once through the source's `pixel_to_counts`
+//!   (px / (sens × 0.022 × 3.125)), one shot, then moves back by the snap.
+//! - `auto`: nothing here; it only clicks when a valid target passes the
+//!   center (`auto.rs`), with no snap.
 //!
 //! Holding the trigger does not repeat the action; release and press again.
 //! A shot holds the button 25–40 ms (drawn per shot): a press and release
@@ -32,6 +36,8 @@ const FRESH_MS: u64 = 100;
 const MAX_STEP: i64 = 127;
 /// Degrees per count at sensitivity 1 (source `pixel_to_counts`: 0.022 × 3.125).
 const DEGREES_PER_COUNT: f64 = 0.022 * 3.125;
+/// Tap pull: this fraction of the error (source `tick_tap`).
+const TAP_PULL: f64 = 0.45;
 /// A shot holds the button this long, drawn per shot.
 const CLICK_MS: (f64, f64) = (25.0, 40.0);
 
@@ -76,6 +82,9 @@ pub struct MagnetTargetEvent {
     pub frame_id: u64,
     /// Target minus crosshair in crop px; `None` when no target.
     pub error: Option<[f64; 2]>,
+    /// The crosshair is inside the target's box.
+    #[serde(default)]
+    pub on_target: bool,
     pub counts_per_px: f64,
     pub timestamp_ms: u64,
     pub settings: MagnetSettings,
@@ -112,6 +121,8 @@ enum Phase {
         hold: Duration,
         back: (i64, i64),
     },
+    /// Spray pulling toward the target, not firing yet.
+    Pulling,
     /// Spray burst started at this time.
     Spraying(Instant),
     /// This press is spent until the trigger is released.
@@ -272,8 +283,9 @@ impl MagnetState {
     ) {
         // Samples stop when Magnet is turned off or processing stalls; a
         // stale one is the same as Magnet off.
-        let Some(event) = event.filter(|event| event.settings.enabled && event.is_fresh_at(now_ms))
-        else {
+        let Some(event) = event.filter(|event| {
+            event.settings.enabled && event.settings.mode != "auto" && event.is_fresh_at(now_ms)
+        }) else {
             self.cancel();
             return;
         };
@@ -286,7 +298,7 @@ impl MagnetState {
         self.last_frame = Some(event.frame_id);
         let elapsed = now.saturating_duration_since(match self.phase {
             Phase::Shooting { at, .. } | Phase::Spraying(at) => at,
-            Phase::Armed | Phase::Done => now,
+            Phase::Armed | Phase::Pulling | Phase::Done => now,
         });
         match self.phase {
             Phase::Armed => {
@@ -296,20 +308,31 @@ impl MagnetState {
                 let Some(error) = event.error else {
                     return;
                 };
-                let (dx, dy) = self.flick(error, event);
+                let mode = event.settings.mode.as_str();
+                let (dx, dy) = match mode {
+                    "silent_immediate" => self.flick(error, event),
+                    "tap" => self.counts(error[0] * TAP_PULL, error[1] * TAP_PULL),
+                    _ => self.pull(error, event),
+                };
                 self.push_move(dx, dy);
+                if mode == "spray" {
+                    self.phase = Phase::Pulling;
+                    if event.on_target {
+                        self.press();
+                        self.phase = Phase::Spraying(now);
+                    }
+                    return;
+                }
                 self.press();
+                // Tap and Flick: one shot (Flick then moves back).
                 self.residual = (0.0, 0.0);
-                self.phase = match event.settings.mode.as_str() {
-                    "spray" => Phase::Spraying(now),
-                    mode => Phase::Shooting {
-                        at: now,
-                        hold: self.shot_hold(),
-                        back: if mode == "silent_immediate" {
-                            (-dx, -dy)
-                        } else {
-                            (0, 0)
-                        },
+                self.phase = Phase::Shooting {
+                    at: now,
+                    hold: self.shot_hold(),
+                    back: if mode == "silent_immediate" {
+                        (-dx, -dy)
+                    } else {
+                        (0, 0)
                     },
                 };
             }
@@ -319,6 +342,18 @@ impl MagnetState {
                     self.push_move(back.0, back.1);
                 }
             }
+            Phase::Pulling => match event.error {
+                Some(error) if new_frame => {
+                    let (dx, dy) = self.pull(error, event);
+                    self.push_move(dx, dy);
+                    if event.on_target {
+                        self.press();
+                        self.phase = Phase::Spraying(now);
+                    }
+                }
+                Some(_) => {}
+                None => self.finish(),
+            },
             Phase::Spraying(_) => {
                 if elapsed >= Duration::from_millis(event.settings.forced_release_ms) {
                     self.finish();
@@ -369,6 +404,7 @@ mod tests {
             config_revision: 0,
             frame_id,
             error,
+            on_target: false,
             counts_per_px: DEGREES_PER_COUNT,
             timestamp_ms: 1_000,
             settings,
@@ -393,13 +429,14 @@ mod tests {
     }
 
     #[test]
-    fn tap_snaps_and_fires_one_shot_per_press() {
+    fn tap_pulls_45_percent_and_fires_one_shot_per_press() {
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
         let mut state = snapped("tap", [40.0, -12.0], start);
+        // No snap: error × 0.45 (px as counts, like the source).
         assert_eq!(
             drain(&mut state),
-            vec![MagnetOp::Move(40, -12), MagnetOp::Press]
+            vec![MagnetOp::Move(18, -5), MagnetOp::Press]
         );
         state.update(Some(&event("tap", 3, Some([0.0, 0.0]))), true, at(20), 1_000);
         assert!(drain(&mut state).is_empty(), "a shot holds 25–40 ms");
@@ -413,40 +450,52 @@ mod tests {
         // Released and pressed again: another shot.
         state.update(Some(&event("tap", 20, None)), false, at(80), 1_000);
         state.update(Some(&event("tap", 20, Some([9.0, 0.0]))), true, at(84), 1_000);
-        state.update(Some(&event("tap", 21, Some([9.0, 0.0]))), true, at(88), 1_000);
+        state.update(Some(&event("tap", 21, Some([20.0, 0.0]))), true, at(88), 1_000);
         assert_eq!(drain(&mut state), vec![MagnetOp::Move(9, 0), MagnetOp::Press]);
     }
 
     #[test]
-    fn spray_snaps_then_pulls_a_burst_until_max_burst_or_target_loss() {
+    fn spray_pulls_and_fires_only_on_the_target_then_bursts_until_max_burst() {
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
         let mut spray = settings("spray");
         (spray.smooth_x_min, spray.smooth_x_max) = (4.0, 4.0);
         (spray.smooth_y_min, spray.smooth_y_max) = (5.0, 5.0);
-        let sample = |frame, error| event_with(spray.clone(), frame, error);
+        let sample = |frame, error, on_target| MagnetTargetEvent {
+            on_target,
+            ..event_with(spray.clone(), frame, error)
+        };
         let mut state = MagnetState::default();
-        state.update(Some(&sample(1, Some([40.0, 50.0]))), true, at(0), 1_000);
-        state.update(Some(&sample(2, Some([40.0, 50.0]))), true, at(4), 1_000);
-        assert_eq!(
-            drain(&mut state),
-            vec![MagnetOp::Move(40, 50), MagnetOp::Press]
-        );
-        state.update(Some(&sample(2, Some([40.0, 50.0]))), true, at(8), 1_000);
-        assert!(drain(&mut state).is_empty(), "same frame: no second pull");
-        state.update(Some(&sample(3, Some([40.0, 50.0]))), true, at(12), 1_000);
+        state.update(Some(&sample(1, Some([40.0, 50.0]), false)), true, at(0), 1_000);
+        state.update(Some(&sample(2, Some([40.0, 50.0]), false)), true, at(4), 1_000);
+        // Off the target: pull only (40 / 4, 50 / 5).
         assert_eq!(drain(&mut state), vec![MagnetOp::Move(10, 10)]);
+        assert!(!state.holding());
+        state.update(Some(&sample(2, Some([40.0, 50.0]), false)), true, at(8), 1_000);
+        assert!(drain(&mut state).is_empty(), "same frame: no second pull");
+        // On the target: pull and fire.
+        state.update(Some(&sample(3, Some([8.0, 10.0]), true)), true, at(12), 1_000);
+        assert_eq!(drain(&mut state), vec![MagnetOp::Move(2, 2), MagnetOp::Press]);
+        // The burst keeps pulling, then ends after Max burst (250 ms).
+        state.update(Some(&sample(4, Some([4.0, 5.0]), false)), true, at(16), 1_000);
+        assert_eq!(drain(&mut state), vec![MagnetOp::Move(1, 1)]);
         assert!(state.holding());
-        state.update(Some(&sample(4, Some([8.0, 0.0]))), true, at(254), 1_000);
-        assert_eq!(drain(&mut state), vec![MagnetOp::Release], "Max burst 250 ms");
-        state.update(Some(&sample(5, Some([8.0, 0.0]))), true, at(300), 1_000);
+        state.update(Some(&sample(5, Some([4.0, 5.0]), true)), true, at(262), 1_000);
+        assert_eq!(drain(&mut state), vec![MagnetOp::Release], "Max burst");
+        state.update(Some(&sample(6, Some([4.0, 5.0]), true)), true, at(300), 1_000);
         assert!(drain(&mut state).is_empty(), "one burst per press");
 
+        // Target lost before or during the burst: no shot / release.
         let mut state = MagnetState::default();
-        state.update(Some(&sample(1, Some([4.0, 0.0]))), true, at(0), 1_000);
-        state.update(Some(&sample(2, Some([4.0, 0.0]))), true, at(4), 1_000);
+        state.update(Some(&sample(1, Some([40.0, 0.0]), false)), true, at(0), 1_000);
+        state.update(Some(&sample(2, Some([40.0, 0.0]), false)), true, at(4), 1_000);
+        state.update(Some(&sample(3, None, false)), true, at(8), 1_000);
+        assert_eq!(drain(&mut state), vec![MagnetOp::Move(10, 0)], "never fired");
+        let mut state = MagnetState::default();
+        state.update(Some(&sample(1, Some([4.0, 0.0]), true)), true, at(0), 1_000);
+        state.update(Some(&sample(2, Some([4.0, 0.0]), true)), true, at(4), 1_000);
         drain(&mut state);
-        state.update(Some(&sample(3, None)), true, at(8), 1_000);
+        state.update(Some(&sample(3, None, false)), true, at(8), 1_000);
         assert_eq!(drain(&mut state), vec![MagnetOp::Release], "target lost");
     }
 
@@ -488,26 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn without_a_target_the_snap_waits_for_one() {
+    fn without_a_target_the_action_waits_for_one() {
         let start = Instant::now();
+        let mode = "silent_immediate";
         let mut state = MagnetState::default();
-        state.update(Some(&event("tap", 1, None)), true, start, 1_000);
-        state.update(Some(&event("tap", 2, None)), true, start, 1_000);
+        state.update(Some(&event(mode, 1, None)), true, start, 1_000);
+        state.update(Some(&event(mode, 2, None)), true, start, 1_000);
         assert!(drain(&mut state).is_empty());
-        state.update(Some(&event("tap", 3, Some([6.0, 0.0]))), true, start, 1_000);
+        state.update(Some(&event(mode, 3, Some([6.0, 0.0]))), true, start, 1_000);
         assert_eq!(drain(&mut state), vec![MagnetOp::Move(6, 0), MagnetOp::Press]);
     }
 
     #[test]
-    fn auto_mode_snaps_and_fires_once() {
+    fn auto_mode_plans_nothing_here() {
         let start = Instant::now();
-        let mut state = snapped("auto", [30.0, 0.0], start);
-        assert_eq!(drain(&mut state), vec![MagnetOp::Move(30, 0), MagnetOp::Press]);
-        let later = start + Duration::from_millis(45);
-        state.update(Some(&event("auto", 3, Some([30.0, 0.0]))), true, later, 1_000);
-        assert_eq!(drain(&mut state), vec![MagnetOp::Release]);
-        state.update(Some(&event("auto", 4, Some([30.0, 0.0]))), true, later, 1_000);
-        assert!(drain(&mut state).is_empty(), "Auto's clicks come from auto.rs");
+        let mut state = MagnetState::default();
+        for frame in 1..5 {
+            state.update(Some(&event("auto", frame, Some([30.0, 0.0]))), true, start, 1_000);
+        }
+        assert!(drain(&mut state).is_empty(), "Auto clicks only on center crossings");
+        assert!(!state.holding());
     }
 
     #[test]
@@ -547,14 +596,14 @@ mod tests {
     #[test]
     fn releasing_the_trigger_or_a_stale_sample_releases_the_button() {
         let start = Instant::now();
-        let mut state = snapped("spray", [8.0, 0.0], start);
+        let mut state = snapped("tap", [8.0, 0.0], start);
         assert!(state.holding());
         drain(&mut state);
-        state.update(Some(&event("spray", 2, Some([8.0, 0.0]))), false, start, 1_000);
+        state.update(Some(&event("tap", 2, Some([8.0, 0.0]))), false, start, 1_000);
         assert_eq!(drain(&mut state), vec![MagnetOp::Release]);
-        let mut state = snapped("spray", [8.0, 0.0], start);
+        let mut state = snapped("tap", [8.0, 0.0], start);
         drain(&mut state);
-        state.update(Some(&event("spray", 3, Some([8.0, 0.0]))), true, start, 1_200);
+        state.update(Some(&event("tap", 3, Some([8.0, 0.0]))), true, start, 1_200);
         assert_eq!(drain(&mut state), vec![MagnetOp::Release], "stale sample");
     }
 }

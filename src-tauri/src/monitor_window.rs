@@ -2809,7 +2809,10 @@ pub fn run(
     loop {
         let error = match slint::run_event_loop_until_quit() {
             Ok(()) if backend_lost.get() => return Err("backend connection lost".into()),
-            Ok(()) => return Ok(()),
+            Ok(()) if quit_requested.get() => return Ok(()),
+            // Nothing asked to quit: not the user closing SysX, so the
+            // supervisor must start it again.
+            Ok(()) => return Err("window event loop ended without a quit request".into()),
             Err(error) if quit_requested.get() => return Err(error.to_string()),
             Err(error) => error,
         };

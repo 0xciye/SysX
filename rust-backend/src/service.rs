@@ -387,8 +387,8 @@ impl ReceiverService {
                     let auto_active = effective_detection_settings(&settings, &device).2;
                     let target_valid = auto_active && processed.result.auto_target_valid;
                     events.target(processed.auto_config_revision, target_valid);
-                    // Every mode, Auto included: each trigger press snaps.
-                    if settings.magnet.enabled {
+                    // The Auto mode only clicks on center crossings (auto.rs).
+                    if settings.magnet.enabled && settings.magnet.mode != "auto" {
                         (events.emit)(magnet_event(
                             &settings,
                             processed,
@@ -2077,7 +2077,9 @@ fn magnet_active(settings: &AppSettings, device: &Value) -> bool {
 /// Magnet is enabled; the host treats a sample older than 100 ms as no target.
 fn magnet_event(settings: &AppSettings, processed: &ProcessedFrame, revision: u64) -> Value {
     let error = processed
-        .snap_target
+        .result
+        .target_xy
+        .filter(|_| !processed.result.auto_active)
         .map(|target| {
             let (x, y) = crate::movement::crop_target_error(
                 (f64::from(target[0]), f64::from(target[1])),
@@ -2095,9 +2097,22 @@ fn magnet_event(settings: &AppSettings, processed: &ProcessedFrame, revision: u6
         "config_revision": revision,
         "frame_id": processed.frame.frame_id,
         "error": error,
+        "on_target": error.is_some() && magnet_on_target(processed),
         "counts_per_px": crate::movement::motion::counts_per_px(settings.sens),
         "timestamp_ms": unix_ms(),
         "settings": settings.magnet,
+    })
+}
+
+/// The crosshair (the crop center) is inside the target's box: Spray fires
+/// only then.
+fn magnet_on_target(processed: &ProcessedFrame) -> bool {
+    let center = (
+        processed.crop_x as f32 + (processed.result.processed_width / 2) as f32,
+        processed.crop_y as f32 + (processed.result.processed_height / 2) as f32,
+    );
+    processed.target_box.is_some_and(|[left, top, right, bottom]| {
+        (left..=right).contains(&center.0) && (top..=bottom).contains(&center.1)
     })
 }
 

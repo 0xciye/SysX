@@ -86,15 +86,24 @@ impl Drop for BackendRuntime {
     }
 }
 
-/// Runs SysX until it ends; true when that was not the user closing it, so
-/// the supervisor should start it again.
-pub fn run() -> bool {
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
+        .to_owned()
+}
+
+/// Runs SysX until it ends; `Some(reason)` when that was not the user
+/// closing it, so the supervisor should start it again.
+pub fn run() -> Option<String> {
     let Some(_instance) = crate::single_instance::acquire() else {
         // Another SysX owns the backend and UDP port: show its monitor, exit.
         if !crate::single_instance::focus_monitor_window() {
             crate::single_instance::request_monitor();
         }
-        return false;
+        return None;
     };
     let movement_state = Arc::new(crate::movement::MovementState::default());
     let auto_target = Arc::new(Mutex::new(AutoTargetEvent::default()));
@@ -105,7 +114,7 @@ pub fn run() -> bool {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("SysX could not start: {error}");
-                return true;
+                return Some(format!("backend did not start: {error}"));
             }
         };
     if start_device_monitor(
@@ -134,12 +143,38 @@ pub fn run() -> bool {
     let monitor_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::monitor_window::run(port, token, event_rx, command_tx)
     }));
-    let restart = !matches!(monitor_result, Ok(Ok(())));
+    let reason = match monitor_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(panic) => Some(format!("window panic: {}", panic_message(&*panic))),
+    };
+    // Did the backend end first, and how?
+    #[cfg(not(target_os = "macos"))]
+    let reason = reason.map(|reason| match backend_exit(&runtime) {
+        Some(code) => format!("{reason} (backend exit=0x{:08X})", code as u32),
+        None => reason,
+    });
     #[cfg(target_os = "macos")]
     drop(terminate::release());
     #[cfg(not(target_os = "macos"))]
     drop(runtime);
-    restart
+    reason
+}
+
+/// The backend's exit code once it has ended, waiting up to a second for a
+/// backend that is just exiting (it exits when the host connection closes).
+#[cfg(not(target_os = "macos"))]
+fn backend_exit(runtime: &BackendRuntime) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Ok(Some(status)) = lock_recover(&runtime.child).try_wait() {
+            return status.code();
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Quit (Cmd+Q, the Dock menu, logout) makes AppKit call `exit()` from inside
@@ -873,7 +908,7 @@ fn library_dir() -> PathBuf {
     }
 }
 
-fn app_data_dir() -> PathBuf {
+pub(crate) fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Ok(root) = std::env::var("LOCALAPPDATA") {
         return PathBuf::from(root).join("SysX");
